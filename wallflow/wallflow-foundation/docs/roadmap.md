@@ -93,6 +93,43 @@
 - Multi-monitor desktop attach.
 - DPI change handling.
 
+## MVP-2.0 Cloud-safe static image decode and layout ✅
+
+*Completed in stage 006.*
+
+- `FitMode` unified in `wallflow_common`: single canonical definition, re-exported by
+  `wallflow-package` and `wallflow-ipc`.
+- `ImageMetadata` type in `wallflow-package`: width, height, color_type, detected_format,
+  file_size_bytes.
+- `load_image_metadata()` function: reads image dimensions and format without full
+  pixel decode, using `image::io::Reader`.
+- `ImageDecodeError` type for image decode failures.
+- `validate_package_deep()`: structural + image decode validation.
+- Layout engine in `wallflow-package::layout`:
+  - `Viewport`, `ImageSize`, `RenderRect`, `StaticImageLayout` types.
+  - `calculate_static_image_layout()` with cover, contain, stretch, center, tile fit modes.
+  - `LayoutError` for zero dimension rejection.
+- IPC protocol v5: `AppliedWallpaperReport`, `StaticImageApplyReport`,
+  `IpcImageMetadata`, `StaticImageLayoutReport`.
+- `WallpaperApplied` event now includes `report: Option<AppliedWallpaperReport>`.
+- Renderer decodes image metadata and calculates layout on `ApplyWallpaper`.
+- `LoadedStaticImageState` replaces `AppliedWallpaperState`.
+- `apply-static-smoke` uses real 2×2 PNG (via `image` crate), deep validation,
+  and verifies image dimensions, layout rect, and wallpaper_id in the report.
+- `package-validate` CLI command with optional `--deep` flag.
+- `image` crate added as workspace dependency.
+- Rendering model documented in `docs/architecture/009-static-image-rendering-model.md`.
+
+### REQUIRES_REAL_WINDOWS_VALIDATION
+
+- Desktop probe (Progman/WorkerW/SHELLDLL_DefView discovery).
+- Desktop attach smoke test (embedding window behind icons).
+- Explorer restart tolerance.
+- Multi-monitor desktop attach.
+- DPI change handling.
+- Layout with actual monitor dimensions (not synthetic 1920×1080).
+- Visual correctness of each fit mode.
+
 ## MVP-2 static wallpaper
 
 - Add winit/wgpu static renderer.

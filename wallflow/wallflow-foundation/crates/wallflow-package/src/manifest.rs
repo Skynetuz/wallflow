@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::WallpaperPackageError;
+pub use wallflow_common::FitMode;
 
 /// Current manifest schema version.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 0;
@@ -49,30 +50,6 @@ impl std::fmt::Display for WallpaperKind {
             WallpaperKind::StaticImage => write!(f, "static_image"),
             WallpaperKind::Video => write!(f, "video"),
             WallpaperKind::Web => write!(f, "web"),
-        }
-    }
-}
-
-/// How a static image should be fitted to the screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FitMode {
-    #[default]
-    Cover,
-    Contain,
-    Stretch,
-    Center,
-    Tile,
-}
-
-impl std::fmt::Display for FitMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FitMode::Cover => write!(f, "cover"),
-            FitMode::Contain => write!(f, "contain"),
-            FitMode::Stretch => write!(f, "stretch"),
-            FitMode::Center => write!(f, "center"),
-            FitMode::Tile => write!(f, "tile"),
         }
     }
 }

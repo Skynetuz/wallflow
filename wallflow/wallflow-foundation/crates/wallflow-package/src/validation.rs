@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::error::{load_image_metadata, ImageDecodeError};
 use crate::manifest::{
     validate_relative_path, WallpaperKind, WallpaperManifest, SUPPORTED_SCHEMA_VERSIONS,
 };
@@ -147,6 +148,47 @@ pub fn validate_package(package: &crate::WallpaperPackage) -> WallpaperValidatio
                 ));
             }
         }
+    }
+
+    report
+}
+
+/// Deep validation: structural + image decode validation.
+///
+/// In addition to all `validate_package` checks, this also:
+/// - Actually decodes the entry image metadata (dimensions, format, color type)
+/// - Verifies the image is a valid, decodable image file
+pub fn validate_package_deep(package: &crate::WallpaperPackage) -> WallpaperValidationReport {
+    let mut report = validate_package(package);
+
+    // For static_image kind, try to decode image metadata
+    if matches!(package.manifest.kind, WallpaperKind::StaticImage)
+        && !package.manifest.entry.image.trim().is_empty()
+    {
+        let image_path = package.directory.join(&package.manifest.entry.image);
+        if image_path.exists() {
+            match load_image_metadata(&image_path) {
+                Ok(metadata) => {
+                    debug!(
+                        package_id = %package.manifest.id,
+                        width = metadata.width,
+                        height = metadata.height,
+                        format = %metadata.detected_format,
+                        "deep validation: image metadata loaded"
+                    );
+                }
+                Err(ImageDecodeError::UnsupportedFormat(fmt)) => {
+                    report.add_error(format!("entry image has unsupported format: {fmt}"));
+                }
+                Err(ImageDecodeError::Decode(msg)) => {
+                    report.add_error(format!("entry image could not be decoded: {msg}"));
+                }
+                Err(ImageDecodeError::Io(e)) => {
+                    report.add_error(format!("entry image io error during decode: {e}"));
+                }
+            }
+        }
+        // If image doesn't exist, validate_package already caught it
     }
 
     report
@@ -363,5 +405,167 @@ mod tests {
             "expected valid, got errors: {:?}",
             report.errors
         );
+    }
+
+    // --- Deep validation tests ---
+
+    #[test]
+    fn deep_validation_with_real_png() {
+        let dir = std::env::temp_dir().join("wallflow-test-deep-valid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("content"));
+
+        let manifest = valid_static_manifest();
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
+
+        // Create a real 2x2 PNG
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        img.save(dir.join("content/wallpaper.png"))
+            .expect("save png");
+
+        let package = crate::WallpaperPackage::load(&dir).expect("load");
+        let report = validate_package_deep(&package);
+        assert!(
+            report.valid,
+            "expected valid, got errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn deep_validation_invalid_image_file_fails() {
+        let dir = std::env::temp_dir().join("wallflow-test-deep-invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("content"));
+
+        let manifest = valid_static_manifest();
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
+
+        // Write invalid image data
+        std::fs::write(dir.join("content/wallpaper.png"), b"NOT-A-REAL-IMAGE").expect("write");
+
+        let package = crate::WallpaperPackage::load(&dir).expect("load");
+        let report = validate_package_deep(&package);
+        assert!(
+            !report.valid,
+            "expected deep validation to fail for invalid image"
+        );
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("decode") || e.contains("could not be decoded")));
+    }
+
+    #[test]
+    fn structural_validation_passes_without_image_decode_if_file_exists() {
+        let dir = std::env::temp_dir().join("wallflow-test-structural-only");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("content"));
+
+        let manifest = valid_static_manifest();
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
+
+        // Write invalid image data - structural validation should still pass
+        std::fs::write(dir.join("content/wallpaper.png"), b"FAKE-DATA").expect("write");
+
+        let package = crate::WallpaperPackage::load(&dir).expect("load");
+        let report = validate_package(&package);
+        assert!(
+            report.valid,
+            "structural validation should pass even with invalid image data, got errors: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn path_traversal_still_rejected_by_deep_validation() {
+        let dir = std::env::temp_dir().join("wallflow-test-deep-traversal");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut manifest = valid_static_manifest();
+        manifest.entry.image = "../etc/passwd".into();
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
+
+        let package = crate::WallpaperPackage::load(&dir).expect("load");
+        let report = validate_package_deep(&package);
+        assert!(!report.valid);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("traversal") || e.contains("invalid")));
+    }
+
+    #[test]
+    fn missing_image_still_fails_deep_validation() {
+        let dir = std::env::temp_dir().join("wallflow-test-deep-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let manifest = valid_static_manifest();
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
+
+        let package = crate::WallpaperPackage::load(&dir).expect("load");
+        let report = validate_package_deep(&package);
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|e| e.contains("not found")));
+    }
+
+    #[test]
+    fn deep_validation_image_dimensions_correct() {
+        let dir = std::env::temp_dir().join("wallflow-test-deep-dimensions");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("content"));
+
+        let manifest = valid_static_manifest();
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
+
+        // Create a real 2x2 PNG
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        img.save(dir.join("content/wallpaper.png"))
+            .expect("save png");
+
+        // Verify metadata directly
+        let image_path = dir.join("content/wallpaper.png");
+        let metadata = load_image_metadata(&image_path).expect("load metadata");
+        assert_eq!(metadata.width, 2);
+        assert_eq!(metadata.height, 2);
+        assert_eq!(metadata.detected_format, "Png");
+    }
+
+    #[test]
+    fn load_metadata_valid_png() {
+        let dir = std::env::temp_dir().join("wallflow-test-metadata-valid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let img = image::RgbaImage::from_pixel(100, 50, image::Rgba([255, 0, 0, 255]));
+        let path = dir.join("test.png");
+        img.save(&path).expect("save");
+
+        let metadata = load_image_metadata(&path).expect("load metadata");
+        assert_eq!(metadata.width, 100);
+        assert_eq!(metadata.height, 50);
+        assert_eq!(metadata.detected_format, "Png");
+        assert!(metadata.file_size_bytes > 0);
+    }
+
+    #[test]
+    fn load_metadata_invalid_file_fails() {
+        let dir = std::env::temp_dir().join("wallflow-test-metadata-invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let path = dir.join("bad.png");
+        std::fs::write(&path, b"garbage data").expect("write");
+
+        let result = load_image_metadata(&path);
+        assert!(result.is_err());
     }
 }

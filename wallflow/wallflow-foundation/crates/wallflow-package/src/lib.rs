@@ -19,9 +19,15 @@
 //! the package directory.
 
 mod error;
+mod layout;
 mod manifest;
 mod validation;
 
-pub use error::WallpaperPackageError;
+pub use error::{load_image_metadata, ImageDecodeError, ImageMetadata, WallpaperPackageError};
+pub use layout::{
+    calculate_static_image_layout, ImageSize, LayoutError, RenderRect, StaticImageLayout, Viewport,
+};
 pub use manifest::*;
-pub use validation::{validate_manifest, validate_package, WallpaperValidationReport};
+pub use validation::{
+    validate_manifest, validate_package, validate_package_deep, WallpaperValidationReport,
+};

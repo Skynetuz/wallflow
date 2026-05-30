@@ -1,6 +1,6 @@
 # 002 – IPC Contract
 
-> Stage: `004-cloud-safe-typed-ipc-renderer-control`
+> Stage: `006-cloud-safe-static-image-decode-and-layout`
 > Date: 2026-05-30
 
 ## Overview
@@ -127,8 +127,8 @@ pub struct EventEnvelope<T> {
 | `Heartbeat { renderer_id, uptime_ms }` | Liveness signal |
 | `Paused { renderer_id }` | Confirmed pause |
 | `Resumed { renderer_id }` | Confirmed resume |
-| `WallpaperApplied { renderer_id, monitor_id, wallpaper_id }` | Wallpaper rendering |
-| `WallpaperApplyFailed { renderer_id, monitor_id, error: WallpaperApplyError }` | Wallpaper apply failed |
+| `WallpaperApplied { renderer_id, monitor_id, wallpaper_id, report }` | Wallpaper rendering (report contains metadata + layout) |
+| `WallpaperApplyFailed { renderer_id, wallpaper_id, error: WallpaperApplyError }` | Wallpaper apply failed |
 | `Error { renderer_id, message }` | Error occurred |
 | `Exited { renderer_id, exit_code }` | Process exiting |
 
@@ -136,17 +136,16 @@ pub struct EventEnvelope<T> {
 
 ```rust
 pub struct ApplyWallpaperRequest {
-    pub assignment_id: AssignmentId,
-    pub monitor_id: MonitorId,
     pub wallpaper_id: WallpaperId,
     pub payload: WallpaperPayload,
+    pub target_monitor: MonitorId,
 }
 ```
 
 ### WallpaperPayload
 
 ```rust
-#[serde(tag = "type", content = "data")]
+#[serde(tag = "kind", content = "data")]
 pub enum WallpaperPayload {
     #[serde(rename = "static_image")]
     StaticImage(StaticImagePayload),
@@ -157,20 +156,59 @@ pub enum WallpaperPayload {
 
 ```rust
 pub struct StaticImagePayload {
-    pub path: PathBuf,
-    pub fit_mode: FitMode,
+    pub image_path: String,
+    pub fit: FitMode,
+    pub background: String,
+    pub opacity: Option<u8>,
 }
 ```
 
-### FitMode
+### FitMode (unified in wallflow_common)
 
 ```rust
 pub enum FitMode {
-    Fill,
-    Fit,
+    Cover,    // default
+    Contain,
     Stretch,
     Center,
     Tile,
+}
+```
+
+### AppliedWallpaperReport (in WallpaperApplied event)
+
+```rust
+pub struct AppliedWallpaperReport {
+    pub wallpaper_id: WallpaperId,
+    pub renderer_id: RendererId,
+    pub applied_at: Option<String>,
+    pub static_image: Option<StaticImageApplyReport>,
+}
+
+pub struct StaticImageApplyReport {
+    pub image_metadata: IpcImageMetadata,
+    pub layout: StaticImageLayoutReport,
+}
+
+pub struct IpcImageMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: String,
+    pub detected_format: String,
+    pub file_size_bytes: u64,
+}
+
+pub struct StaticImageLayoutReport {
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub fit: FitMode,
+    pub destination_x: f64,
+    pub destination_y: f64,
+    pub destination_width: f64,
+    pub destination_height: f64,
+    pub background: String,
 }
 ```
 
@@ -178,21 +216,23 @@ pub enum FitMode {
 
 ```rust
 pub enum WallpaperApplyError {
-    FileNotFound,
-    DecodeFailed(String),
-    UnsupportedFormat(String),
-    RenderFailed(String),
+    UnsupportedKind { kind: String },
+    InvalidImagePath { path: String },
+    ImageLoadFailed { path: String, reason: String },
+    InvalidRendererState { state: String },
+    Other { message: String },
 }
 ```
 
 ## Protocol Versioning
 
-The current protocol version is **4** (`PROTOCOL_VERSION`).
+The current protocol version is **5** (`PROTOCOL_VERSION`).
 
 - **Version 1**: Initial protocol with basic CoreCommand/CoreEvent.
 - **Version 2**: Added RendererCommand/RendererEvent with full lifecycle.
 - **Version 3**: Added `IpcMessage` tagged union for unambiguous frame decoding.
 - **Version 4**: Added `ApplyWallpaperRequest` for structured wallpaper apply commands and `WallpaperApplyFailed` event for error reporting.
+- **Version 5**: Added `AppliedWallpaperReport` to `WallpaperApplied` event, containing image metadata and layout calculation results. `FitMode` moved to `wallflow_common`.
 
 Every envelope includes `protocol_version`. Receivers MUST validate the version
 and reject mismatched messages with `FrameError::ProtocolVersionMismatch`.

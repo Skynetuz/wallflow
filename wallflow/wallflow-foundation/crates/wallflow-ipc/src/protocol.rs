@@ -6,7 +6,8 @@ use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperId};
 /// Version 2 added the new RendererCommand/RendererEvent/CoreCommand/CoreEvent types.
 /// Version 3 adds the IpcMessage tagged union for unambiguous frame decoding.
 /// Version 4 adds ApplyWallpaperRequest, StaticImagePayload, WallpaperApplyError.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version 5 adds AppliedWallpaperReport with image metadata and layout.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
@@ -142,27 +143,79 @@ impl<T> Envelope<T> {
 // ---------------------------------------------------------------------------
 
 /// How a static image should be fitted to the screen.
-/// Mirrors `wallflow_package::FitMode` but defined independently in the IPC
-/// layer so that the renderer does not need to depend on wallflow-package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FitMode {
-    #[default]
-    Cover,
-    Contain,
-    Stretch,
-    Center,
-    Tile,
+/// Re-exported from wallflow_common::FitMode for use in IPC payloads.
+pub use wallflow_common::FitMode;
+
+// ---------------------------------------------------------------------------
+// Applied wallpaper report types (IPC-safe, no image crate dependency)
+// ---------------------------------------------------------------------------
+
+/// IPC-safe image metadata (no dependency on image crate types).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcImageMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub color_type: String,
+    pub detected_format: String,
+    pub file_size_bytes: u64,
 }
 
-impl std::fmt::Display for FitMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FitMode::Cover => write!(f, "cover"),
-            FitMode::Contain => write!(f, "contain"),
-            FitMode::Stretch => write!(f, "stretch"),
-            FitMode::Center => write!(f, "center"),
-            FitMode::Tile => write!(f, "tile"),
+/// IPC-safe layout report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticImageLayoutReport {
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub fit: FitMode,
+    pub destination_x: f64,
+    pub destination_y: f64,
+    pub destination_width: f64,
+    pub destination_height: f64,
+    pub background: String,
+}
+
+/// Report specific to a static image wallpaper apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticImageApplyReport {
+    pub image_metadata: IpcImageMetadata,
+    pub layout: StaticImageLayoutReport,
+}
+
+/// Detailed report when a wallpaper is successfully applied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedWallpaperReport {
+    pub wallpaper_id: WallpaperId,
+    pub renderer_id: RendererId,
+    pub applied_at: Option<String>, // ISO 8601 timestamp
+    pub static_image: Option<StaticImageApplyReport>,
+}
+
+impl From<wallflow_package::ImageMetadata> for IpcImageMetadata {
+    fn from(m: wallflow_package::ImageMetadata) -> Self {
+        IpcImageMetadata {
+            width: m.width,
+            height: m.height,
+            color_type: m.color_type,
+            detected_format: m.detected_format,
+            file_size_bytes: m.file_size_bytes,
+        }
+    }
+}
+
+impl From<wallflow_package::StaticImageLayout> for StaticImageLayoutReport {
+    fn from(l: wallflow_package::StaticImageLayout) -> Self {
+        StaticImageLayoutReport {
+            viewport_width: l.viewport.width,
+            viewport_height: l.viewport.height,
+            image_width: l.image_size.width,
+            image_height: l.image_size.height,
+            fit: l.fit,
+            destination_x: l.destination_rect.x,
+            destination_y: l.destination_rect.y,
+            destination_width: l.destination_rect.width,
+            destination_height: l.destination_rect.height,
+            background: l.background,
         }
     }
 }
@@ -274,6 +327,10 @@ pub enum RendererEvent {
         renderer_id: RendererId,
         wallpaper_id: WallpaperId,
         monitor_id: MonitorId,
+        /// Detailed report about the applied wallpaper (metadata, layout).
+        /// Present when the renderer performed image decode and layout calculation.
+        #[serde(default)]
+        report: Option<AppliedWallpaperReport>,
     },
     /// An error occurred while applying a wallpaper.
     WallpaperApplyFailed {
@@ -411,6 +468,176 @@ mod tests {
             renderer_id: RendererId::new(),
             wallpaper_id: WallpaperId::new(),
             monitor_id: MonitorId("mon-1".into()),
+            report: None,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn renderer_event_wallpaper_applied_with_report_roundtrip() {
+        let wid = WallpaperId::new();
+        let rid = RendererId::new();
+        let event = RendererEvent::WallpaperApplied {
+            renderer_id: rid,
+            wallpaper_id: wid,
+            monitor_id: MonitorId("mon-1".into()),
+            report: Some(AppliedWallpaperReport {
+                wallpaper_id: wid,
+                renderer_id: rid,
+                applied_at: Some("2024-01-01T00:00:00Z".into()),
+                static_image: Some(StaticImageApplyReport {
+                    image_metadata: IpcImageMetadata {
+                        width: 1920,
+                        height: 1080,
+                        color_type: "Rgba8".into(),
+                        detected_format: "Png".into(),
+                        file_size_bytes: 12345,
+                    },
+                    layout: StaticImageLayoutReport {
+                        viewport_width: 1920,
+                        viewport_height: 1080,
+                        image_width: 1920,
+                        image_height: 1080,
+                        fit: FitMode::Cover,
+                        destination_x: 0.0,
+                        destination_y: 0.0,
+                        destination_width: 1920.0,
+                        destination_height: 1080.0,
+                        background: "#000000".into(),
+                    },
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn ipc_image_metadata_roundtrip() {
+        let meta = IpcImageMetadata {
+            width: 256,
+            height: 256,
+            color_type: "Rgba8".into(),
+            detected_format: "Png".into(),
+            file_size_bytes: 67890,
+        };
+        let json = serde_json::to_string(&meta).expect("serialize");
+        let decoded: IpcImageMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(meta, decoded);
+    }
+
+    #[test]
+    fn static_image_layout_report_roundtrip() {
+        let report = StaticImageLayoutReport {
+            viewport_width: 1920,
+            viewport_height: 1080,
+            image_width: 1024,
+            image_height: 768,
+            fit: FitMode::Contain,
+            destination_x: 240.0,
+            destination_y: 0.0,
+            destination_width: 1440.0,
+            destination_height: 1080.0,
+            background: "#1a1a2e".into(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let decoded: StaticImageLayoutReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(report, decoded);
+    }
+
+    #[test]
+    fn static_image_apply_report_roundtrip() {
+        let report = StaticImageApplyReport {
+            image_metadata: IpcImageMetadata {
+                width: 100,
+                height: 100,
+                color_type: "Rgb8".into(),
+                detected_format: "Jpeg".into(),
+                file_size_bytes: 5000,
+            },
+            layout: StaticImageLayoutReport {
+                viewport_width: 1920,
+                viewport_height: 1080,
+                image_width: 100,
+                image_height: 100,
+                fit: FitMode::Center,
+                destination_x: 910.0,
+                destination_y: 490.0,
+                destination_width: 100.0,
+                destination_height: 100.0,
+                background: "#000000".into(),
+            },
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let decoded: StaticImageApplyReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(report, decoded);
+    }
+
+    #[test]
+    fn applied_wallpaper_report_roundtrip() {
+        let wid = WallpaperId::new();
+        let rid = RendererId::new();
+        let report = AppliedWallpaperReport {
+            wallpaper_id: wid,
+            renderer_id: rid,
+            applied_at: Some("2024-06-15T12:30:00Z".into()),
+            static_image: Some(StaticImageApplyReport {
+                image_metadata: IpcImageMetadata {
+                    width: 2,
+                    height: 2,
+                    color_type: "Rgba8".into(),
+                    detected_format: "Png".into(),
+                    file_size_bytes: 100,
+                },
+                layout: StaticImageLayoutReport {
+                    viewport_width: 1920,
+                    viewport_height: 1080,
+                    image_width: 2,
+                    image_height: 2,
+                    fit: FitMode::Cover,
+                    destination_x: 0.0,
+                    destination_y: 0.0,
+                    destination_width: 1920.0,
+                    destination_height: 1080.0,
+                    background: "#000000".into(),
+                },
+            }),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let decoded: AppliedWallpaperReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(report, decoded);
+    }
+
+    #[test]
+    fn wallpaper_applied_without_report_deserializes() {
+        // Verify backward compatibility: WallpaperApplied without report field
+        let wid = WallpaperId::new();
+        let rid = RendererId::new();
+        let json = format!(
+            r#"{{"WallpaperApplied":{{"renderer_id":"{}","wallpaper_id":"{}","monitor_id":"mon-1"}}}}"#,
+            rid.0, wid.0
+        );
+        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            RendererEvent::WallpaperApplied { report, .. } => {
+                assert_eq!(report, None);
+            }
+            _ => panic!("expected WallpaperApplied"),
+        }
+    }
+
+    #[test]
+    fn wallpaper_apply_failed_with_image_load_error_roundtrip() {
+        let event = RendererEvent::WallpaperApplyFailed {
+            renderer_id: RendererId::new(),
+            wallpaper_id: WallpaperId::new(),
+            error: WallpaperApplyError::ImageLoadFailed {
+                path: "/bad/image.png".into(),
+                reason: "unsupported format".into(),
+            },
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");

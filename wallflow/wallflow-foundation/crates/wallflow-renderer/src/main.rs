@@ -7,8 +7,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use wallflow_common::{RendererId, WallpaperId};
 use wallflow_ipc::{
-    encode_to_bytes, ApplyWallpaperRequest, EventEnvelope, IpcMessage, RendererCommand,
-    RendererEvent, WallpaperApplyError, WallpaperPayload,
+    encode_to_bytes, AppliedWallpaperReport, ApplyWallpaperRequest, EventEnvelope,
+    IpcImageMetadata, IpcMessage, RendererCommand, RendererEvent, StaticImageApplyReport,
+    StaticImageLayoutReport, WallpaperApplyError, WallpaperPayload,
 };
 use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
 
@@ -64,16 +65,16 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// Applied wallpaper state
+// Loaded static image state (replaces AppliedWallpaperState)
 // ---------------------------------------------------------------------------
 
-/// Tracks the currently applied wallpaper in the renderer process.
+/// Tracks a loaded static image wallpaper with decoded metadata and layout.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields will be read when GPU rendering is implemented (stage 006)
-struct AppliedWallpaperState {
+#[allow(dead_code)]
+struct LoadedStaticImageState {
     wallpaper_id: WallpaperId,
-    payload: WallpaperPayload,
-    target_monitor: String,
+    metadata: wallflow_package::ImageMetadata,
+    layout: wallflow_package::StaticImageLayout,
     applied_at: Instant,
 }
 
@@ -172,7 +173,7 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
     let interval = Duration::from_millis(interval_ms);
     let mut is_paused = false;
     let mut heartbeat_count: u64 = 0;
-    let mut applied_state: Option<AppliedWallpaperState> = None;
+    let mut loaded_state: Option<LoadedStaticImageState> = None;
 
     // Channel for receiving commands from the stdin reader thread
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RendererCommand>();
@@ -245,7 +246,7 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
                         break;
                     }
                     RendererCommand::ApplyWallpaper(request) => {
-                        handle_apply_wallpaper(renderer_id, request, &mut applied_state)?;
+                        handle_apply_wallpaper(renderer_id, request, &mut loaded_state)?;
                     }
                     RendererCommand::SetMonitor { monitor_id } => {
                         info!(?renderer_id, ?monitor_id, "monitor changed via IPC command");
@@ -280,11 +281,11 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
     Ok(())
 }
 
-/// Handle an ApplyWallpaper command: validate, update state, respond.
+/// Handle an ApplyWallpaper command: validate, decode metadata, calculate layout, respond.
 fn handle_apply_wallpaper(
     renderer_id: RendererId,
     request: ApplyWallpaperRequest,
-    applied_state: &mut Option<AppliedWallpaperState>,
+    loaded_state: &mut Option<LoadedStaticImageState>,
 ) -> Result<()> {
     let wallpaper_id = request.wallpaper_id;
     let monitor_id = request.target_monitor.clone();
@@ -304,34 +305,148 @@ fn handle_apply_wallpaper(
                 return Ok(());
             }
 
-            // At this stage, the renderer does not actually render the image.
-            // It validates the payload and records the applied state.
-            // Real GPU rendering will be implemented in stage 006.
+            let image_path = std::path::Path::new(&static_payload.image_path);
+
+            // Decode image metadata using wallflow-package
+            let metadata = match wallflow_package::load_image_metadata(image_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    let reason = format!("{e}");
+                    warn!(
+                        ?renderer_id,
+                        ?wallpaper_id,
+                        error = %reason,
+                        "failed to decode image metadata"
+                    );
+                    send_ipc_event(RendererEvent::WallpaperApplyFailed {
+                        renderer_id,
+                        wallpaper_id,
+                        error: WallpaperApplyError::ImageLoadFailed {
+                            path: static_payload.image_path.clone(),
+                            reason,
+                        },
+                    })?;
+                    return Ok(());
+                }
+            };
+
+            // Calculate layout using wallflow-package
+            let image_size = wallflow_package::ImageSize {
+                width: metadata.width,
+                height: metadata.height,
+            };
+            // Default viewport: 1920x1080 (synthetic viewport for cloud testing)
+            let viewport = wallflow_package::Viewport {
+                width: 1920,
+                height: 1080,
+            };
+
+            let layout = match wallflow_package::calculate_static_image_layout(
+                image_size,
+                viewport,
+                static_payload.fit,
+                static_payload.background.clone(),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    let reason = format!("{e}");
+                    warn!(
+                        ?renderer_id,
+                        ?wallpaper_id,
+                        error = %reason,
+                        "failed to calculate layout"
+                    );
+                    send_ipc_event(RendererEvent::WallpaperApplyFailed {
+                        renderer_id,
+                        wallpaper_id,
+                        error: WallpaperApplyError::Other { message: reason },
+                    })?;
+                    return Ok(());
+                }
+            };
+
             info!(
                 ?renderer_id,
                 ?wallpaper_id,
                 image_path = %static_payload.image_path,
+                image_width = metadata.width,
+                image_height = metadata.height,
                 ?static_payload.fit,
-                background = %static_payload.background,
-                "static wallpaper applied (state recorded, not rendering yet)"
+                "static wallpaper applied with decoded metadata and layout"
             );
 
-            *applied_state = Some(AppliedWallpaperState {
+            // Store the loaded state
+            *loaded_state = Some(LoadedStaticImageState {
                 wallpaper_id,
-                payload: request.payload,
-                target_monitor: monitor_id.0.clone(),
+                metadata: metadata.clone(),
+                layout: layout.clone(),
                 applied_at: Instant::now(),
             });
+
+            // Build the report
+            let ipc_metadata: IpcImageMetadata = metadata.into();
+            let ipc_layout: StaticImageLayoutReport = layout.into();
+
+            let report = AppliedWallpaperReport {
+                wallpaper_id,
+                renderer_id,
+                applied_at: Some(chrono_now_iso8601()),
+                static_image: Some(StaticImageApplyReport {
+                    image_metadata: ipc_metadata,
+                    layout: ipc_layout,
+                }),
+            };
 
             send_ipc_event(RendererEvent::WallpaperApplied {
                 renderer_id,
                 wallpaper_id,
                 monitor_id,
+                report: Some(report),
             })?;
         }
     }
 
     Ok(())
+}
+
+/// Get current time as ISO 8601 string without depending on chrono.
+fn chrono_now_iso8601() -> String {
+    // Simple ISO 8601-like timestamp using std::time
+    // Format: YYYY-MM-DDTHH:MM:SSZ (UTC approximation)
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = elapsed.as_secs();
+    // Calculate date components from unix timestamp
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Calculate year/month/day from days since epoch
+    let (year, month, day) = days_to_date(days);
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days_since_epoch + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Background thread that reads IPC command frames from stdin.

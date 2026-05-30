@@ -1,6 +1,6 @@
 # 008 – Wallpaper Package Format v0
 
-> Stage: `005-cloud-safe-wallpaper-package-and-apply-contract`
+> Stage: `006-cloud-safe-static-image-decode-and-layout`
 > Date: 2026-05-30
 
 ## Overview
@@ -121,6 +121,37 @@ Allowed patterns:
 - `preview.png`
 - `assets/bg/image.jpg`
 
+## Deep Validation
+
+Stage 006 introduces **deep validation** via `validate_package_deep()`, which
+performs all structural checks plus actual image decode verification:
+
+1. All structural checks from `validate_package()` run first.
+2. For `static_image` kind, the entry image is opened and decoded using
+   `load_image_metadata()`.
+3. If the image cannot be decoded (corrupt file, unsupported format), an
+   error is added to the validation report.
+4. If the image is valid, the metadata (width, height, color type, format)
+   is logged at debug level.
+
+### Validation Levels
+
+| Level | Function | Checks |
+|-------|----------|--------|
+| Manifest | `validate_manifest()` | Schema, required fields, kind, path traversal |
+| Package | `validate_package()` | All manifest checks + file existence |
+| Deep | `validate_package_deep()` | All package checks + image decode verification |
+
+### Usage
+
+```bash
+# Structural validation only
+cargo run -p wallflow-cli -- package-validate /path/to/package
+
+# Deep validation (including image decode)
+cargo run -p wallflow-cli -- package-validate /path/to/package --deep
+```
+
 ## IPC Integration
 
 When a wallpaper is applied via IPC, the `ApplyWallpaper` command carries the
@@ -139,18 +170,24 @@ ApplyWallpaperRequest {
 }
 ```
 
-The renderer validates the payload, records the applied state, and responds
-with `WallpaperApplied` or `WallpaperApplyFailed`.
+The renderer decodes the image metadata, calculates the layout, and responds
+with `WallpaperApplied` containing an `AppliedWallpaperReport` with:
+- Image metadata (dimensions, format, color type, file size)
+- Layout calculation result (destination rectangle, viewport, fit mode)
+- ISO 8601 timestamp
+
+On decode failure, `WallpaperApplyFailed` is sent with error details.
 
 ## Current Limitations
 
-- The renderer accepts and records the applied wallpaper state but does **not**
+- The renderer decodes image metadata and calculates layout but does **not**
   yet render the image to the screen. Real GPU rendering will be implemented
-  in stage 006 (winit/wgpu renderer).
+  in a future stage (winit/wgpu renderer).
 - Only `static_image` kind is supported. Video and web wallpapers will be
   added in future stages.
-- Image format validation (is this actually a valid PNG/JPEG?) is not yet
-  implemented. The dummy fixture file in the smoke test is not a real image.
+- The viewport used for layout calculation is a synthetic 1920×1080.
+  Real monitor dimensions will be used when Windows desktop integration
+  is complete.
 
 ## Future Extensions
 
@@ -158,5 +195,4 @@ with `WallpaperApplied` or `WallpaperApplyFailed`.
 - **Video entry**: Add `video` kind with `entry.video`, `entry.muted`, `entry.looping`.
 - **Web entry**: Add `web` kind with `entry.html` entry point.
 - **Package archives**: Support `.wallflow` zip archives instead of directories.
-- **Image validation**: Verify that image files are decodable.
 - **Content hashing**: SHA-256 checksums for integrity verification.
