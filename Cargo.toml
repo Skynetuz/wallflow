@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/wallflow-common",
+  "crates/wallflow-config",
+  "crates/wallflow-ipc",
+  "crates/wallflow-monitor",
+  "crates/wallflow-desktop",
+  "crates/wallflow-media",
+  "crates/wallflow-core",
+  "crates/wallflow-renderer",
+  "crates/wallflow-cli",
+  "crates/wallflow-package",
+  "crates/wallflow-render"
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+authors = ["WallFlow contributors"]
+repository = "https://example.invalid/wallflow"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time"] }
+tracing = "0.1"
+winit = "0.30"
+sha2 = "0.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+softbuffer = "0.4"
+raw-window-handle = "0.6"
+

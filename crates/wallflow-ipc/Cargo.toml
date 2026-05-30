@@ -1,0 +1,15 @@
+[package]
+name = "wallflow-ipc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+wallflow-common = { path = "../wallflow-common" }
+wallflow-package = { path = "../wallflow-package" }

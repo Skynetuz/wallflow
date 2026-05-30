@@ -1,0 +1,33 @@
+[package]
+name = "wallflow-renderer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+wallflow-common = { path = "../wallflow-common" }
+wallflow-desktop = { path = "../wallflow-desktop" }
+wallflow-ipc = { path = "../wallflow-ipc" }
+wallflow-media = { path = "../wallflow-media" }
+wallflow-package = { path = "../wallflow-package" }
+wallflow-render = { path = "../wallflow-render" }
+winit.workspace = true
+softbuffer.workspace = true
+raw-window-handle.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging"
+] }
