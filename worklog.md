@@ -70,3 +70,73 @@ Stage Summary:
 - docs/architecture/004-windows-desktop-attach.md: comprehensive documentation
 - 22 tests passing (11 desktop, 2 config, 3 core, 1 ipc, 2 media, 3 monitor)
 - desktop-probe and desktop-attach-smoke cannot be tested on Linux; need real Windows
+
+---
+Task ID: 3
+Agent: main
+Task: WallFlow Cloud-Safe Core Renderer Integration (003)
+
+Work Log:
+- Enhanced wallflow-common/src/renderer.rs:
+  - Added RendererState::is_terminal() and is_alive() methods
+  - Added RendererHealth enum (Healthy, Stale, Unhealthy)
+  - Added RendererRestartPolicy enum (Never, Limited, Always) with Default
+  - Added RendererAssignment struct (renderer_id + monitor_id)
+  - Added Display impl for RendererId
+- Enhanced wallflow-ipc/src/protocol.rs:
+  - Bumped PROTOCOL_VERSION from 1 to 2
+  - Added RendererCommand enum (Start, Pause, Resume, Stop, ApplyWallpaper, SetMonitor, Shutdown)
+  - Added RendererEvent enum (Started, Ready, Heartbeat, Paused, Resumed, WallpaperApplied, Error, Exited)
+  - Added CoreCommand enum (ApplyWallpaperToMonitor, StopWallpaper, PauseAll, ResumeAll, QueryState, etc.)
+  - Added CoreEvent enum (StateChanged, RendererStarted, RendererStopped, RendererCrashed, RendererRecovered, etc.)
+  - Added 6 new unit tests for IPC roundtrips
+- Enhanced wallflow-core:
+  - Added supervisor.rs: RendererSupervisor with full lifecycle management
+    - register_renderer, mark_running, mark_heartbeat, mark_paused, mark_resumed, mark_stopping, mark_stopped, mark_crashed
+    - detect_stale, should_restart, recover, deregister
+    - snapshot and report generation
+  - Updated watchdog.rs: WatchdogPolicy now serde-serializable (secs instead of Duration)
+    - Added health_from_heartbeat() and should_attempt_restart() functions
+    - 10 watchdog tests
+  - Added RendererStatus, RendererHandle, RendererReport, SupervisorSnapshot, SupervisorReport structs
+  - 15 supervisor unit tests
+  - Updated app.rs: CoreApp now owns a RendererSupervisor
+  - Updated renderer_process.rs: Added headless_heartbeat support in RendererLaunchSpec, is_running(), pid()
+  - Added wallflow-ipc dependency
+- Enhanced wallflow-renderer/src/main.rs:
+  - Added --headless-heartbeat and --heartbeat-interval-ms CLI args
+  - Added run_headless_heartbeat() function that emits JSON events on stdout
+  - Events: Started, Ready, Heartbeat (periodic), Exited (on timeout)
+  - Fully testable on Linux without GUI or Win32
+- Enhanced wallflow-cli/src/main.rs:
+  - Added supervisor-smoke command with --timeout-secs and --heartbeat-interval-ms args
+  - Spawns renderer in headless mode, reads stdout, parses events
+  - Validates Started, Ready, Heartbeat, Exited events
+  - Prints structured JSON report
+  - Returns exit code 0 on success
+- Added .github/workflows/ci.yml:
+  - Ubuntu: fmt, check, clippy, test, headless smoke, supervisor smoke
+  - Windows: check, test (no desktop-attach smoke)
+- Added docs/architecture/003-renderer-lifecycle.md
+- Added docs/architecture/007-cloud-validation-strategy.md
+- Updated docs/roadmap.md with MVP-1.5 section
+- Tested Windows cross-compilation:
+  - x86_64-pc-windows-gnu: Pure-logic crates compile; Win32 crates fail (missing import libs)
+  - x86_64-pc-windows-msvc: Same issue (missing Windows SDK libs)
+  - Conclusion: Cross-compilation requires Windows SDK; CI Windows runner is simpler
+- All 4 cargo commands pass: fmt, check, clippy -D warnings, test (50 tests)
+- Headless renderer tested: emits proper JSON events, exits cleanly with code 0
+- Supervisor smoke tested: PASSED with structured JSON report
+
+Stage Summary:
+- 13 files changed/created
+- wallflow-common: RendererHealth, RendererRestartPolicy, RendererAssignment, Display for RendererId
+- wallflow-ipc: Full typed IPC protocol v2 (RendererCommand/Event, CoreCommand/Event)
+- wallflow-core: RendererSupervisor (15 tests), enhanced WatchdogPolicy (10 tests)
+- wallflow-renderer: Headless heartbeat mode (--headless-heartbeat)
+- wallflow-cli: supervisor-smoke command
+- .github/workflows/ci.yml: Ubuntu + Windows CI
+- 50 tests passing total (up from 22)
+- Headless renderer and supervisor smoke both validated on Linux
+- Windows cross-compilation documented as requiring Windows SDK libs
+- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor

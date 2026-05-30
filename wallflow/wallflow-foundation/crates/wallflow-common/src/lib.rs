@@ -9,5 +9,8 @@ pub mod wallpaper;
 
 pub use error::{WallFlowError, WallFlowResult};
 pub use monitor::{MonitorId, MonitorInfo, MonitorPosition, MonitorSize};
-pub use renderer::{RendererGroupId, RendererId, RendererState};
+pub use renderer::{
+    RendererAssignment, RendererGroupId, RendererHealth, RendererId, RendererRestartPolicy,
+    RendererState,
+};
 pub use wallpaper::{PerformanceProfile, WallpaperAssignment, WallpaperId, WallpaperKind};

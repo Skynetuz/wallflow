@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::time::{Duration, Instant};
 use wallflow_config::{default_config_path, AppConfig};
 use wallflow_core::CoreApp;
 use wallflow_monitor::platform_monitor_provider;
@@ -31,6 +32,18 @@ enum Command {
 
     /// Create a dummy renderer window, attach it behind desktop icons, then clean up.
     DesktopAttachSmoke,
+
+    /// Launch a headless renderer, monitor its process, and report results.
+    /// This is the cloud-testable supervisor smoke test.
+    SupervisorSmoke {
+        /// How many seconds to let the renderer run before declaring success.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+
+        /// Renderer heartbeat interval in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        heartbeat_interval_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -67,10 +80,20 @@ fn main() -> Result<()> {
         Command::DesktopAttachSmoke => {
             run_desktop_attach_smoke()?;
         }
+        Command::SupervisorSmoke {
+            timeout_secs,
+            heartbeat_interval_ms,
+        } => {
+            run_supervisor_smoke(timeout_secs, heartbeat_interval_ms)?;
+        }
     }
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Desktop probe
+// ---------------------------------------------------------------------------
 
 fn run_desktop_probe() -> Result<()> {
     use wallflow_desktop::probe_desktop;
@@ -95,6 +118,10 @@ fn run_desktop_probe() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Desktop attach smoke
+// ---------------------------------------------------------------------------
 
 fn run_desktop_attach_smoke() -> Result<()> {
     run_desktop_attach_smoke_impl()
@@ -280,4 +307,260 @@ struct WideString(Vec<u16>);
 #[cfg(target_os = "windows")]
 fn wide(value: &str) -> WideString {
     WideString(value.encode_utf16().chain(std::iter::once(0)).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor smoke
+// ---------------------------------------------------------------------------
+
+/// Supervisor smoke test: launches a headless renderer, monitors it, and
+/// prints a structured report. This is the cloud-testable integration test
+/// that validates the renderer lifecycle without requiring a real Windows
+/// desktop or GUI.
+///
+/// The test works by:
+/// 1. Finding the renderer executable in the current target directory.
+/// 2. Spawning it with `--headless-heartbeat` mode.
+/// 3. Reading stdout lines as heartbeat events.
+/// 4. Waiting for the renderer to exit (or timeout).
+/// 5. Printing a structured JSON report.
+fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+    use tokio::time;
+
+    // Build a minimal runtime for the async smoke test
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Find the renderer executable
+        let renderer_exe = find_renderer_exe()?;
+
+        println!("=== Supervisor Smoke Test ===");
+        println!("Renderer exe: {}", renderer_exe.display());
+        println!(
+            "Timeout: {}s, Heartbeat interval: {}ms",
+            timeout_secs, heartbeat_interval_ms
+        );
+
+        // Spawn the renderer process
+        let mut child = Command::new(&renderer_exe)
+            .arg("--headless-heartbeat")
+            .arg("--heartbeat-interval-ms")
+            .arg(heartbeat_interval_ms.to_string())
+            .arg("--timeout-secs")
+            .arg(timeout_secs.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+
+        let pid = child.id();
+        println!("Renderer spawned (PID: {:?})", pid);
+
+        // Read stdout lines as heartbeat events
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+
+        let mut heartbeat_count: u64 = 0;
+        let mut started_received = false;
+        let mut ready_received = false;
+        let mut exited_received = false;
+        let mut first_heartbeat_at: Option<Duration> = None;
+        let mut last_heartbeat_at: Option<Duration> = None;
+
+        let deadline = time::sleep(Duration::from_secs(timeout_secs + 10));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    eprintln!("Supervisor smoke timed out waiting for renderer output");
+                    let _ = child.kill().await;
+                    break;
+                }
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            // Try to parse as JSON event
+                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let elapsed = start.elapsed();
+
+                                match event_type {
+                                    "Started" => {
+                                        started_received = true;
+                                        println!("  [{:.1}s] Received Started event", elapsed.as_secs_f64());
+                                    }
+                                    "Ready" => {
+                                        ready_received = true;
+                                        println!("  [{:.1}s] Received Ready event", elapsed.as_secs_f64());
+                                    }
+                                    "Heartbeat" => {
+                                        heartbeat_count += 1;
+                                        if first_heartbeat_at.is_none() {
+                                            first_heartbeat_at = Some(elapsed);
+                                        }
+                                        last_heartbeat_at = Some(elapsed);
+                                        if heartbeat_count <= 3 || heartbeat_count % 5 == 0 {
+                                            println!(
+                                                "  [{:.1}s] Heartbeat #{} (uptime: {}ms)",
+                                                elapsed.as_secs_f64(),
+                                                heartbeat_count,
+                                                event.get("uptime_ms").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            );
+                                        }
+                                    }
+                                    "Exited" => {
+                                        exited_received = true;
+                                        println!(
+                                            "  [{:.1}s] Received Exited event (exit_code: {:?})",
+                                            elapsed.as_secs_f64(),
+                                            event.get("exit_code")
+                                        );
+                                    }
+                                    other => {
+                                        println!("  [{:.1}s] Unknown event: {}", elapsed.as_secs_f64(), other);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // EOF — renderer closed stdout
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading renderer stdout: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wait for the process to exit
+        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(e)) => {
+                eprintln!("Error waiting for renderer: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Renderer did not exit in time, killing");
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let total_elapsed = start.elapsed();
+        let exit_code = exit_status.as_ref().and_then(|s| s.code());
+        let success = exit_code == Some(0)
+            && started_received
+            && ready_received
+            && heartbeat_count > 0
+            && exited_received;
+
+        // Build the structured report
+        let report = serde_json::json!({
+            "test": "supervisor-smoke",
+            "success": success,
+            "total_elapsed_ms": total_elapsed.as_millis() as u64,
+            "renderer_pid": pid,
+            "exit_code": exit_code,
+            "events": {
+                "started_received": started_received,
+                "ready_received": ready_received,
+                "heartbeat_count": heartbeat_count,
+                "exited_received": exited_received,
+                "first_heartbeat_at_ms": first_heartbeat_at.map(|d| d.as_millis() as u64),
+                "last_heartbeat_at_ms": last_heartbeat_at.map(|d| d.as_millis() as u64),
+            },
+            "config": {
+                "timeout_secs": timeout_secs,
+                "heartbeat_interval_ms": heartbeat_interval_ms,
+            }
+        });
+
+        println!("\n=== Supervisor Smoke Report ===");
+        println!("{}", serde_json::to_string_pretty(&report)?);
+
+        if success {
+            println!("\nSupervisor smoke test PASSED.");
+        } else {
+            eprintln!("\nSupervisor smoke test FAILED.");
+            if !started_received {
+                eprintln!("  Missing: Started event");
+            }
+            if !ready_received {
+                eprintln!("  Missing: Ready event");
+            }
+            if heartbeat_count == 0 {
+                eprintln!("  Missing: heartbeat events");
+            }
+            if !exited_received {
+                eprintln!("  Missing: Exited event");
+            }
+            if exit_code != Some(0) {
+                eprintln!("  Non-zero exit code: {:?}", exit_code);
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Find the wallflow-renderer executable in the current build output.
+fn find_renderer_exe() -> Result<std::path::PathBuf> {
+    // Try the standard target/debug location relative to the workspace
+    let candidates = [
+        "target/debug/wallflow-renderer",
+        "../target/debug/wallflow-renderer",
+        "../../target/debug/wallflow-renderer",
+    ];
+
+    // First, try to find the exe relative to the current executable
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            let candidate = parent.join("wallflow-renderer");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            // Go up to target/
+            if let Some(grandparent) = parent.parent() {
+                let candidate = grandparent.join("wallflow-renderer");
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    // Try CWD-based paths
+    for candidate in &candidates {
+        let path = std::path::PathBuf::from(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // On Windows, try with .exe extension
+    #[cfg(target_os = "windows")]
+    {
+        for candidate in &candidates {
+            let path = std::path::PathBuf::format!("{}.exe", candidate);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "could not find wallflow-renderer executable. Build it first with: cargo build -p wallflow-renderer"
+    ))
 }

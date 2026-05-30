@@ -6,9 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 wallflow-common = { path = "../wallflow-common" }
 wallflow-config = { path = "../wallflow-config" }
 wallflow-monitor = { path = "../wallflow-monitor" }
+wallflow-ipc = { path = "../wallflow-ipc" }

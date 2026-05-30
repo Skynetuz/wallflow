@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wallflow_common::RendererId;
@@ -37,6 +38,16 @@ struct Args {
     /// before automatically exiting. 0 = run until Ctrl+C.
     #[arg(long, default_value_t = 0)]
     timeout_secs: u64,
+
+    /// Run in headless heartbeat mode (no GUI, no Win32).
+    /// Periodically prints a heartbeat event and exits after timeout.
+    /// Suitable for cloud testing on Linux.
+    #[arg(long, default_value_t = false)]
+    headless_heartbeat: bool,
+
+    /// Heartbeat interval in milliseconds (only used with --headless-heartbeat).
+    #[arg(long, default_value_t = 500)]
+    heartbeat_interval_ms: u64,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +59,10 @@ fn main() -> Result<()> {
     let renderer_id = RendererId(args.renderer_id.unwrap_or_else(Uuid::new_v4));
 
     info!(?renderer_id, monitor = %args.monitor, wallpaper = %args.wallpaper, "renderer starting");
+
+    if args.headless_heartbeat {
+        return run_headless_heartbeat(renderer_id, args.heartbeat_interval_ms, args.timeout_secs);
+    }
 
     if args.desktop_attach {
         return run_desktop_attach_renderer(args.timeout_secs);
@@ -94,6 +109,90 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Headless heartbeat mode for cloud testing.
+///
+/// Runs without any GUI or Win32 dependencies. Periodically emits a heartbeat
+/// event (printed as JSON to stdout) and exits cleanly after the specified
+/// timeout. This mode is suitable for testing the renderer supervisor on
+/// Linux/CI without a real Windows desktop.
+fn run_headless_heartbeat(
+    renderer_id: RendererId,
+    interval_ms: u64,
+    timeout_secs: u64,
+) -> Result<()> {
+    let timeout = if timeout_secs > 0 {
+        Some(Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    let start = Instant::now();
+    let interval = Duration::from_millis(interval_ms);
+    let mut heartbeat_count: u64 = 0;
+
+    // Emit the "Started" event
+    let started_event = serde_json::json!({
+        "type": "RendererEvent",
+        "event": "Started",
+        "renderer_id": renderer_id.0.to_string(),
+        "timestamp_ms": start.elapsed().as_millis() as u64,
+    });
+    println!("{}", serde_json::to_string(&started_event)?);
+    info!(?renderer_id, "headless renderer started");
+
+    // Emit the "Ready" event
+    let ready_event = serde_json::json!({
+        "type": "RendererEvent",
+        "event": "Ready",
+        "renderer_id": renderer_id.0.to_string(),
+        "timestamp_ms": start.elapsed().as_millis() as u64,
+    });
+    println!("{}", serde_json::to_string(&ready_event)?);
+    info!(?renderer_id, "headless renderer ready");
+
+    loop {
+        // Check timeout
+        if let Some(dur) = timeout {
+            if start.elapsed() >= dur {
+                info!(
+                    ?renderer_id,
+                    heartbeat_count, "headless renderer timeout reached, exiting"
+                );
+                break;
+            }
+        }
+
+        // Sleep for the heartbeat interval
+        std::thread::sleep(interval);
+
+        heartbeat_count += 1;
+        let uptime_ms = start.elapsed().as_millis() as u64;
+
+        // Emit a heartbeat event as JSON on stdout
+        let heartbeat_event = serde_json::json!({
+            "type": "RendererEvent",
+            "event": "Heartbeat",
+            "renderer_id": renderer_id.0.to_string(),
+            "uptime_ms": uptime_ms,
+            "heartbeat_count": heartbeat_count,
+            "timestamp_ms": start.elapsed().as_millis() as u64,
+        });
+        println!("{}", serde_json::to_string(&heartbeat_event)?);
+    }
+
+    // Emit the "Exited" event
+    let exited_event = serde_json::json!({
+        "type": "RendererEvent",
+        "event": "Exited",
+        "renderer_id": renderer_id.0.to_string(),
+        "exit_code": 0,
+        "timestamp_ms": start.elapsed().as_millis() as u64,
+    });
+    println!("{}", serde_json::to_string(&exited_event)?);
+
+    Ok(())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn run_desktop_attach_renderer(_timeout_secs: u64) -> Result<()> {
     warn!("--desktop-attach is only supported on Windows");
@@ -102,7 +201,6 @@ fn run_desktop_attach_renderer(_timeout_secs: u64) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
-    use std::time::{Duration, Instant};
     use wallflow_desktop::{
         attach_window_to_desktop, detach_window_from_desktop, probe_desktop, NativeWindowHandle,
     };
