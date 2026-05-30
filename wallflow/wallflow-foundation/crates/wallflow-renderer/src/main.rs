@@ -1,10 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
+use std::io::{Read as StdRead, Write as StdWrite};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wallflow_common::RendererId;
+use wallflow_ipc::{encode_to_bytes, EventEnvelope, IpcMessage, RendererCommand, RendererEvent};
 use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
 
 #[derive(Debug, Parser)]
@@ -42,23 +44,46 @@ struct Args {
     /// Run in headless heartbeat mode (no GUI, no Win32).
     /// Periodically prints a heartbeat event and exits after timeout.
     /// Suitable for cloud testing on Linux.
+    /// This is the LEGACY mode — prefer --ipc-stdio for typed IPC.
     #[arg(long, default_value_t = false)]
     headless_heartbeat: bool,
 
-    /// Heartbeat interval in milliseconds (only used with --headless-heartbeat).
+    /// Heartbeat interval in milliseconds (used with --headless-heartbeat and --ipc-stdio).
     #[arg(long, default_value_t = 500)]
     heartbeat_interval_ms: u64,
+
+    /// Run in IPC stdio mode: read commands from stdin, write events to stdout.
+    /// All events use typed IPC frames (length-prefixed JSON).
+    /// Diagnostic logs go to stderr only. This is the preferred mode for
+    /// Core ↔ Renderer communication.
+    #[arg(long, default_value_t = false)]
+    ipc_stdio: bool,
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // In --ipc-stdio mode, stdout is reserved for IPC frames.
+    // All diagnostic output must go to stderr.
+    let use_stderr_only = std::env::args().any(|a| a == "--ipc-stdio");
+
+    if use_stderr_only {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+    }
 
     let args = Args::parse();
     let renderer_id = RendererId(args.renderer_id.unwrap_or_else(Uuid::new_v4));
 
     info!(?renderer_id, monitor = %args.monitor, wallpaper = %args.wallpaper, "renderer starting");
+
+    if args.ipc_stdio {
+        return run_ipc_stdio(renderer_id, args.heartbeat_interval_ms, args.timeout_secs);
+    }
 
     if args.headless_heartbeat {
         return run_headless_heartbeat(renderer_id, args.heartbeat_interval_ms, args.timeout_secs);
@@ -104,17 +129,232 @@ fn main() -> Result<()> {
     }
 
     // MVP smoke behavior: keep process alive until manually stopped.
-    // The next agent task should replace this with the winit event loop and IPC reader.
     std::thread::park();
     Ok(())
 }
 
-/// Headless heartbeat mode for cloud testing.
+// ---------------------------------------------------------------------------
+// IPC stdio mode
+// ---------------------------------------------------------------------------
+
+/// IPC stdio mode: the primary communication mode for Core ↔ Renderer.
+///
+/// - Reads `RendererCommand` frames from stdin on a background thread.
+/// - Writes `RendererEvent` frames to stdout from the main thread.
+/// - All diagnostic logs go to stderr.
+/// - Heartbeats are sent periodically via IPC frames.
+/// - Exits cleanly on `Shutdown` command or timeout.
+fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -> Result<()> {
+    let timeout = if timeout_secs > 0 {
+        Some(Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    let start = Instant::now();
+    let interval = Duration::from_millis(interval_ms);
+    let mut is_paused = false;
+    let mut heartbeat_count: u64 = 0;
+
+    // Channel for receiving commands from the stdin reader thread
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RendererCommand>();
+
+    // Spawn a background thread to read commands from stdin
+    std::thread::Builder::new()
+        .name("ipc-stdin-reader".into())
+        .spawn(move || {
+            if let Err(e) = stdin_reader_loop(cmd_tx) {
+                info!("stdin reader thread exited: {e}");
+            }
+        })?;
+
+    // Send Started event
+    send_ipc_event(RendererEvent::Started { renderer_id })?;
+    info!(?renderer_id, "IPC stdio renderer started");
+
+    // Send Ready event
+    send_ipc_event(RendererEvent::Ready { renderer_id })?;
+    info!(?renderer_id, "IPC stdio renderer ready");
+
+    loop {
+        // Check timeout
+        if let Some(dur) = timeout {
+            if start.elapsed() >= dur {
+                info!(
+                    ?renderer_id,
+                    heartbeat_count, "IPC stdio renderer timeout reached, exiting"
+                );
+                send_ipc_event(RendererEvent::Exited {
+                    renderer_id,
+                    exit_code: Some(0),
+                })?;
+                break;
+            }
+        }
+
+        // Check for commands (non-blocking with short timeout)
+        match cmd_rx.recv_timeout(interval) {
+            Ok(cmd) => {
+                match cmd {
+                    RendererCommand::Pause => {
+                        is_paused = true;
+                        send_ipc_event(RendererEvent::Paused { renderer_id })?;
+                        info!(?renderer_id, "renderer paused via IPC command");
+                    }
+                    RendererCommand::Resume => {
+                        is_paused = false;
+                        send_ipc_event(RendererEvent::Resumed { renderer_id })?;
+                        info!(?renderer_id, "renderer resumed via IPC command");
+                    }
+                    RendererCommand::Shutdown => {
+                        send_ipc_event(RendererEvent::Exited {
+                            renderer_id,
+                            exit_code: Some(0),
+                        })?;
+                        info!(?renderer_id, "renderer shutting down via IPC command");
+                        break;
+                    }
+                    RendererCommand::Start => {
+                        // Already started; acknowledge
+                        send_ipc_event(RendererEvent::Ready { renderer_id })?;
+                    }
+                    RendererCommand::Stop => {
+                        send_ipc_event(RendererEvent::Exited {
+                            renderer_id,
+                            exit_code: Some(0),
+                        })?;
+                        info!(?renderer_id, "renderer stopped via IPC command");
+                        break;
+                    }
+                    RendererCommand::ApplyWallpaper(assignment) => {
+                        send_ipc_event(RendererEvent::WallpaperApplied {
+                            renderer_id,
+                            monitor_id: assignment.monitor_id.clone(),
+                        })?;
+                        info!(?renderer_id, "wallpaper applied via IPC command");
+                    }
+                    RendererCommand::SetMonitor { monitor_id } => {
+                        info!(?renderer_id, ?monitor_id, "monitor changed via IPC command");
+                        let uptime_ms = start.elapsed().as_millis() as u64;
+                        send_ipc_event(RendererEvent::Heartbeat {
+                            renderer_id,
+                            uptime_ms,
+                        })?;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No command received in this interval — send heartbeat if not paused
+                if !is_paused {
+                    heartbeat_count += 1;
+                    let uptime_ms = start.elapsed().as_millis() as u64;
+                    send_ipc_event(RendererEvent::Heartbeat {
+                        renderer_id,
+                        uptime_ms,
+                    })?;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Stdin reader thread exited (EOF on stdin) — keep running until timeout
+                // but stop trying to read commands
+                info!(?renderer_id, "stdin closed, no more commands expected");
+                std::thread::sleep(interval);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Background thread that reads IPC command frames from stdin.
+/// Sends decoded commands to the main loop via the channel.
+fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result<()> {
+    use wallflow_ipc::{IpcMessage, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
+
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        // Read the 4-byte length prefix
+        let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+        match stdin.read_exact(&mut len_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // stdin closed — exit the reader thread
+                break;
+            }
+            Err(e) => {
+                warn!("error reading stdin length prefix: {e}");
+                break;
+            }
+        }
+
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_FRAME_SIZE {
+            warn!(len, "invalid IPC frame length on stdin");
+            continue;
+        }
+
+        let mut payload = vec![0u8; len];
+        if let Err(e) = stdin.read_exact(&mut payload) {
+            warn!("error reading stdin payload: {e}");
+            break;
+        }
+
+        let msg: IpcMessage = match serde_json::from_slice(&payload) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("error decoding IPC message from stdin: {e}");
+                continue;
+            }
+        };
+
+        match msg {
+            IpcMessage::Command(env) => {
+                if env.protocol_version != wallflow_ipc::PROTOCOL_VERSION {
+                    warn!(
+                        expected = wallflow_ipc::PROTOCOL_VERSION,
+                        got = env.protocol_version,
+                        "protocol version mismatch"
+                    );
+                    continue;
+                }
+                if cmd_tx.send(env.payload).is_err() {
+                    // Receiver dropped — main loop has exited
+                    break;
+                }
+            }
+            _ => {
+                warn!("expected Command message on stdin, got different message type");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Send a RendererEvent as an IPC frame to stdout.
+fn send_ipc_event(event: RendererEvent) -> Result<()> {
+    let msg = IpcMessage::Event(EventEnvelope::new(event));
+    let bytes = encode_to_bytes(&msg)?;
+    // SAFETY: We write the entire encoded frame to stdout in one call.
+    // Stdout is locked for the duration of this write to prevent interleaving.
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&bytes)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Legacy headless heartbeat mode
+// ---------------------------------------------------------------------------
+
+/// Headless heartbeat mode for cloud testing (legacy).
 ///
 /// Runs without any GUI or Win32 dependencies. Periodically emits a heartbeat
 /// event (printed as JSON to stdout) and exits cleanly after the specified
 /// timeout. This mode is suitable for testing the renderer supervisor on
 /// Linux/CI without a real Windows desktop.
+///
+/// Prefer `--ipc-stdio` for typed IPC communication.
 fn run_headless_heartbeat(
     renderer_id: RendererId,
     interval_ms: u64,
@@ -193,6 +433,10 @@ fn run_headless_heartbeat(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Desktop attach mode (Windows only)
+// ---------------------------------------------------------------------------
+
 #[cfg(not(target_os = "windows"))]
 fn run_desktop_attach_renderer(_timeout_secs: u64) -> Result<()> {
     warn!("--desktop-attach is only supported on Windows");
@@ -210,7 +454,7 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    // Step 1: Probe desktop
+    // REQUIRES_REAL_WINDOWS_VALIDATION
     let probe = probe_desktop();
     info!(
         platform_supported = probe.platform_supported,
@@ -225,7 +469,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
         anyhow::bail!("desktop attach not feasible: {err}");
     }
 
-    // Step 2: Register window class
     let class_name = wide("WallFlowRendererClass");
     let window_title = wide("WallFlow Renderer");
 
@@ -249,7 +492,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
             anyhow::bail!("RegisterClassW failed (error: {})", err.0);
         }
 
-        // Step 3: Create the renderer window (popup, full screen size)
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let hwnd = CreateWindowExW(
@@ -271,7 +513,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
         let native_handle = NativeWindowHandle(hwnd.0 as isize);
         info!(hwnd = hwnd.0 as isize, "renderer window created");
 
-        // Step 4: Attach to desktop
         let attach_report = attach_window_to_desktop(native_handle)?;
         info!(
             worker = attach_report.worker_handle.0,
@@ -279,7 +520,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
             "renderer window attached to desktop"
         );
 
-        // After SetParent, reposition the window to fill the WorkerW client area.
         // SAFETY: GetClientRect and MoveWindow are standard Win32 APIs with valid params.
         let mut rect = RECT::default();
         let _ = GetClientRect(HWND(attach_report.worker_handle.0 as *mut _), &mut rect);
@@ -293,9 +533,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
             attach_report.worker_handle.0 as usize, width, height
         );
 
-        // Step 5: Run message loop with optional timeout.
-        // Using PeekMessageW + sleep instead of GetMessageW so the timeout works
-        // even when no messages arrive.
         let start = Instant::now();
         let timeout = if timeout_secs > 0 {
             Some(Duration::from_secs(timeout_secs))
@@ -305,7 +542,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
 
         let mut msg = MSG::default();
         loop {
-            // Check timeout
             if let Some(dur) = timeout {
                 if start.elapsed() >= dur {
                     info!("timeout reached, exiting");
@@ -314,7 +550,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
             }
 
             // SAFETY: PeekMessageW with null HWND checks the thread message queue.
-            // PM_REMOVE removes the message after retrieval.
             let has_msg = PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE);
             if has_msg.as_bool() {
                 if msg.message == WM_QUIT {
@@ -324,12 +559,10 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             } else {
-                // No messages — sleep briefly to avoid busy-waiting
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
 
-        // Step 6: Detach and cleanup
         let detach_report = detach_window_from_desktop(native_handle)?;
         info!(
             success = detach_report.success,
@@ -362,7 +595,7 @@ unsafe extern "system" fn renderer_wnd_proc(
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00804040));
         let _ = FillRect(hdc, &rect, brush);
         let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush);
-        LRESULT(1) // background was erased
+        LRESULT(1)
     } else {
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }

@@ -16,6 +16,7 @@ tracing-subscriber.workspace = true
 wallflow-config = { path = "../wallflow-config" }
 wallflow-core = { path = "../wallflow-core" }
 wallflow-desktop = { path = "../wallflow-desktop" }
+wallflow-ipc = { path = "../wallflow-ipc" }
 wallflow-monitor = { path = "../wallflow-monitor" }
 
 [target.'cfg(windows)'.dependencies]

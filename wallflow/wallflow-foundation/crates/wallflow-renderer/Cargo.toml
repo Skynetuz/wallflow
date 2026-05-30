@@ -15,6 +15,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 wallflow-common = { path = "../wallflow-common" }
 wallflow-desktop = { path = "../wallflow-desktop" }
+wallflow-ipc = { path = "../wallflow-ipc" }
 wallflow-media = { path = "../wallflow-media" }
 
 [target.'cfg(windows)'.dependencies]

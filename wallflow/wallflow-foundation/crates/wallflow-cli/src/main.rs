@@ -34,10 +34,23 @@ enum Command {
     DesktopAttachSmoke,
 
     /// Launch a headless renderer, monitor its process, and report results.
-    /// This is the cloud-testable supervisor smoke test.
+    /// This is the LEGACY cloud-testable supervisor smoke test (uses stdout text).
     SupervisorSmoke {
         /// How many seconds to let the renderer run before declaring success.
         #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+
+        /// Renderer heartbeat interval in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        heartbeat_interval_ms: u64,
+    },
+
+    /// Launch a renderer in --ipc-stdio mode, exchange typed IPC frames,
+    /// exercise the full command/event lifecycle, and report results.
+    /// This is the PRIMARY cloud-testable IPC integration test.
+    IpcSupervisorSmoke {
+        /// How many seconds to let the renderer run before declaring success.
+        #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
 
         /// Renderer heartbeat interval in milliseconds.
@@ -85,6 +98,12 @@ fn main() -> Result<()> {
             heartbeat_interval_ms,
         } => {
             run_supervisor_smoke(timeout_secs, heartbeat_interval_ms)?;
+        }
+        Command::IpcSupervisorSmoke {
+            timeout_secs,
+            heartbeat_interval_ms,
+        } => {
+            run_ipc_supervisor_smoke(timeout_secs, heartbeat_interval_ms)?;
         }
     }
 
@@ -563,4 +582,283 @@ fn find_renderer_exe() -> Result<std::path::PathBuf> {
     Err(anyhow::anyhow!(
         "could not find wallflow-renderer executable. Build it first with: cargo build -p wallflow-renderer"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// IPC supervisor smoke
+// ---------------------------------------------------------------------------
+
+/// IPC supervisor smoke test: launches a renderer in `--ipc-stdio` mode,
+/// exchanges typed IPC frames, and validates the full command/event lifecycle.
+///
+/// The test flow:
+/// 1. Spawn renderer with `--ipc-stdio`
+/// 2. Wait for Started + Ready events
+/// 3. Wait for at least 2 Heartbeat events
+/// 4. Send Pause command, wait for Paused event
+/// 5. Send Resume command, wait for Resumed event
+/// 6. Send Shutdown command, wait for Exited event
+/// 7. Print structured JSON report
+fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    use tokio::time;
+    use wallflow_ipc::{RendererCommand, RendererEvent};
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let start = Instant::now();
+        let renderer_exe = find_renderer_exe()?;
+
+        println!("=== IPC Supervisor Smoke Test ===");
+        println!("Renderer exe: {}", renderer_exe.display());
+        println!(
+            "Timeout: {}s, Heartbeat interval: {}ms",
+            timeout_secs, heartbeat_interval_ms
+        );
+
+        // Spawn renderer with --ipc-stdio
+        let mut child = Command::new(&renderer_exe)
+            .arg("--ipc-stdio")
+            .arg("--heartbeat-interval-ms")
+            .arg(heartbeat_interval_ms.to_string())
+            .arg("--timeout-secs")
+            .arg(timeout_secs.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()) // renderer logs go to our stderr
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+
+        let pid = child.id();
+        println!("Renderer spawned (PID: {:?})", pid);
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
+
+        let mut stdin_writer = tokio::io::BufWriter::new(stdin);
+        let mut stdout_reader = tokio::io::BufReader::new(stdout);
+
+        let mut started_received = false;
+        let mut ready_received = false;
+        let mut heartbeat_count: u64 = 0;
+        let mut paused_received = false;
+        let mut resumed_received = false;
+        let mut exited_received = false;
+        let mut exit_code_received: Option<i32> = None;
+        let mut pause_sent = false;
+        let mut resume_sent = false;
+        let mut shutdown_sent = false;
+
+        let deadline = time::sleep(Duration::from_secs(timeout_secs + 10));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    eprintln!("IPC supervisor smoke timed out");
+                    let _ = child.kill().await;
+                    break;
+                }
+                result = read_ipc_frame(&mut stdout_reader) => {
+                    match result {
+                        Ok(Some(event)) => {
+                            let elapsed = start.elapsed();
+                            match &event {
+                                RendererEvent::Started { renderer_id } => {
+                                    started_received = true;
+                                    println!("  [{:.1}s] Started (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                }
+                                RendererEvent::Ready { renderer_id } => {
+                                    ready_received = true;
+                                    println!("  [{:.1}s] Ready (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                }
+                                RendererEvent::Heartbeat { renderer_id, uptime_ms } => {
+                                    heartbeat_count += 1;
+                                    if heartbeat_count <= 3 {
+                                        println!("  [{:.1}s] Heartbeat #{} (uptime: {}ms, renderer_id: {})",
+                                            elapsed.as_secs_f64(), heartbeat_count, uptime_ms, renderer_id);
+                                    }
+                                    // After 2 heartbeats, send Pause
+                                    if heartbeat_count == 2 && !pause_sent {
+                                        println!("  [{:.1}s] Sending Pause command...", elapsed.as_secs_f64());
+                                        send_ipc_command(&mut stdin_writer, RendererCommand::Pause).await?;
+                                        pause_sent = true;
+                                    }
+                                }
+                                RendererEvent::Paused { renderer_id } => {
+                                    paused_received = true;
+                                    println!("  [{:.1}s] Paused (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                    // Now send Resume
+                                    if !resume_sent {
+                                        println!("  [{:.1}s] Sending Resume command...", elapsed.as_secs_f64());
+                                        send_ipc_command(&mut stdin_writer, RendererCommand::Resume).await?;
+                                        resume_sent = true;
+                                    }
+                                }
+                                RendererEvent::Resumed { renderer_id } => {
+                                    resumed_received = true;
+                                    println!("  [{:.1}s] Resumed (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                    // Now send Shutdown
+                                    if !shutdown_sent {
+                                        println!("  [{:.1}s] Sending Shutdown command...", elapsed.as_secs_f64());
+                                        send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
+                                        shutdown_sent = true;
+                                    }
+                                }
+                                RendererEvent::Exited { renderer_id, exit_code } => {
+                                    exited_received = true;
+                                    exit_code_received = *exit_code;
+                                    println!("  [{:.1}s] Exited (exit_code: {:?}, renderer_id: {})", elapsed.as_secs_f64(), exit_code, renderer_id);
+                                    break;
+                                }
+                                RendererEvent::Error { renderer_id, message } => {
+                                    eprintln!("  [{:.1}s] Error from renderer {}: {}", elapsed.as_secs_f64(), renderer_id, message);
+                                }
+                                RendererEvent::WallpaperApplied { renderer_id, monitor_id } => {
+                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, monitor_id.0);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // EOF
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading IPC frame: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drop the stdin writer to close the pipe
+        drop(stdin_writer);
+
+        // Wait for the process to exit
+        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(e)) => {
+                eprintln!("Error waiting for renderer: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Renderer did not exit in time, killing");
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let total_elapsed = start.elapsed();
+        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
+
+        let success = process_exit_code == Some(0)
+            && started_received
+            && ready_received
+            && heartbeat_count >= 2
+            && paused_received
+            && resumed_received
+            && exited_received
+            && exit_code_received == Some(0);
+
+        let report = serde_json::json!({
+            "test": "ipc-supervisor-smoke",
+            "success": success,
+            "total_elapsed_ms": total_elapsed.as_millis() as u64,
+            "renderer_pid": pid,
+            "process_exit_code": process_exit_code,
+            "ipc_exit_code": exit_code_received,
+            "events": {
+                "started_received": started_received,
+                "ready_received": ready_received,
+                "heartbeat_count": heartbeat_count,
+                "paused_received": paused_received,
+                "resumed_received": resumed_received,
+                "exited_received": exited_received,
+            },
+            "commands_sent": {
+                "pause_sent": pause_sent,
+                "resume_sent": resume_sent,
+                "shutdown_sent": shutdown_sent,
+            },
+            "config": {
+                "timeout_secs": timeout_secs,
+                "heartbeat_interval_ms": heartbeat_interval_ms,
+            }
+        });
+
+        println!("\n=== IPC Supervisor Smoke Report ===");
+        println!("{}", serde_json::to_string_pretty(&report)?);
+
+        if success {
+            println!("\nIPC supervisor smoke test PASSED.");
+        } else {
+            eprintln!("\nIPC supervisor smoke test FAILED.");
+            if !started_received { eprintln!("  Missing: Started event"); }
+            if !ready_received { eprintln!("  Missing: Ready event"); }
+            if heartbeat_count < 2 { eprintln!("  Missing: at least 2 heartbeats (got {})", heartbeat_count); }
+            if !paused_received { eprintln!("  Missing: Paused event"); }
+            if !resumed_received { eprintln!("  Missing: Resumed event"); }
+            if !exited_received { eprintln!("  Missing: Exited event"); }
+            if exit_code_received != Some(0) { eprintln!("  Non-zero IPC exit code: {:?}", exit_code_received); }
+            if process_exit_code != Some(0) { eprintln!("  Non-zero process exit code: {:?}", process_exit_code); }
+        }
+
+        Ok(())
+    })
+}
+
+/// Read one IPC frame from the renderer's stdout and extract the RendererEvent.
+async fn read_ipc_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<wallflow_ipc::RendererEvent>> {
+    use tokio::io::AsyncReadExt;
+    use wallflow_ipc::{IpcMessage, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
+
+    let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_FRAME_SIZE {
+        return Err(anyhow::anyhow!("invalid IPC frame length: {len}"));
+    }
+
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
+
+    let msg: IpcMessage = serde_json::from_slice(&payload)?;
+
+    match msg {
+        IpcMessage::Event(env) => Ok(Some(env.payload)),
+        _ => {
+            eprintln!("expected Event message from renderer, got different message type");
+            Ok(None)
+        }
+    }
+}
+
+/// Send one IPC command frame to the renderer's stdin.
+async fn send_ipc_command<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    cmd: wallflow_ipc::RendererCommand,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use wallflow_ipc::{encode_to_bytes, CommandEnvelope, IpcMessage};
+
+    let msg = IpcMessage::Command(CommandEnvelope::new(cmd));
+    let bytes = encode_to_bytes(&msg)?;
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(())
 }

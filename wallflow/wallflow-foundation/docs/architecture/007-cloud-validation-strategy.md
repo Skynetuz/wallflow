@@ -1,7 +1,7 @@
 # 007 – Cloud Validation Strategy
 
-> Stage: `003-cloud-safe-core-renderer-integration`
-> Date: 2026-05-30
+> Stage: `004-cloud-safe-typed-ipc-renderer-control`
+> Date: 2026-05-30 (updated)
 
 ## Problem
 
@@ -21,13 +21,25 @@ are tested with standard `cargo test` on any platform.
 - WatchdogPolicy decisions (fresh/stale/safe mode)
 - RendererRestartPolicy evaluation
 - IPC serialization/deserialization roundtrips
+- IPC frame encoding/decoding (sync and async)
+- Protocol version validation
+- CommandEnvelope / EventEnvelope construction
+- IpcMessage tagged union serialization
 - RendererAssignment and monitor mapping
 - Monitor diff detection
 - Configuration loading/saving
-- Headless renderer heartbeat mode
-- Supervisor smoke test (process-based)
 
-### Tier 2: Windows Compile-Check (CI)
+### Tier 2: Cloud-Testable Integration (Linux/CI process smoke)
+
+Integration tests that spawn actual renderer processes and validate the
+full IPC command/event lifecycle via piped stdio.
+
+- `--ipc-stdio` renderer mode (typed IPC frames over stdin/stdout)
+- `ipc-supervisor-smoke` CLI command (Start → Ready → Heartbeat → Pause →
+  Paused → Resume → Resumed → Shutdown → Exited)
+- `--headless-heartbeat` renderer mode (legacy stdout text mode)
+
+### Tier 3: Windows Compile-Check (CI)
 
 Code that compiles on Windows but does not require an interactive desktop.
 Validated via GitHub Actions on `windows-latest`.
@@ -36,7 +48,7 @@ Validated via GitHub Actions on `windows-latest`.
 - Full workspace `cargo test --workspace` on Windows
 - Unit tests that use `cfg(windows)` stubs
 
-### Tier 3: REQUIRES_REAL_WINDOWS_VALIDATION
+### Tier 4: REQUIRES_REAL_WINDOWS_VALIDATION
 
 Code that depends on the actual Windows desktop environment: Explorer,
 Progman, WorkerW, and the full Win32 window hierarchy.
@@ -67,44 +79,52 @@ The GitHub Actions Windows runner provides a much simpler solution.
 ## CI Strategy
 
 ```
-┌─────────────────────────────────┐
-│        Ubuntu Runner            │
-│                                 │
-│  1. cargo fmt --all --check     │
-│  2. cargo check --workspace     │
-│  3. cargo clippy (strict)       │
-│  4. cargo test --workspace      │
-│  5. headless heartbeat smoke    │
-│  6. supervisor smoke            │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│        Ubuntu Runner (lint + test)        │
+│                                           │
+│  1. cargo fmt --all -- --check            │
+│  2. cargo check --workspace               │
+│  3. cargo clippy (strict)                 │
+│  4. cargo test --workspace (67 tests)      │
+└──────────────────────────────────────────┘
 
-┌─────────────────────────────────┐
-│        Windows Runner           │
-│                                 │
-│  1. cargo check --workspace     │
-│  2. cargo test --workspace      │
-│                                 │
-│  (No desktop-attach smoke:      │
-│   runner lacks interactive      │
-│   Explorer desktop session)     │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│        Ubuntu Runner (IPC smoke)          │
+│                                           │
+│  1. cargo build -p wallflow-renderer      │
+│  2. cargo build -p wallflow-cli           │
+│  3. ipc-supervisor-smoke (typed IPC)      │
+│  4. legacy headless heartbeat smoke       │
+└──────────────────────────────────────────┘
+
+┌──────────────────────────────────────────┐
+│        Windows Runner                     │
+│                                           │
+│  1. cargo check --workspace               │
+│  2. cargo test --workspace                │
+│                                           │
+│  (No desktop-attach smoke:                │
+│   runner lacks interactive                │
+│   Explorer desktop session)               │
+└──────────────────────────────────────────┘
 ```
 
-## Headless Testing Pattern
+## IPC Testing Pattern
 
-The headless heartbeat mode enables a powerful testing pattern:
+The `--ipc-stdio` mode enables a powerful testing pattern:
 
-1. **Renderer**: Run with `--headless-heartbeat --timeout-secs N` — emits
-   JSON events on stdout, no GUI needed.
-2. **Supervisor/CLI**: Spawn the renderer as a subprocess, read stdout,
-   parse events, validate lifecycle.
-3. **Integration**: The supervisor-smoke command wraps this pattern and
+1. **Renderer**: Run with `--ipc-stdio --heartbeat-interval-ms N --timeout-secs T`.
+   Reads typed `RendererCommand` frames from stdin, writes typed
+   `RendererEvent` frames to stdout. All logs go to stderr.
+2. **Supervisor/CLI**: Spawn the renderer as a subprocess, pipe stdin/stdout,
+   exchange typed IPC frames, validate the full lifecycle.
+3. **Integration**: The `ipc-supervisor-smoke` command wraps this pattern and
    produces a structured JSON report.
 
 This pattern can be extended:
-- Replace stdout-based events with IPC pipe events once the IPC layer is
-  connected to the renderer process.
 - Add latency measurements, error injection, and crash recovery scenarios.
+- Replace stdio pipes with Windows named pipes or Unix domain sockets.
+- Add protocol fuzzing and malformed frame handling tests.
 
 ## Marking Convention
 
@@ -124,7 +144,5 @@ This marker appears in:
 
 ## Next Steps
 
-- **Stage 004**: Connect IPC layer to renderer process (replace stdout
-  heartbeat with typed IPC frames)
 - **Stage 005**: Implement winit/wgpu-based rendering loop
 - **Stage 006**: Real Windows validation with manual testing on Win10/11

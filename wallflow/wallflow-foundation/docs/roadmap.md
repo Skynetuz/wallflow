@@ -47,12 +47,34 @@
 - Multi-monitor desktop attach.
 - DPI change handling.
 
+## MVP-1.7 Cloud-safe typed IPC renderer control ✅
+
+*Completed in stage 004.*
+
+- IPC protocol v3: `IpcMessage` tagged union for unambiguous frame decoding.
+- `CommandEnvelope<T>` and `EventEnvelope<T>` with protocol version and request ID.
+- Length-prefixed JSON framing: async (`read_frame`/`write_frame`) and sync
+  (`encode_to_bytes`/`decode_from_bytes`) helpers.
+- Frame validation: max size, invalid length, invalid JSON, protocol version mismatch.
+- `--ipc-stdio` renderer mode: reads commands from stdin, writes events to stdout,
+  all logs to stderr.
+- Full IPC command/event lifecycle: Start, Pause, Resume, Stop, Shutdown,
+  ApplyWallpaper, SetMonitor.
+- `ipc-supervisor-smoke` CLI command: spawns renderer, exchanges typed IPC
+  frames, validates complete lifecycle (Started → Ready → Heartbeat → Pause →
+  Paused → Resume → Resumed → Shutdown → Exited).
+- Legacy `--headless-heartbeat` mode preserved for backward compatibility.
+- 67 unit tests passing on Linux (24 in wallflow-ipc, 25 in wallflow-core,
+  11 in wallflow-desktop, 2 in wallflow-config, 2 in wallflow-media, 3 in
+  wallflow-monitor).
+- GitHub Actions CI updated with IPC smoke test.
+- IPC contract documented in `docs/architecture/002-ipc-contract.md`.
+
 ## MVP-2 static wallpaper
 
 - Add winit/wgpu static renderer.
 - Per-monitor placement.
 - Fullscreen detection pause policy.
-- Connect IPC pipe to renderer process.
 
 ## MVP-3 video wallpaper
 

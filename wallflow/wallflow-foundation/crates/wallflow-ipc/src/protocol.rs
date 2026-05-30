@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use wallflow_common::{MonitorId, MonitorInfo, RendererId, RendererState, WallpaperAssignment};
+use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperAssignment};
 
 /// IPC protocol version. Increment on breaking changes.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Version 2 added the new RendererCommand/RendererEvent/CoreCommand/CoreEvent types.
+/// Version 3 adds the IpcMessage tagged union for unambiguous frame decoding.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
@@ -20,7 +22,95 @@ impl Default for RequestId {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IpcMessage — tagged union for unambiguous frame decoding
+// ---------------------------------------------------------------------------
+
+/// Top-level IPC message that wraps all possible message types.
+///
+/// Every frame on the IPC transport is an `IpcMessage`. The `direction` tag
+/// makes it unambiguous which type of payload is inside, even for a reader
+/// that does not know what to expect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "direction", content = "payload")]
+pub enum IpcMessage {
+    /// A command sent from Core to a Renderer process.
+    #[serde(rename = "core_to_renderer")]
+    Command(CommandEnvelope<RendererCommand>),
+    /// An event sent from a Renderer process to Core.
+    #[serde(rename = "renderer_to_core")]
+    Event(EventEnvelope<RendererEvent>),
+    /// A command sent from an external source (UI, CLI) to Core.
+    #[serde(rename = "external_to_core")]
+    CoreCommand(CommandEnvelope<CoreCommand>),
+    /// An event broadcast by Core to listeners.
+    #[serde(rename = "core_broadcast")]
+    CoreEvent(EventEnvelope<CoreEvent>),
+}
+
+// ---------------------------------------------------------------------------
+// Typed envelopes
+// ---------------------------------------------------------------------------
+
+/// Envelope for commands (which carry a request_id for correlation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandEnvelope<T> {
+    pub protocol_version: u16,
+    pub request_id: RequestId,
+    pub payload: T,
+}
+
+impl<T> CommandEnvelope<T> {
+    pub fn new(payload: T) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: RequestId::new(),
+            payload,
+        }
+    }
+
+    pub fn with_request_id(request_id: RequestId, payload: T) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            payload,
+        }
+    }
+}
+
+/// Envelope for events (which do not require a request_id by default).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelope<T> {
+    pub protocol_version: u16,
+    pub request_id: Option<RequestId>,
+    pub payload: T,
+}
+
+impl<T> EventEnvelope<T> {
+    pub fn new(payload: T) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: None,
+            payload,
+        }
+    }
+
+    /// Create an event envelope that correlates with a specific request.
+    pub fn with_correlation(request_id: RequestId, payload: T) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Some(request_id),
+            payload,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy generic envelope (kept for backward compatibility)
+// ---------------------------------------------------------------------------
+
 /// Generic envelope wrapping every IPC message with metadata.
+/// Prefer `CommandEnvelope` or `EventEnvelope` for new code.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
     pub protocol_version: u16,
@@ -155,53 +245,41 @@ pub enum CoreEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy protocol types (kept for backward compatibility during migration)
+// Helper functions for creating typed IPC messages
 // ---------------------------------------------------------------------------
 
-/// Legacy core command for monitor-level operations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum LegacyCoreCommand {
-    GetMonitors,
-    ApplyWallpaper(WallpaperAssignment),
-    PauseMonitor { monitor_id: MonitorId },
-    ResumeMonitor { monitor_id: MonitorId },
-    StopMonitor { monitor_id: MonitorId },
-    EnterSafeMode { reason: String },
-    ExitSafeMode,
-    Shutdown,
+/// Create a `RendererCommand` IPC message ready for framing.
+pub fn renderer_command(cmd: RendererCommand) -> IpcMessage {
+    IpcMessage::Command(CommandEnvelope::new(cmd))
 }
 
-/// Legacy renderer command set.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum LegacyRendererCommand {
-    Load(WallpaperAssignment),
-    Play,
-    Pause,
-    Stop,
-    Shutdown,
+/// Create a `RendererEvent` IPC message ready for framing.
+pub fn renderer_event(event: RendererEvent) -> IpcMessage {
+    IpcMessage::Event(EventEnvelope::new(event))
 }
 
-/// Legacy renderer event set.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum LegacyRendererEvent {
-    Ready {
-        renderer_id: RendererId,
-    },
-    FirstFrame {
-        renderer_id: RendererId,
-    },
-    Heartbeat {
-        renderer_id: RendererId,
-        uptime_ms: u64,
-    },
-    StateChanged {
-        renderer_id: RendererId,
-        state: RendererState,
-    },
-    Error {
-        renderer_id: RendererId,
-        message: String,
-    },
+/// Create a `CoreCommand` IPC message ready for framing.
+pub fn core_command(cmd: CoreCommand) -> IpcMessage {
+    IpcMessage::CoreCommand(CommandEnvelope::new(cmd))
+}
+
+/// Create a `CoreEvent` IPC message ready for framing.
+pub fn core_event(event: CoreEvent) -> IpcMessage {
+    IpcMessage::CoreEvent(EventEnvelope::new(event))
+}
+
+/// Extract the renderer_id from a RendererEvent, if present.
+pub fn renderer_event_id(event: &RendererEvent) -> RendererId {
+    match event {
+        RendererEvent::Started { renderer_id } => *renderer_id,
+        RendererEvent::Ready { renderer_id } => *renderer_id,
+        RendererEvent::Heartbeat { renderer_id, .. } => *renderer_id,
+        RendererEvent::Paused { renderer_id } => *renderer_id,
+        RendererEvent::Resumed { renderer_id } => *renderer_id,
+        RendererEvent::WallpaperApplied { renderer_id, .. } => *renderer_id,
+        RendererEvent::Error { renderer_id, .. } => *renderer_id,
+        RendererEvent::Exited { renderer_id, .. } => *renderer_id,
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +351,77 @@ mod tests {
         let env = Envelope::request(rid, RendererCommand::Shutdown);
         assert_eq!(env.protocol_version, PROTOCOL_VERSION);
         assert!(env.request_id.is_some());
+    }
+
+    #[test]
+    fn ipc_message_command_roundtrip() {
+        let msg = renderer_command(RendererCommand::Pause);
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: IpcMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn ipc_message_event_roundtrip() {
+        let rid = RendererId::new();
+        let msg = renderer_event(RendererEvent::Ready { renderer_id: rid });
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: IpcMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn command_envelope_has_request_id() {
+        let env = CommandEnvelope::new(RendererCommand::Start);
+        assert_eq!(env.protocol_version, PROTOCOL_VERSION);
+        // request_id is always present in CommandEnvelope
+    }
+
+    #[test]
+    fn event_envelope_no_request_id_by_default() {
+        let env = EventEnvelope::new(RendererEvent::Started {
+            renderer_id: RendererId::new(),
+        });
+        assert_eq!(env.protocol_version, PROTOCOL_VERSION);
+        assert!(env.request_id.is_none());
+    }
+
+    #[test]
+    fn event_envelope_with_correlation() {
+        let rid = RequestId::new();
+        let env = EventEnvelope::with_correlation(
+            rid,
+            RendererEvent::Started {
+                renderer_id: RendererId::new(),
+            },
+        );
+        assert!(env.request_id.is_some());
+        assert_eq!(env.request_id.as_ref().expect("id"), &rid);
+    }
+
+    #[test]
+    fn renderer_event_id_extraction() {
+        let rid = RendererId::new();
+        let event = RendererEvent::Heartbeat {
+            renderer_id: rid,
+            uptime_ms: 100,
+        };
+        assert_eq!(renderer_event_id(&event), rid);
+    }
+
+    #[test]
+    fn ipc_message_core_command_roundtrip() {
+        let msg = core_command(CoreCommand::PauseAll);
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: IpcMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn ipc_message_core_event_roundtrip() {
+        let msg = core_event(CoreEvent::Ready);
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let decoded: IpcMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(msg, decoded);
     }
 }
