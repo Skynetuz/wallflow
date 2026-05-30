@@ -1,0 +1,16 @@
+[package]
+name = "wallflow-renderer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+wallflow-common = { path = "../wallflow-common" }
+wallflow-desktop = { path = "../wallflow-desktop" }
+wallflow-media = { path = "../wallflow-media" }
