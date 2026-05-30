@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
-use wallflow_common::{RendererId, WallpaperId};
+use wallflow_common::{
+    RenderSimLayoutReport, RenderSimReport, RendererId, RendererRuntimeMode, RendererRuntimeState,
+    RendererViewport, WallpaperId, WindowRuntimeConfig,
+};
 use wallflow_ipc::{
     encode_to_bytes, AppliedWallpaperReport, ApplyWallpaperRequest, EventEnvelope,
     IpcImageMetadata, IpcMessage, RendererCommand, RendererEvent, StaticImageApplyReport,
@@ -40,7 +43,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     desktop_attach: bool,
 
-    /// How many seconds the desktop-attached renderer window should stay alive
+    /// How many seconds the renderer window should stay alive
     /// before automatically exiting. 0 = run until Ctrl+C.
     #[arg(long, default_value_t = 0)]
     timeout_secs: u64,
@@ -59,13 +62,32 @@ struct Args {
     /// Run in IPC stdio mode: read commands from stdin, write events to stdout.
     /// All events use typed IPC frames (length-prefixed JSON).
     /// Diagnostic logs go to stderr only. This is the preferred mode for
-    /// Core ↔ Renderer communication.
+    /// Core <-> Renderer communication.
     #[arg(long, default_value_t = false)]
     ipc_stdio: bool,
+
+    /// Run in windowed static mode: opens a winit window for static wallpaper
+    /// display. The window runs for the specified timeout or until closed.
+    /// Requires a display server (Wayland/X11 on Linux, Desktop on Windows).
+    #[arg(long, default_value_t = false)]
+    windowed_static: bool,
+
+    /// Run in headless render simulation mode: no window, synthetic viewport,
+    /// produces a structured JSON report. Suitable for CI and cloud testing.
+    #[arg(long, default_value_t = false)]
+    headless_render_sim: bool,
+
+    /// Window/viewport width in pixels (used with --windowed-static and --headless-render-sim).
+    #[arg(long, default_value_t = 800)]
+    width: u32,
+
+    /// Window/viewport height in pixels (used with --windowed-static and --headless-render-sim).
+    #[arg(long, default_value_t = 450)]
+    height: u32,
 }
 
 // ---------------------------------------------------------------------------
-// Loaded static image state (replaces AppliedWallpaperState)
+// Loaded static image state
 // ---------------------------------------------------------------------------
 
 /// Tracks a loaded static image wallpaper with decoded metadata and layout.
@@ -79,9 +101,9 @@ struct LoadedStaticImageState {
 }
 
 fn main() -> Result<()> {
-    // In --ipc-stdio mode, stdout is reserved for IPC frames.
-    // All diagnostic output must go to stderr.
-    let use_stderr_only = std::env::args().any(|a| a == "--ipc-stdio");
+    // Determine if stderr-only logging is needed
+    let use_stderr_only =
+        std::env::args().any(|a| a == "--ipc-stdio" || a == "--headless-render-sim");
 
     if use_stderr_only {
         tracing_subscriber::fmt()
@@ -99,8 +121,29 @@ fn main() -> Result<()> {
 
     info!(?renderer_id, monitor = %args.monitor, wallpaper = %args.wallpaper, "renderer starting");
 
+    // Dispatch to the correct runtime mode
     if args.ipc_stdio {
         return run_ipc_stdio(renderer_id, args.heartbeat_interval_ms, args.timeout_secs);
+    }
+
+    if args.headless_render_sim {
+        return run_headless_render_sim(
+            renderer_id,
+            args.width,
+            args.height,
+            args.timeout_secs,
+            args.source.as_deref(),
+        );
+    }
+
+    if args.windowed_static {
+        return run_windowed_static(
+            renderer_id,
+            args.width,
+            args.height,
+            args.timeout_secs,
+            args.source.as_deref(),
+        );
     }
 
     if args.headless_heartbeat {
@@ -111,6 +154,7 @@ fn main() -> Result<()> {
         return run_desktop_attach_renderer(args.timeout_secs);
     }
 
+    // Default: no specific mode — keep process alive for smoke testing
     match args.wallpaper.as_str() {
         "none" => {
             info!("no wallpaper requested; renderer stays alive for smoke testing");
@@ -152,10 +196,381 @@ fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Headless render simulation mode
+// ---------------------------------------------------------------------------
+
+/// Headless render simulation: no window, synthetic viewport, structured report.
+///
+/// This mode simulates the renderer lifecycle without requiring a display server.
+/// It goes through the state transitions Starting → Ready → Running → ShuttingDown → Exited,
+/// optionally applying a static wallpaper and calculating its layout for the given viewport.
+/// The result is a structured JSON report printed to stdout.
+fn run_headless_render_sim(
+    renderer_id: RendererId,
+    width: u32,
+    height: u32,
+    timeout_secs: u64,
+    source: Option<&std::path::Path>,
+) -> Result<()> {
+    let start = Instant::now();
+    let timeout = if timeout_secs > 0 {
+        Duration::from_secs(timeout_secs)
+    } else {
+        Duration::from_secs(5) // Default 5s for sim mode
+    };
+
+    let viewport = RendererViewport::new(width, height);
+    if !viewport.is_valid() {
+        let report = RenderSimReport {
+            mode: RendererRuntimeMode::HeadlessRenderSim,
+            viewport,
+            state_transitions: vec![RendererRuntimeState::Starting, RendererRuntimeState::Failed],
+            wallpaper_applied: false,
+            layout_report: None,
+            total_sim_time_ms: start.elapsed().as_millis() as u64,
+            exit_code: 1,
+        };
+        eprintln!("invalid viewport dimensions: {}x{}", width, height);
+        let json = serde_json::to_string(&report)?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    let mut state_transitions = vec![RendererRuntimeState::Starting];
+    info!(?renderer_id, %viewport, "headless render sim starting");
+
+    state_transitions.push(RendererRuntimeState::Ready);
+    info!(?renderer_id, "headless render sim ready");
+
+    state_transitions.push(RendererRuntimeState::Running);
+
+    // Try to apply a static wallpaper if a source image path was provided
+    let mut wallpaper_applied = false;
+    let mut layout_report: Option<RenderSimLayoutReport> = None;
+
+    if let Some(image_path) = source {
+        match apply_static_wallpaper_for_sim(image_path, &viewport) {
+            Ok((metadata, layout)) => {
+                wallpaper_applied = true;
+                layout_report = Some(RenderSimLayoutReport {
+                    image_width: metadata.width,
+                    image_height: metadata.height,
+                    viewport_width: viewport.width,
+                    viewport_height: viewport.height,
+                    destination_x: layout.destination_rect.x,
+                    destination_y: layout.destination_rect.y,
+                    destination_width: layout.destination_rect.width,
+                    destination_height: layout.destination_rect.height,
+                });
+                info!(
+                    ?renderer_id,
+                    image_path = %image_path.display(),
+                    image_width = metadata.width,
+                    image_height = metadata.height,
+                    "wallpaper applied in render sim"
+                );
+            }
+            Err(e) => {
+                warn!(?renderer_id, error = %e, "failed to apply wallpaper in render sim");
+            }
+        }
+    }
+
+    // Simulate the running period
+    while start.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    state_transitions.push(RendererRuntimeState::ShuttingDown);
+    state_transitions.push(RendererRuntimeState::Exited);
+
+    let total_sim_time_ms = start.elapsed().as_millis() as u64;
+
+    let report = RenderSimReport {
+        mode: RendererRuntimeMode::HeadlessRenderSim,
+        viewport,
+        state_transitions,
+        wallpaper_applied,
+        layout_report,
+        total_sim_time_ms,
+        exit_code: 0,
+    };
+
+    let json = serde_json::to_string(&report)?;
+    println!("{json}");
+
+    info!(
+        ?renderer_id,
+        total_sim_time_ms, "headless render sim completed"
+    );
+    Ok(())
+}
+
+/// Apply a static wallpaper for render simulation (no IPC, direct return).
+fn apply_static_wallpaper_for_sim(
+    image_path: &std::path::Path,
+    viewport: &RendererViewport,
+) -> Result<(
+    wallflow_package::ImageMetadata,
+    wallflow_package::StaticImageLayout,
+)> {
+    let metadata = wallflow_package::load_image_metadata(image_path)?;
+
+    let image_size = wallflow_package::ImageSize {
+        width: metadata.width,
+        height: metadata.height,
+    };
+    let vp = wallflow_package::Viewport {
+        width: viewport.width,
+        height: viewport.height,
+    };
+
+    let layout = wallflow_package::calculate_static_image_layout(
+        image_size,
+        vp,
+        wallflow_common::FitMode::Cover,
+        "#000000".into(),
+    )?;
+
+    Ok((metadata, layout))
+}
+
+// ---------------------------------------------------------------------------
+// Windowed static mode (winit)
+// ---------------------------------------------------------------------------
+
+/// Application handler for the windowed static renderer using winit 0.30 ApplicationHandler API.
+struct WindowedStaticApp {
+    renderer_id: RendererId,
+    viewport: RendererViewport,
+    loaded_state: Option<LoadedStaticImageState>,
+    timeout: Option<Duration>,
+    start: Instant,
+    window: Option<winit::window::Window>,
+}
+
+impl winit::application::ApplicationHandler for WindowedStaticApp {
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            winit::event::WindowEvent::CloseRequested => {
+                info!(?self.renderer_id, "window close requested, exiting");
+                event_loop.exit();
+            }
+            winit::event::WindowEvent::Resized(physical_size) => {
+                let new_w = physical_size.width;
+                let new_h = physical_size.height;
+                if new_w > 0 && new_h > 0 {
+                    self.viewport = RendererViewport::new(new_w, new_h);
+
+                    // Recalculate layout if wallpaper is applied
+                    if let Some(ref state) = self.loaded_state {
+                        let vp = wallflow_package::Viewport {
+                            width: new_w,
+                            height: new_h,
+                        };
+                        match wallflow_package::calculate_static_image_layout(
+                            wallflow_package::ImageSize {
+                                width: state.metadata.width,
+                                height: state.metadata.height,
+                            },
+                            vp,
+                            state.layout.fit,
+                            state.layout.background.clone(),
+                        ) {
+                            Ok(new_layout) => {
+                                info!(
+                                    ?self.renderer_id,
+                                    viewport = %self.viewport,
+                                    dest_w = new_layout.destination_rect.width,
+                                    dest_h = new_layout.destination_rect.height,
+                                    "layout recalculated after resize"
+                                );
+                                let wallpaper_id = state.wallpaper_id;
+                                let metadata = state.metadata.clone();
+                                let applied_at = state.applied_at;
+                                self.loaded_state = Some(LoadedStaticImageState {
+                                    wallpaper_id,
+                                    metadata,
+                                    layout: new_layout,
+                                    applied_at,
+                                });
+                            }
+                            Err(e) => {
+                                warn!(?self.renderer_id, error = %e, "failed to recalculate layout after resize");
+                            }
+                        }
+                    }
+
+                    info!(
+                        ?self.renderer_id,
+                        width = new_w,
+                        height = new_h,
+                        "window resized"
+                    );
+                }
+            }
+            winit::event::WindowEvent::Destroyed => {
+                info!(?self.renderer_id, "window destroyed, exiting");
+                event_loop.exit();
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Check timeout
+        if let Some(dur) = self.timeout {
+            if self.start.elapsed() >= dur {
+                info!(
+                    ?self.renderer_id,
+                    elapsed_ms = self.start.elapsed().as_millis() as u64,
+                    "windowed static renderer timeout reached, exiting"
+                );
+                event_loop.exit();
+            }
+        }
+        // Request a redraw so the window remains responsive
+        if let Some(ref window) = self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Create the window when the event loop is ready (on first resume)
+        if self.window.is_none() {
+            let window_config = WindowRuntimeConfig::new(self.viewport.width, self.viewport.height);
+            let window_attrs = winit::window::WindowAttributes::default()
+                .with_title(&window_config.title)
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    window_config.width,
+                    window_config.height,
+                ));
+
+            match event_loop.create_window(window_attrs) {
+                Ok(w) => {
+                    info!(?self.renderer_id, "winit window created");
+                    self.window = Some(w);
+                }
+                Err(e) => {
+                    warn!(?self.renderer_id, error = %e, "failed to create winit window");
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+}
+
+/// Windowed static mode: creates a winit window, optionally loads a static wallpaper,
+/// runs the event loop until timeout or window close.
+///
+/// This mode requires a display server. On Linux this means Wayland or X11.
+/// If no display server is available, it returns a graceful error without panicking.
+fn run_windowed_static(
+    renderer_id: RendererId,
+    width: u32,
+    height: u32,
+    timeout_secs: u64,
+    source: Option<&std::path::Path>,
+) -> Result<()> {
+    let start = Instant::now();
+    let timeout = if timeout_secs > 0 {
+        Some(Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    let viewport = RendererViewport::new(width, height);
+    let mut loaded_state: Option<LoadedStaticImageState> = None;
+
+    info!(?renderer_id, %viewport, "windowed static renderer starting");
+
+    // Try to apply a static wallpaper if source was provided
+    if let Some(image_path) = source {
+        match apply_static_wallpaper_for_windowed(image_path, &viewport) {
+            Ok(state) => {
+                info!(
+                    ?renderer_id,
+                    image_path = %image_path.display(),
+                    image_width = state.metadata.width,
+                    image_height = state.metadata.height,
+                    "wallpaper applied in windowed mode"
+                );
+                loaded_state = Some(state);
+            }
+            Err(e) => {
+                warn!(?renderer_id, error = %e, "failed to apply wallpaper in windowed mode");
+            }
+        }
+    }
+
+    // Create the winit event loop
+    let event_loop = match winit::event_loop::EventLoop::new() {
+        Ok(el) => el,
+        Err(e) => {
+            // No display server available — return a clear error without panic
+            let msg = format!("failed to create winit event loop (no display server?): {e}");
+            warn!(?renderer_id, error = %msg, "cannot open window");
+            eprintln!("{msg}");
+            return Err(anyhow::anyhow!("{msg}"));
+        }
+    };
+
+    let mut app = WindowedStaticApp {
+        renderer_id,
+        viewport,
+        loaded_state,
+        timeout,
+        start,
+        window: None,
+    };
+
+    event_loop.run_app(&mut app)?;
+
+    info!(?renderer_id, "windowed static renderer exited");
+    Ok(())
+}
+
+/// Apply a static wallpaper for windowed mode (no IPC, direct return).
+fn apply_static_wallpaper_for_windowed(
+    image_path: &std::path::Path,
+    viewport: &RendererViewport,
+) -> Result<LoadedStaticImageState> {
+    let metadata = wallflow_package::load_image_metadata(image_path)?;
+
+    let image_size = wallflow_package::ImageSize {
+        width: metadata.width,
+        height: metadata.height,
+    };
+    let vp = wallflow_package::Viewport {
+        width: viewport.width,
+        height: viewport.height,
+    };
+
+    let layout = wallflow_package::calculate_static_image_layout(
+        image_size,
+        vp,
+        wallflow_common::FitMode::Cover,
+        "#000000".into(),
+    )?;
+
+    Ok(LoadedStaticImageState {
+        wallpaper_id: WallpaperId::new(),
+        metadata,
+        layout,
+        applied_at: Instant::now(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // IPC stdio mode
 // ---------------------------------------------------------------------------
 
-/// IPC stdio mode: the primary communication mode for Core ↔ Renderer.
+/// IPC stdio mode: the primary communication mode for Core <-> Renderer.
 ///
 /// - Reads `RendererCommand` frames from stdin on a background thread.
 /// - Writes `RendererEvent` frames to stdout from the main thread.
@@ -411,20 +826,16 @@ fn handle_apply_wallpaper(
 
 /// Get current time as ISO 8601 string without depending on chrono.
 fn chrono_now_iso8601() -> String {
-    // Simple ISO 8601-like timestamp using std::time
-    // Format: YYYY-MM-DDTHH:MM:SSZ (UTC approximation)
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = elapsed.as_secs();
-    // Calculate date components from unix timestamp
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
 
-    // Calculate year/month/day from days since epoch
     let (year, month, day) = days_to_date(days);
 
     format!(
@@ -435,7 +846,6 @@ fn chrono_now_iso8601() -> String {
 
 /// Convert days since Unix epoch to (year, month, day).
 fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days_since_epoch + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -450,18 +860,15 @@ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
 }
 
 /// Background thread that reads IPC command frames from stdin.
-/// Sends decoded commands to the main loop via the channel.
 fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result<()> {
     use wallflow_ipc::{IpcMessage, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
 
     let mut stdin = std::io::stdin().lock();
     loop {
-        // Read the 4-byte length prefix
         let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
         match stdin.read_exact(&mut len_buf) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // stdin closed — exit the reader thread
                 break;
             }
             Err(e) => {
@@ -501,7 +908,6 @@ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result
                     continue;
                 }
                 if cmd_tx.send(env.payload).is_err() {
-                    // Receiver dropped — main loop has exited
                     break;
                 }
             }
@@ -518,8 +924,6 @@ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result
 fn send_ipc_event(event: RendererEvent) -> Result<()> {
     let msg = IpcMessage::Event(EventEnvelope::new(event));
     let bytes = encode_to_bytes(&msg)?;
-    // SAFETY: We write the entire encoded frame to stdout in one call.
-    // Stdout is locked for the duration of this write to prevent interleaving.
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&bytes)?;
     stdout.flush()?;
@@ -530,14 +934,6 @@ fn send_ipc_event(event: RendererEvent) -> Result<()> {
 // Legacy headless heartbeat mode
 // ---------------------------------------------------------------------------
 
-/// Headless heartbeat mode for cloud testing (legacy).
-///
-/// Runs without any GUI or Win32 dependencies. Periodically emits a heartbeat
-/// event (printed as JSON to stdout) and exits cleanly after the specified
-/// timeout. This mode is suitable for testing the renderer supervisor on
-/// Linux/CI without a real Windows desktop.
-///
-/// Prefer `--ipc-stdio` for typed IPC communication.
 fn run_headless_heartbeat(
     renderer_id: RendererId,
     interval_ms: u64,
@@ -553,7 +949,6 @@ fn run_headless_heartbeat(
     let interval = Duration::from_millis(interval_ms);
     let mut heartbeat_count: u64 = 0;
 
-    // Emit the "Started" event
     let started_event = serde_json::json!({
         "type": "RendererEvent",
         "event": "Started",
@@ -563,7 +958,6 @@ fn run_headless_heartbeat(
     println!("{}", serde_json::to_string(&started_event)?);
     info!(?renderer_id, "headless renderer started");
 
-    // Emit the "Ready" event
     let ready_event = serde_json::json!({
         "type": "RendererEvent",
         "event": "Ready",
@@ -574,7 +968,6 @@ fn run_headless_heartbeat(
     info!(?renderer_id, "headless renderer ready");
 
     loop {
-        // Check timeout
         if let Some(dur) = timeout {
             if start.elapsed() >= dur {
                 info!(
@@ -585,13 +978,11 @@ fn run_headless_heartbeat(
             }
         }
 
-        // Sleep for the heartbeat interval
         std::thread::sleep(interval);
 
         heartbeat_count += 1;
         let uptime_ms = start.elapsed().as_millis() as u64;
 
-        // Emit a heartbeat event as JSON on stdout
         let heartbeat_event = serde_json::json!({
             "type": "RendererEvent",
             "event": "Heartbeat",
@@ -603,7 +994,6 @@ fn run_headless_heartbeat(
         println!("{}", serde_json::to_string(&heartbeat_event)?);
     }
 
-    // Emit the "Exited" event
     let exited_event = serde_json::json!({
         "type": "RendererEvent",
         "event": "Exited",
@@ -655,8 +1045,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
     let class_name = wide("WallFlowRendererClass");
     let window_title = wide("WallFlow Renderer");
 
-    // SAFETY: RegisterClassW and CreateWindowExW are standard Win32 window
-    // creation APIs. The WNDCLASSW struct is properly initialized.
     unsafe {
         let module = GetModuleHandleW(PCWSTR::null())
             .map_err(|e| anyhow::anyhow!("GetModuleHandleW failed: {e}"))?;
@@ -703,7 +1091,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
             "renderer window attached to desktop"
         );
 
-        // SAFETY: GetClientRect and MoveWindow are standard Win32 APIs with valid params.
         let mut rect = RECT::default();
         let _ = GetClientRect(HWND(attach_report.worker_handle.0 as *mut _), &mut rect);
         let width = rect.right - rect.left;
@@ -732,7 +1119,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
                 }
             }
 
-            // SAFETY: PeekMessageW with null HWND checks the thread message queue.
             let has_msg = PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE);
             if has_msg.as_bool() {
                 if msg.message == WM_QUIT {
@@ -770,8 +1156,6 @@ unsafe extern "system" fn renderer_wnd_proc(
         PostQuitMessage(0);
         LRESULT(0)
     } else if msg == WM_ERASEBKGND {
-        // SAFETY: wParam is the HDC passed by WM_ERASEBKGND. GetClientRect
-        // and FillRect are standard GDI APIs with valid parameters.
         let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
         let mut rect = windows::Win32::Foundation::RECT::default();
         let _ = GetClientRect(hwnd, &mut rect);

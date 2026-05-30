@@ -106,6 +106,11 @@ jobs:
           cargo run -p wallflow-cli -- apply-static-smoke --timeout-secs 10 --heartbeat-interval-ms 500
           echo "Apply static smoke test completed"
 
+      - name: Render sim smoke test
+        run: |
+          cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 5 --width 800 --height 450
+          echo "Render sim smoke test completed"
+
       - name: Legacy headless heartbeat smoke
         run: |
           timeout 15 ./target/debug/wallflow-renderer --headless-heartbeat --heartbeat-interval-ms 500 --timeout-secs 5 || true

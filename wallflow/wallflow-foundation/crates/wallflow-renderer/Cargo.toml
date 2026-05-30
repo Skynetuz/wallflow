@@ -19,6 +19,7 @@ wallflow-desktop = { path = "../wallflow-desktop" }
 wallflow-ipc = { path = "../wallflow-ipc" }
 wallflow-media = { path = "../wallflow-media" }
 wallflow-package = { path = "../wallflow-package" }
+winit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

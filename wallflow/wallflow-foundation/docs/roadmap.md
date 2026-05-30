@@ -130,11 +130,40 @@
 - Layout with actual monitor dimensions (not synthetic 1920×1080).
 - Visual correctness of each fit mode.
 
+## MVP-2.1 Windowed static renderer ✅
+
+*Completed in stage 007.*
+
+- `winit` 0.30 added as workspace dependency for cross-platform window management.
+- `RendererRuntimeMode` enum: `HeadlessIpc`, `HeadlessRenderSim`, `WindowedStatic`.
+- `RendererRuntimeState` lifecycle: Starting → Ready → Running → Paused → ShuttingDown → Exited / Failed.
+- `RendererViewport` type with width, height, and optional DPI scale factor.
+- `WindowRuntimeConfig` type for windowed renderer parameters.
+- `RenderSimReport` and `RenderSimLayoutReport` structured output types.
+- `--headless-render-sim` renderer mode: synthetic viewport, no display server, JSON report.
+- `--windowed-static` renderer mode: winit 0.30 ApplicationHandler event loop, real window.
+- `render-sim-smoke` CLI command: full renderer lifecycle + wallpaper apply + layout verification in CI.
+- Viewport resize handling with automatic layout recalculation in `--windowed-static` mode.
+- `ApplicationHandler` pattern for winit 0.30 (resumed creates window, about_to_wait checks timeout).
+- Desktop attach not yet connected to winit window (requires REQUIRES_REAL_WINDOWS_VALIDATION).
+- Renderer runtime architecture documented in `docs/architecture/010-renderer-window-runtime.md`.
+
+### REQUIRES_REAL_WINDOWS_VALIDATION
+
+- `--windowed-static` on Windows (winit creates a Win32 window; must verify on real desktop)
+- Desktop attach with winit window (`SetParent()` on winit-managed HWND is untested)
+- Viewport resize from real monitor events (not just synthetic resize)
+- Layout with actual monitor dimensions (not synthetic 1920×1080)
+- Visual correctness of each fit mode
+- DPI scale factor changes (WM_DPICHANGED)
+- Explorer restart tolerance with winit event loop
+
 ## MVP-2 static wallpaper
 
-- Add winit/wgpu static renderer.
+- Add wgpu rendering pipeline to the windowed static renderer.
 - Per-monitor placement.
 - Fullscreen detection pause policy.
+- Connect desktop attach to winit window on Windows.
 
 ## MVP-3 video wallpaper
 

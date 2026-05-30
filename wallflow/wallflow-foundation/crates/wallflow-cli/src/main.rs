@@ -80,6 +80,24 @@ enum Command {
         #[arg(long, default_value_t = false)]
         deep: bool,
     },
+
+    /// Create a test wallpaper package, launch the renderer in
+    /// --headless-render-sim mode with a static wallpaper, and verify
+    /// the layout report. This is the cloud-testable render simulation
+    /// integration test.
+    RenderSimSmoke {
+        /// How many seconds to let the renderer simulation run.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+
+        /// Viewport width for the simulation.
+        #[arg(long, default_value_t = 800)]
+        width: u32,
+
+        /// Viewport height for the simulation.
+        #[arg(long, default_value_t = 450)]
+        height: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -136,6 +154,13 @@ fn main() -> Result<()> {
         }
         Command::PackageValidate { path, deep } => {
             run_package_validate(&path, deep)?;
+        }
+        Command::RenderSimSmoke {
+            timeout_secs,
+            width,
+            height,
+        } => {
+            run_render_sim_smoke(timeout_secs, width, height)?;
         }
     }
 
@@ -1166,4 +1191,249 @@ fn run_package_validate(path: &str, deep: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Render sim smoke test
+// ---------------------------------------------------------------------------
+
+fn run_render_sim_smoke(timeout_secs: u64, width: u32, height: u32) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    use tokio::time;
+    use wallflow_common::{RenderSimReport, RendererRuntimeMode, RendererRuntimeState};
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Step 1: Create a temporary test wallpaper package with a REAL 2x2 PNG
+        let temp_dir = std::env::temp_dir().join("wallflow-render-sim-smoke");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("content"))?;
+
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        let image_path = temp_dir.join("content/wallpaper.png");
+        img.save(&image_path)?;
+
+        let image_path_str = image_path.to_string_lossy().to_string();
+
+        println!("=== Render Sim Smoke Test ===");
+        println!("Test image: {}", image_path.display());
+        println!("Viewport: {}x{}", width, height);
+        println!("Timeout: {}s", timeout_secs);
+
+        // Step 2: Spawn renderer in --headless-render-sim mode with --source
+        let renderer_exe = find_renderer_exe()?;
+        println!("Renderer exe: {}", renderer_exe.display());
+
+        let mut child = Command::new(&renderer_exe)
+            .arg("--headless-render-sim")
+            .arg("--width")
+            .arg(width.to_string())
+            .arg("--height")
+            .arg(height.to_string())
+            .arg("--timeout-secs")
+            .arg(timeout_secs.to_string())
+            .arg("--source")
+            .arg(&image_path_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+
+        let pid = child.id();
+        println!("Renderer spawned (PID: {:?})", pid);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
+        let stdout_reader = tokio::io::BufReader::new(stdout);
+
+        // Read the render sim report from stdout (one JSON line)
+        let deadline = time::sleep(Duration::from_secs(timeout_secs + 15));
+        tokio::pin!(deadline);
+
+        let mut report_json = String::new();
+        let mut report_received = false;
+
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = stdout_reader.lines();
+
+        tokio::select! {
+            _ = &mut deadline => {
+                eprintln!("Render sim smoke timed out waiting for report");
+                let _ = child.kill().await;
+            }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        report_json = line;
+                        report_received = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Error reading renderer stdout: {e}");
+                    }
+                }
+            }
+        }
+
+        // Wait for the process to exit
+        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(e)) => {
+                eprintln!("Error waiting for renderer: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Renderer did not exit in time, killing");
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let total_elapsed = start.elapsed();
+        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
+
+        // Parse and verify the report
+        let mut mode_ok = false;
+        let mut viewport_ok = false;
+        let mut state_transitions_ok = false;
+        let mut wallpaper_applied_ok = false;
+        let mut layout_ok = false;
+        let mut exit_code_ok = false;
+
+        if report_received {
+            match serde_json::from_str::<RenderSimReport>(&report_json) {
+                Ok(report) => {
+                    println!("\n=== Render Sim Report ===");
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+
+                    // Verify mode
+                    if report.mode == RendererRuntimeMode::HeadlessRenderSim {
+                        mode_ok = true;
+                    }
+
+                    // Verify viewport
+                    if report.viewport.width == width && report.viewport.height == height {
+                        viewport_ok = true;
+                    }
+
+                    // Verify state transitions include the expected sequence
+                    if report
+                        .state_transitions
+                        .contains(&RendererRuntimeState::Starting)
+                        && report
+                            .state_transitions
+                            .contains(&RendererRuntimeState::Ready)
+                        && report
+                            .state_transitions
+                            .contains(&RendererRuntimeState::Running)
+                        && report
+                            .state_transitions
+                            .contains(&RendererRuntimeState::Exited)
+                    {
+                        state_transitions_ok = true;
+                    }
+
+                    // Verify wallpaper was applied
+                    if report.wallpaper_applied {
+                        wallpaper_applied_ok = true;
+                    }
+
+                    // Verify layout report
+                    if let Some(ref layout) = report.layout_report {
+                        if layout.image_width == 2
+                            && layout.image_height == 2
+                            && layout.viewport_width == width
+                            && layout.viewport_height == height
+                            && layout.destination_width > 0.0
+                            && layout.destination_height > 0.0
+                        {
+                            layout_ok = true;
+                        }
+                    }
+
+                    // Verify exit code
+                    if report.exit_code == 0 {
+                        exit_code_ok = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to parse render sim report: {e}");
+                    eprintln!("Raw output: {report_json}");
+                }
+            }
+        }
+
+        let success = report_received
+            && mode_ok
+            && viewport_ok
+            && state_transitions_ok
+            && wallpaper_applied_ok
+            && layout_ok
+            && exit_code_ok
+            && process_exit_code == Some(0);
+
+        let verification = serde_json::json!({
+            "report_received": report_received,
+            "mode_ok": mode_ok,
+            "viewport_ok": viewport_ok,
+            "state_transitions_ok": state_transitions_ok,
+            "wallpaper_applied_ok": wallpaper_applied_ok,
+            "layout_ok": layout_ok,
+            "exit_code_ok": exit_code_ok,
+            "process_exit_code": process_exit_code,
+        });
+
+        let report = serde_json::json!({
+            "test": "render-sim-smoke",
+            "success": success,
+            "total_elapsed_ms": total_elapsed.as_millis() as u64,
+            "renderer_pid": pid,
+            "verification": verification,
+            "config": {
+                "timeout_secs": timeout_secs,
+                "width": width,
+                "height": height,
+            }
+        });
+
+        println!("\n=== Render Sim Smoke Report ===");
+        println!("{}", serde_json::to_string_pretty(&report)?);
+
+        if success {
+            println!("\nRender sim smoke test PASSED.");
+        } else {
+            eprintln!("\nRender sim smoke test FAILED.");
+            if !report_received {
+                eprintln!("  Missing: render sim report");
+            }
+            if !mode_ok {
+                eprintln!("  Verification: mode not HeadlessRenderSim");
+            }
+            if !viewport_ok {
+                eprintln!("  Verification: viewport mismatch");
+            }
+            if !state_transitions_ok {
+                eprintln!("  Verification: state transitions incomplete");
+            }
+            if !wallpaper_applied_ok {
+                eprintln!("  Verification: wallpaper not applied");
+            }
+            if !layout_ok {
+                eprintln!("  Verification: layout report invalid");
+            }
+            if !exit_code_ok {
+                eprintln!("  Verification: exit code not 0");
+            }
+        }
+
+        // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    })
 }

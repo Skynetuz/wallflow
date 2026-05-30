@@ -442,4 +442,88 @@ mod tests {
                 .expect("layout");
         assert_eq!(layout.background, "#1a1a2e");
     }
+
+    // --- Stage 007: viewport 800×450 tests for render sim ---
+
+    #[test]
+    fn cover_2x2_into_800x450_viewport() {
+        // 2x2 image into 800x450 viewport (render sim default)
+        // scale = max(800/2, 450/2) = max(400, 225) = 400
+        // dest_w = 2*400 = 800, dest_h = 2*400 = 800
+        // x = (800-800)/2 = 0, y = (450-800)/2 = -175
+        let image = ImageSize {
+            width: 2,
+            height: 2,
+        };
+        let viewport = Viewport {
+            width: 800,
+            height: 450,
+        };
+        let layout = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string())
+            .expect("layout");
+        assert_eq!(layout.destination_rect.width, 800.0);
+        assert_eq!(layout.destination_rect.height, 800.0);
+        assert_eq!(layout.destination_rect.x, 0.0);
+        assert_eq!(layout.destination_rect.y, -175.0);
+    }
+
+    #[test]
+    fn contain_2x2_into_800x450_viewport() {
+        // scale = min(800/2, 450/2) = min(400, 225) = 225
+        // dest_w = 2*225 = 450, dest_h = 2*225 = 450
+        // x = (800-450)/2 = 175, y = (450-450)/2 = 0
+        let image = ImageSize {
+            width: 2,
+            height: 2,
+        };
+        let viewport = Viewport {
+            width: 800,
+            height: 450,
+        };
+        let layout =
+            calculate_static_image_layout(image, viewport, FitMode::Contain, BG.to_string())
+                .expect("layout");
+        assert_eq!(layout.destination_rect.width, 450.0);
+        assert_eq!(layout.destination_rect.height, 450.0);
+        assert_eq!(layout.destination_rect.x, 175.0);
+        assert_eq!(layout.destination_rect.y, 0.0);
+    }
+
+    #[test]
+    fn stretch_2x2_into_800x450_viewport() {
+        let image = ImageSize {
+            width: 2,
+            height: 2,
+        };
+        let viewport = Viewport {
+            width: 800,
+            height: 450,
+        };
+        let layout =
+            calculate_static_image_layout(image, viewport, FitMode::Stretch, BG.to_string())
+                .expect("layout");
+        assert_eq!(layout.destination_rect.x, 0.0);
+        assert_eq!(layout.destination_rect.y, 0.0);
+        assert_eq!(layout.destination_rect.width, 800.0);
+        assert_eq!(layout.destination_rect.height, 450.0);
+    }
+
+    #[test]
+    fn center_2x2_into_800x450_viewport() {
+        let image = ImageSize {
+            width: 2,
+            height: 2,
+        };
+        let viewport = Viewport {
+            width: 800,
+            height: 450,
+        };
+        let layout =
+            calculate_static_image_layout(image, viewport, FitMode::Center, BG.to_string())
+                .expect("layout");
+        assert_eq!(layout.destination_rect.width, 2.0);
+        assert_eq!(layout.destination_rect.height, 2.0);
+        assert_eq!(layout.destination_rect.x, 399.0);
+        assert_eq!(layout.destination_rect.y, 224.0);
+    }
 }
