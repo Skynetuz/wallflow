@@ -30,7 +30,9 @@ pub struct StaticRenderInput {
 /// 7. Returns the `RenderOutput`.
 ///
 /// Uses nearest-neighbor scaling (temporary; bilinear/Lanczos can be added later).
-pub fn render_static_image_cpu(input: StaticRenderInput) -> Result<RenderOutput, StaticRenderError> {
+pub fn render_static_image_cpu(
+    input: StaticRenderInput,
+) -> Result<RenderOutput, StaticRenderError> {
     // Validate viewport
     if input.viewport.width == 0 || input.viewport.height == 0 {
         return Err(StaticRenderError::InvalidViewport {
@@ -40,8 +42,8 @@ pub fn render_static_image_cpu(input: StaticRenderInput) -> Result<RenderOutput,
     }
 
     // Parse background color
-    let bg_color = RgbaColor::parse_hex(&input.background)
-        .map_err(StaticRenderError::InvalidBackground)?;
+    let bg_color =
+        RgbaColor::parse_hex(&input.background).map_err(StaticRenderError::InvalidBackground)?;
 
     // Open and decode image
     let img = image::open(&input.image_path).map_err(|e| {
@@ -279,7 +281,6 @@ mod tests {
     #[test]
     fn render_cover_creates_correct_output_dimensions() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(
             &img_path,
@@ -313,7 +314,6 @@ mod tests {
     #[test]
     fn render_contain_creates_correct_output_dimensions() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
 
@@ -335,7 +335,6 @@ mod tests {
 
     #[test]
     fn render_stretch_creates_correct_output_dimensions() {
-        let dir = unique_test_dir();
         let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
@@ -359,7 +358,6 @@ mod tests {
     #[test]
     fn render_center_creates_correct_output_dimensions() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
 
@@ -381,7 +379,6 @@ mod tests {
 
     #[test]
     fn render_tile_creates_correct_output_dimensions() {
-        let dir = unique_test_dir();
         let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
@@ -428,7 +425,6 @@ mod tests {
     #[test]
     fn invalid_background_fails() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
 
@@ -455,7 +451,6 @@ mod tests {
 
     #[test]
     fn checksum_stable() {
-        let dir = unique_test_dir();
         let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([128, 64, 32, 255]); 4]);
@@ -492,7 +487,6 @@ mod tests {
     #[test]
     fn output_png_roundtrip() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([255, 0, 0, 255]); 4]);
 
@@ -522,7 +516,6 @@ mod tests {
     #[test]
     fn stretch_2x2_into_4x4_pixels() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         // 2x2 image: red, green, blue, white
         create_test_png(
@@ -530,9 +523,9 @@ mod tests {
             2,
             2,
             &[
-                image::Rgba([255, 0, 0, 255]),   // top-left: red
-                image::Rgba([0, 255, 0, 255]),   // top-right: green
-                image::Rgba([0, 0, 255, 255]),   // bottom-left: blue
+                image::Rgba([255, 0, 0, 255]),     // top-left: red
+                image::Rgba([0, 255, 0, 255]),     // top-right: green
+                image::Rgba([0, 0, 255, 255]),     // bottom-left: blue
                 image::Rgba([255, 255, 255, 255]), // bottom-right: white
             ],
         );
@@ -562,7 +555,6 @@ mod tests {
 
     #[test]
     fn center_2x2_into_4x4_pixels() {
-        let dir = unique_test_dir();
         let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(
@@ -604,7 +596,6 @@ mod tests {
     #[test]
     fn contain_with_background() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         // 2x2 square image into 4x2 viewport (wider than tall)
         // Contain: scale = min(4/2, 2/2) = min(2, 1) = 1
@@ -636,7 +627,11 @@ mod tests {
 
         // Pixel (0,0) should be green background (left padding)
         let px = get_pixel(&output, 0, 0);
-        assert_eq!(px, [0, 255, 0, 255], "pixel (0,0) should be green background");
+        assert_eq!(
+            px,
+            [0, 255, 0, 255],
+            "pixel (0,0) should be green background"
+        );
 
         // Pixel (1,0) should be red (left edge of contained image)
         let px = get_pixel(&output, 1, 0);
@@ -646,7 +641,6 @@ mod tests {
     #[test]
     fn tile_into_5x5_pixels() {
         let dir = unique_test_dir();
-        let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         // 2x2 image: each pixel a distinct color
         create_test_png(
@@ -654,9 +648,9 @@ mod tests {
             2,
             2,
             &[
-                image::Rgba([255, 0, 0, 255]),   // (0,0) red
-                image::Rgba([0, 255, 0, 255]),   // (1,0) green
-                image::Rgba([0, 0, 255, 255]),   // (0,1) blue
+                image::Rgba([255, 0, 0, 255]),     // (0,0) red
+                image::Rgba([0, 255, 0, 255]),     // (1,0) green
+                image::Rgba([0, 0, 255, 255]),     // (0,1) blue
                 image::Rgba([255, 255, 255, 255]), // (1,1) white
             ],
         );
@@ -704,7 +698,6 @@ mod tests {
 
     #[test]
     fn render_output_metadata() {
-        let dir = unique_test_dir();
         let dir = unique_test_dir();
         let img_path = dir.join("test.png");
         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);

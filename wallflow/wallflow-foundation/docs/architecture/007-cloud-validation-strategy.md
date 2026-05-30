@@ -39,7 +39,12 @@ full IPC command/event lifecycle or the full renderer lifecycle via piped stdio.
   Paused → Resume → Resumed → Shutdown → Exited)
 - `--headless-heartbeat` renderer mode (legacy stdout text mode)
 - `--headless-render-sim` renderer mode (full lifecycle + layout, no display server)
+- `--headless-render-sim --source --render-output --fit` mode (actual pixel rendering + PNG output)
 - `render-sim-smoke` CLI command (renderer lifecycle + wallpaper apply + layout verification)
+- `render-output-smoke` CLI command (full render pipeline: test PNG → CPU render → verify output PNG)
+- CPU reference renderer producing actual RGBA pixel data for all fit modes
+- SHA-256 checksum stability tests
+- Pixel-level rendering tests (stretch, center, contain, tile)
 
 ### Tier 3: Windows Compile-Check (CI)
 
@@ -87,16 +92,19 @@ The GitHub Actions Windows runner provides a much simpler solution.
 │  1. cargo fmt --all -- --check            │
 │  2. cargo check --workspace               │
 │  3. cargo clippy (strict)                 │
-│  4. cargo test --workspace (67 tests)      │
+│  4. cargo test --workspace (164 tests)     │
 └──────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
-│        Ubuntu Runner (IPC smoke)          │
+│     Ubuntu Runner (IPC + render smoke)    │
 │                                           │
 │  1. cargo build -p wallflow-renderer      │
 │  2. cargo build -p wallflow-cli           │
 │  3. ipc-supervisor-smoke (typed IPC)      │
-│  4. legacy headless heartbeat smoke       │
+│  4. apply-static-smoke (wallpaper apply)  │
+│  5. render-sim-smoke (full lifecycle)     │
+│  6. render-output-smoke (pixel render)    │
+│  7. legacy headless heartbeat smoke       │
 └──────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
@@ -216,23 +224,42 @@ cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 3 --width 1920 --he
 
 ### CI Integration
 
-The `render-sim-smoke` command should be added to the Ubuntu CI runner after
-the existing IPC smoke tests:
+The `render-sim-smoke` and `render-output-smoke` commands run on the Ubuntu
+CI runner after the existing IPC smoke tests:
 
 ```
 ┌──────────────────────────────────────────┐
-│        Ubuntu Runner (IPC + render sim)   │
+│   Ubuntu Runner (IPC + render smoke)      │
 │                                           │
 │  1. cargo build -p wallflow-renderer      │
 │  2. cargo build -p wallflow-cli           │
 │  3. ipc-supervisor-smoke (typed IPC)      │
-│  4. legacy headless heartbeat smoke       │
+│  4. apply-static-smoke (wallpaper apply)  │
 │  5. render-sim-smoke (full lifecycle)     │
+│  6. render-output-smoke (pixel render)    │
+│  7. legacy headless heartbeat smoke       │
 └──────────────────────────────────────────┘
 ```
 
-This test runs in seconds and requires no special hardware, display server,
-or GPU — making it ideal for every pull request and merge to main.
+These tests run in seconds and require no special hardware, display server,
+or GPU — making them ideal for every pull request and merge to main.
+
+## Render Output Smoke Test (render-output-smoke)
+
+The `render-output-smoke` CLI command validates the full CPU render pipeline
+end-to-end: it creates a 2×2 test PNG with distinct pixel colors, runs the
+renderer in `--headless-render-sim` mode with `--source` and `--render-output`,
+then verifies:
+
+1. The output PNG file exists on disk.
+2. The output PNG decodes successfully with the `image` crate.
+3. The output dimensions match the specified viewport (800×450).
+4. A SHA-256 checksum is present in the structured report.
+5. The renderer process exits with code 0.
+
+This test exercises the complete render path from image decode through layout
+calculation to pixel compositing and PNG serialization. It is the most
+comprehensive cloud-testable validation of the rendering pipeline.
 
 ## Marking Convention
 
@@ -252,6 +279,6 @@ This marker appears in:
 
 ## Next Steps
 
-- **Stage 008**: Add wgpu rendering pipeline to the windowed static renderer
-- **Stage 009**: Connect desktop attach to winit window on Windows
-- **Stage 010**: Real Windows validation with manual testing on Win10/11
+- **Stage 009**: Add wgpu rendering pipeline to the windowed static renderer
+- **Stage 010**: Connect desktop attach to winit window on Windows
+- **Stage 011**: Real Windows validation with manual testing on Win10/11

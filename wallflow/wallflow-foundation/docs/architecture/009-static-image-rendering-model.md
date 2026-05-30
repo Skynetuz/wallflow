@@ -169,12 +169,29 @@ In the current implementation, the renderer uses a synthetic viewport of
 When real Windows desktop integration is implemented, the viewport will be
 sourced from `MonitorInfo.size_px`.
 
+## Render Output (CPU Reference)
+
+The layout calculation described above determines *where* and *how large* the image should be drawn, but does not produce actual pixels. The render output layer in `wallflow-render` takes the layout result and composites real RGBA pixel data.
+
+For full details, see `docs/architecture/011-static-render-output.md`.
+
+The render pipeline is:
+
+1. **Image Decode** — `load_image_metadata()` reads dimensions (as above).
+2. **Full Pixel Decode** — `image::open()` loads the full pixel data and converts to RGBA8.
+3. **Layout Calculation** — `calculate_static_image_layout()` computes the destination rectangle (as above).
+4. **Pixel Compositing** — `render_static_image_cpu()` fills the viewport buffer with the background color, then draws the image according to the fit mode using nearest-neighbor scaling.
+5. **Output** — The resulting `RenderOutput` contains the RGBA pixel buffer, and can be saved as PNG or checksummed with SHA-256.
+
+The CPU reference renderer is fully cloud-testable. It validates that each fit mode produces the correct pixel output, including background fill, clipping, and tiling, without requiring a GPU or display server.
+
 ## REQUIRES_REAL_WINDOWS_VALIDATION
 
 The following items require validation on a real Windows environment:
 
 - Layout with actual monitor dimensions (not synthetic 1920×1080)
-- Visual correctness of each fit mode (cover cropping, contain letterboxing,
+- Visual correctness of each fit mode on a real display (cover cropping, contain letterboxing,
   stretch distortion, center positioning, tile tiling)
 - Background color rendering in contain/center modes
 - Clip behavior when destination rect extends beyond viewport
+- GPU-rendered output matching the CPU reference output
