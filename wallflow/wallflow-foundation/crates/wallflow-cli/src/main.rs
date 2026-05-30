@@ -112,6 +112,11 @@ enum Command {
     /// outputs a skipped report and exits with code 0. If available, performs
     /// a minimal offscreen clear render and verifies the output.
     WgpuSmoke,
+
+    /// Run the presenter simulation smoke test: creates a test PNG, runs the
+    /// renderer in --presenter-sim mode, and verifies the structured JSON report.
+    /// This is the cloud-testable softbuffer presenter integration test.
+    PresenterSimSmoke,
 }
 
 fn main() -> Result<()> {
@@ -184,6 +189,9 @@ fn main() -> Result<()> {
         }
         Command::WgpuSmoke => {
             run_wgpu_smoke()?;
+        }
+        Command::PresenterSimSmoke => {
+            run_presenter_sim_smoke()?;
         }
     }
 
@@ -1797,4 +1805,250 @@ fn run_wgpu_smoke() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Presenter simulation smoke test
+// ---------------------------------------------------------------------------
+
+fn run_presenter_sim_smoke() -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+    use tokio::time;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Step 1: Create a temporary 2x2 PNG with distinct colors
+        let temp_dir = std::env::temp_dir().join("wallflow-presenter-sim-smoke");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let mut img = image::RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255])); // red
+        img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255])); // green
+        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255])); // blue
+        img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255])); // white
+        let source_path = temp_dir.join("source.png");
+        img.save(&source_path)?;
+
+        let source_path_str = source_path.to_string_lossy().to_string();
+
+        println!("=== Presenter Sim Smoke Test ===");
+        println!("Source image: {}", source_path.display());
+
+        // Step 2: Run renderer in --presenter-sim mode
+        let renderer_exe = find_renderer_exe()?;
+        println!("Renderer exe: {}", renderer_exe.display());
+
+        let mut child = Command::new(&renderer_exe)
+            .arg("--presenter-sim")
+            .arg("--width")
+            .arg("800")
+            .arg("--height")
+            .arg("450")
+            .arg("--source")
+            .arg(&source_path_str)
+            .arg("--fit")
+            .arg("cover")
+            .arg("--timeout-secs")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+
+        let pid = child.id();
+        println!("Renderer spawned (PID: {:?})", pid);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
+        let stdout_reader = tokio::io::BufReader::new(stdout);
+        let mut lines = stdout_reader.lines();
+
+        let deadline = time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+
+        let mut report_json = String::new();
+        let mut report_received = false;
+
+        tokio::select! {
+            _ = &mut deadline => {
+                eprintln!("Presenter sim smoke timed out waiting for report");
+                let _ = child.kill().await;
+            }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        report_json = line;
+                        report_received = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Error reading renderer stdout: {e}");
+                    }
+                }
+            }
+        }
+
+        // Wait for the process to exit
+        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(e)) => {
+                eprintln!("Error waiting for renderer: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Renderer did not exit in time, killing");
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let total_elapsed = start.elapsed();
+        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
+
+        // Step 3: Parse and verify the PresenterReport JSON
+        let mut exit_code_ok = false;
+        let mut rendered_ok = false;
+        let mut presented_simulated_ok = false;
+        let mut checksum_ok = false;
+        let mut viewport_ok = false;
+        let mut source_path_ok = false;
+        let mut error_ok = false;
+
+        if process_exit_code == Some(0) {
+            exit_code_ok = true;
+        }
+
+        if report_received {
+            if let Ok(report_val) = serde_json::from_str::<serde_json::Value>(&report_json) {
+                // rendered = true
+                if report_val
+                    .get("rendered")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    rendered_ok = true;
+                }
+
+                // presented_simulated = true
+                if report_val
+                    .get("presented_simulated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    presented_simulated_ok = true;
+                }
+
+                // checksum is present (not null)
+                if report_val
+                    .get("checksum")
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false)
+                {
+                    checksum_ok = true;
+                }
+
+                // viewport = 800×450 (nested: viewport.width, viewport.height)
+                let viewport_obj = report_val.get("viewport");
+                let viewport_w = viewport_obj
+                    .and_then(|v| v.get("width"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let viewport_h = viewport_obj
+                    .and_then(|v| v.get("height"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if viewport_w == 800 && viewport_h == 450 {
+                    viewport_ok = true;
+                }
+
+                // source_path exists in report
+                if report_val
+                    .get("source_path")
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false)
+                {
+                    source_path_ok = true;
+                }
+
+                // error is null or absent
+                let error_val = report_val.get("error");
+                if error_val.is_none() || error_val.unwrap().is_null() {
+                    error_ok = true;
+                }
+            }
+        }
+
+        let success = exit_code_ok
+            && rendered_ok
+            && presented_simulated_ok
+            && checksum_ok
+            && viewport_ok
+            && source_path_ok
+            && error_ok;
+
+        let verification = serde_json::json!({
+            "exit_code_ok": exit_code_ok,
+            "rendered_ok": rendered_ok,
+            "presented_simulated_ok": presented_simulated_ok,
+            "checksum_ok": checksum_ok,
+            "viewport_ok": viewport_ok,
+            "source_path_ok": source_path_ok,
+            "error_ok": error_ok,
+            "process_exit_code": process_exit_code,
+        });
+
+        let report = serde_json::json!({
+            "test": "presenter-sim-smoke",
+            "success": success,
+            "total_elapsed_ms": total_elapsed.as_millis() as u64,
+            "renderer_pid": pid,
+            "source_path": source_path_str,
+            "verification": verification,
+        });
+
+        println!("\n=== Presenter Sim Smoke Report ===");
+        println!("{}", serde_json::to_string_pretty(&report)?);
+
+        if success {
+            println!("\nPresenter sim smoke test PASSED.");
+        } else {
+            eprintln!("\nPresenter sim smoke test FAILED.");
+            if !exit_code_ok {
+                eprintln!(
+                    "  Failed: process exit code is not 0 (got {:?})",
+                    process_exit_code
+                );
+            }
+            if !rendered_ok {
+                eprintln!("  Failed: rendered is not true");
+            }
+            if !presented_simulated_ok {
+                eprintln!("  Failed: presented_simulated is not true");
+            }
+            if !checksum_ok {
+                eprintln!("  Missing: checksum in report");
+            }
+            if !viewport_ok {
+                eprintln!("  Failed: viewport is not 800x450");
+            }
+            if !source_path_ok {
+                eprintln!("  Missing: source_path in report");
+            }
+            if !error_ok {
+                eprintln!("  Failed: error field is present and non-null");
+            }
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    })
 }

@@ -13,6 +13,7 @@
 mod color;
 mod error;
 mod output;
+mod presenter;
 mod renderer;
 mod wgpu_backend;
 mod wgpu_error;
@@ -20,6 +21,10 @@ mod wgpu_error;
 pub use color::RgbaColor;
 pub use error::StaticRenderError;
 pub use output::{RenderOutput, RenderOutputMetadata};
+pub use presenter::{
+    rgba_to_softbuffer_u32, rgba_to_softbuffer_u32_with_surface_size, PresenterBackend,
+    PresenterReport, PresenterState, PresenterViewport, SoftbufferPresenterConfig,
+};
 pub use renderer::{render_static_image_cpu, StaticRenderInput};
 pub use wgpu_backend::{
     probe_wgpu_capabilities, render_static_image_wgpu_offscreen, WgpuRenderCapabilities,

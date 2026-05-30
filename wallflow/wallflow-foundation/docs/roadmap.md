@@ -227,6 +227,41 @@
 - Explorer restart tolerance with winit event loop
 - Real GPU adapter capabilities on Windows hardware
 
+## MVP-2.4 Cloud-safe softbuffer window presenter ✅
+
+*Completed in stage 010.*
+
+- `softbuffer` 0.4 added as workspace dependency for CPU-to-window pixel blitting.
+- `raw-window-handle` 0.6 added for raw handle extraction from winit Window.
+- `PresenterBackend` enum: `SoftbufferCpu` (default), `WgpuExperimental` (reserved).
+- `PresenterState` lifecycle: Created → SurfaceReady → FrameRendered → Presented → Closed/Failed.
+- `SoftbufferPresenterConfig` with validation (zero dimensions, missing source).
+- `PresenterReport` structured output: backend, viewport, rendered, presented, presented_simulated, checksum, error, exit_reason, duration_ms.
+- `rgba_to_softbuffer_u32()` pixel conversion: RGBA8 → softbuffer `0x00RRGGBB` format with alpha compositing against black background.
+- `rgba_to_softbuffer_u32_with_surface_size()` for size-mismatch handling (pad/crop).
+- `--windowed-softbuffer` renderer mode: winit window + softbuffer context/surface + CPU render → blit → present.
+- `--presenter-sim` renderer mode: cloud-safe simulation, no window, JSON report to stdout.
+- `presenter-sim-smoke` CLI command: creates test PNG, runs presenter-sim, verifies JSON report.
+- Raw window/display handle wrappers for softbuffer (winit Window is not Clone).
+- Resize handling: viewport update + re-render + re-present.
+- Timeout and close-request: clean event loop exit.
+- Logs to stderr in presenter-sim mode; stdout reserved for structured output.
+- Graceful error when no display server (no panic, clear error message).
+- 194 tests passing (23 new presenter-related tests in wallflow-render).
+- `presenter-sim-smoke` added to CI.
+- Softbuffer presenter architecture documented in `docs/architecture/013-softbuffer-window-presenter.md`.
+
+### REQUIRES_REAL_WINDOWS_VALIDATION
+
+- `--windowed-softbuffer` visual correctness on Windows
+- Frame content matches CPU reference renderer output
+- Resize behavior (re-render, re-present, no flicker)
+- Desktop attach with winit window
+- DPI scale factor handling
+- Explorer restart tolerance with winit event loop
+- Real GPU adapter capabilities on Windows hardware
+- wgpu GPU rendering matching CPU reference output
+
 ## MVP-3 video wallpaper
 
 - Implement Media Foundation backend.

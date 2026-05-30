@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use std::io::{Read as StdRead, Write as StdWrite};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -15,6 +16,10 @@ use wallflow_ipc::{
     StaticImageLayoutReport, WallpaperApplyError, WallpaperPayload,
 };
 use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
+use wallflow_render::{
+    rgba_to_softbuffer_u32, PresenterBackend, PresenterReport, PresenterViewport,
+    SoftbufferPresenterConfig,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "wallflow-renderer")]
@@ -97,6 +102,25 @@ struct Args {
     /// Render backend to use: "cpu" (default, cloud-testable) or "wgpu" (experimental, requires GPU).
     #[arg(long, default_value = "cpu")]
     backend: String,
+
+    /// Run in windowed softbuffer mode: opens a winit window and presents the
+    /// CPU-rendered frame via softbuffer. Requires a display server.
+    /// Not suitable for CI/cloud (no display server).
+    #[arg(long, default_value_t = false)]
+    windowed_softbuffer: bool,
+
+    /// Run in presenter simulation mode: no window, uses CPU reference renderer,
+    /// performs RGBA → softbuffer format conversion, and outputs a structured
+    /// JSON report. Suitable for CI and cloud testing.
+    #[arg(long, default_value_t = false)]
+    presenter_sim: bool,
+}
+
+impl Args {
+    /// Default background color for presenter modes.
+    fn background_for_presenter(&self) -> String {
+        "#000000".into()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,8 +139,8 @@ struct LoadedStaticImageState {
 
 fn main() -> Result<()> {
     // Determine if stderr-only logging is needed
-    let use_stderr_only =
-        std::env::args().any(|a| a == "--ipc-stdio" || a == "--headless-render-sim");
+    let use_stderr_only = std::env::args()
+        .any(|a| a == "--ipc-stdio" || a == "--headless-render-sim" || a == "--presenter-sim");
 
     if use_stderr_only {
         tracing_subscriber::fmt()
@@ -156,6 +180,45 @@ fn main() -> Result<()> {
             args.render_output.as_deref(),
             fit,
             &args.backend,
+        );
+    }
+
+    if args.windowed_softbuffer {
+        let fit = match args.fit.parse::<wallflow_common::FitMode>() {
+            Ok(f) => f,
+            Err(()) => {
+                eprintln!("invalid fit mode: {}", args.fit);
+                return Err(anyhow::anyhow!("invalid fit mode: {}", args.fit));
+            }
+        };
+        return run_windowed_softbuffer(
+            renderer_id,
+            args.width,
+            args.height,
+            args.timeout_secs,
+            args.source.as_deref(),
+            fit,
+            &args.fit,
+            &args.background_for_presenter(),
+        );
+    }
+
+    if args.presenter_sim {
+        let fit = match args.fit.parse::<wallflow_common::FitMode>() {
+            Ok(f) => f,
+            Err(()) => {
+                eprintln!("invalid fit mode: {}", args.fit);
+                return Err(anyhow::anyhow!("invalid fit mode: {}", args.fit));
+            }
+        };
+        return run_presenter_sim(
+            args.width,
+            args.height,
+            args.source.as_deref(),
+            fit,
+            &args.fit,
+            &args.background_for_presenter(),
+            args.timeout_secs,
         );
     }
 
@@ -731,8 +794,547 @@ fn apply_static_wallpaper_for_windowed(
 }
 
 // ---------------------------------------------------------------------------
-// IPC stdio mode
+// Windowed softbuffer presenter mode
 // ---------------------------------------------------------------------------
+
+/// Wrapper that provides `HasDisplayHandle` from a raw display handle.
+/// This is needed because softbuffer::Context takes ownership of the display provider,
+/// but we cannot give it the winit::Window (we need it for Surface too).
+struct DisplayHandleWrapper {
+    raw: raw_window_handle::RawDisplayHandle,
+}
+
+impl raw_window_handle::HasDisplayHandle for DisplayHandleWrapper {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        // SAFETY: The raw display handle is valid for the lifetime of this wrapper.
+        // This is the same pattern used by winit internally.
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(self.raw) })
+    }
+}
+
+/// Wrapper that provides `HasWindowHandle` from a raw window handle.
+struct WindowHandleWrapper {
+    raw: raw_window_handle::RawWindowHandle,
+}
+
+impl raw_window_handle::HasWindowHandle for WindowHandleWrapper {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        // SAFETY: The raw window handle is valid for the lifetime of this wrapper.
+        // This is the same pattern used by winit internally.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.raw) })
+    }
+}
+
+/// Application handler for the softbuffer-based windowed presenter.
+struct SoftbufferPresenterApp {
+    renderer_id: RendererId,
+    viewport: RendererViewport,
+    source: Option<PathBuf>,
+    fit: wallflow_common::FitMode,
+    #[allow(dead_code)]
+    fit_str: String,
+    background: String,
+    timeout: Option<Duration>,
+    start: Instant,
+    window: Option<winit::window::Window>,
+    context: Option<softbuffer::Context<DisplayHandleWrapper>>,
+    surface: Option<softbuffer::Surface<DisplayHandleWrapper, WindowHandleWrapper>>,
+    needs_render: bool,
+    last_render_output: Option<wallflow_render::RenderOutput>,
+}
+
+impl SoftbufferPresenterApp {
+    /// Perform CPU rendering of the source image for the current viewport.
+    fn render_frame(&mut self) -> Result<wallflow_render::RenderOutput, String> {
+        let vp = wallflow_package::Viewport {
+            width: self.viewport.width,
+            height: self.viewport.height,
+        };
+
+        if let Some(ref source) = self.source {
+            let render_input = wallflow_render::StaticRenderInput {
+                image_path: source.clone(),
+                viewport: vp,
+                fit: self.fit,
+                background: self.background.clone(),
+                opacity: None,
+            };
+            wallflow_render::render_static_image_cpu(render_input)
+                .map_err(|e| format!("CPU render failed: {e}"))
+        } else {
+            // No source: generate a test pattern (checkerboard)
+            let width = self.viewport.width;
+            let height = self.viewport.height;
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = ((y * width + x) * 4) as usize;
+                    let checker = ((x / 32) + (y / 32)) % 2;
+                    if checker == 0 {
+                        pixels[idx] = 48; // R
+                        pixels[idx + 1] = 48; // G
+                        pixels[idx + 2] = 56; // B
+                        pixels[idx + 3] = 255; // A
+                    } else {
+                        pixels[idx] = 32; // R
+                        pixels[idx + 1] = 32; // G
+                        pixels[idx + 2] = 40; // B
+                        pixels[idx + 3] = 255; // A
+                    }
+                }
+            }
+            Ok(wallflow_render::RenderOutput::new(width, height, pixels))
+        }
+    }
+
+    /// Present the rendered frame to the softbuffer surface.
+    fn present_frame(&mut self) -> Result<(), String> {
+        let surface = match self.surface.as_mut() {
+            Some(s) => s,
+            None => return Err("surface not available".into()),
+        };
+
+        if self.viewport.width == 0 || self.viewport.height == 0 {
+            return Err("viewport has zero dimensions".into());
+        }
+
+        let width = NonZeroU32::new(self.viewport.width)
+            .ok_or_else(|| "viewport width is zero".to_string())?;
+        let height = NonZeroU32::new(self.viewport.height)
+            .ok_or_else(|| "viewport height is zero".to_string())?;
+
+        surface
+            .resize(width, height)
+            .map_err(|e| format!("softbuffer resize failed: {e}"))?;
+
+        let mut buffer = surface
+            .buffer_mut()
+            .map_err(|e| format!("softbuffer buffer_mut failed: {e}"))?;
+
+        if let Some(ref output) = self.last_render_output {
+            let softbuffer_pixels =
+                rgba_to_softbuffer_u32(&output.pixels_rgba, output.width, output.height)?;
+
+            // Copy pixels to the buffer
+            let len = buffer.len().min(softbuffer_pixels.len());
+            buffer[..len].copy_from_slice(&softbuffer_pixels[..len]);
+            // Fill remaining pixels with black if surface is larger
+            for pixel in buffer[len..].iter_mut() {
+                *pixel = 0;
+            }
+        } else {
+            // No rendered output — fill with black
+            for pixel in buffer.iter_mut() {
+                *pixel = 0;
+            }
+        }
+
+        buffer
+            .present()
+            .map_err(|e| format!("softbuffer present failed: {e}"))?;
+
+        Ok(())
+    }
+}
+
+impl winit::application::ApplicationHandler for SoftbufferPresenterApp {
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            winit::event::WindowEvent::CloseRequested => {
+                info!(?self.renderer_id, "window close requested, exiting");
+                event_loop.exit();
+            }
+            winit::event::WindowEvent::Resized(physical_size) => {
+                let new_w = physical_size.width;
+                let new_h = physical_size.height;
+                if new_w > 0 && new_h > 0 {
+                    self.viewport = RendererViewport::new(new_w, new_h);
+                    self.needs_render = true;
+                    info!(
+                        ?self.renderer_id,
+                        width = new_w,
+                        height = new_h,
+                        "window resized, marking for re-render"
+                    );
+                }
+            }
+            winit::event::WindowEvent::RedrawRequested => {
+                if self.needs_render {
+                    match self.render_frame() {
+                        Ok(output) => {
+                            self.last_render_output = Some(output);
+                            self.needs_render = false;
+                        }
+                        Err(e) => {
+                            warn!(?self.renderer_id, error = %e, "render failed during redraw");
+                        }
+                    }
+                }
+
+                if let Err(e) = self.present_frame() {
+                    warn!(?self.renderer_id, error = %e, "present failed during redraw");
+                }
+            }
+            winit::event::WindowEvent::Destroyed => {
+                info!(?self.renderer_id, "window destroyed, exiting");
+                event_loop.exit();
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Check timeout
+        if let Some(dur) = self.timeout {
+            if self.start.elapsed() >= dur {
+                info!(
+                    ?self.renderer_id,
+                    elapsed_ms = self.start.elapsed().as_millis() as u64,
+                    "windowed softbuffer presenter timeout reached, exiting"
+                );
+                event_loop.exit();
+            }
+        }
+        // Request a redraw
+        if let Some(ref window) = self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.window.is_none() {
+            let window_config = WindowRuntimeConfig::new(self.viewport.width, self.viewport.height);
+            let window_attrs = winit::window::WindowAttributes::default()
+                .with_title(&window_config.title)
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    window_config.width,
+                    window_config.height,
+                ));
+
+            let window = match event_loop.create_window(window_attrs) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(?self.renderer_id, error = %e, "failed to create winit window");
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            // Create softbuffer context and surface using raw handle wrappers.
+            // We cannot pass the winit::Window to both Context::new() and Surface::new()
+            // because both take ownership and Window is not Clone. Instead, we extract
+            // the raw handles and wrap them in types that implement HasDisplayHandle /
+            // HasWindowHandle. This is the same pattern winit uses internally.
+            let raw_display = match raw_window_handle::HasDisplayHandle::display_handle(&window) {
+                Ok(h) => h.as_raw(),
+                Err(e) => {
+                    warn!(?self.renderer_id, error = %e, "failed to get raw display handle");
+                    self.window = Some(window);
+                    event_loop.exit();
+                    return;
+                }
+            };
+            let raw_window = match raw_window_handle::HasWindowHandle::window_handle(&window) {
+                Ok(h) => h.as_raw(),
+                Err(e) => {
+                    warn!(?self.renderer_id, error = %e, "failed to get raw window handle");
+                    self.window = Some(window);
+                    event_loop.exit();
+                    return;
+                }
+            };
+
+            let display_wrapper = DisplayHandleWrapper { raw: raw_display };
+            let window_wrapper = WindowHandleWrapper { raw: raw_window };
+
+            match softbuffer::Context::new(display_wrapper) {
+                Ok(context) => {
+                    info!(?self.renderer_id, "softbuffer context created");
+                    match softbuffer::Surface::new(&context, window_wrapper) {
+                        Ok(surface) => {
+                            info!(?self.renderer_id, "softbuffer surface created");
+                            self.context = Some(context);
+                            self.surface = Some(surface);
+                            self.window = Some(window);
+                            self.needs_render = true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                ?self.renderer_id,
+                                error = %e,
+                                "failed to create softbuffer surface"
+                            );
+                            self.window = Some(window);
+                            event_loop.exit();
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        ?self.renderer_id,
+                        error = %e,
+                        "failed to create softbuffer context (no display server?)"
+                    );
+                    self.window = Some(window);
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+}
+
+/// Windowed softbuffer mode: creates a winit window, uses CPU reference renderer,
+/// converts RGBA to softbuffer format, and presents to the window.
+///
+/// This mode requires a display server. On Linux this means Wayland or X11.
+/// If no display server is available, it returns a graceful error without panicking.
+#[allow(clippy::too_many_arguments)]
+fn run_windowed_softbuffer(
+    renderer_id: RendererId,
+    width: u32,
+    height: u32,
+    timeout_secs: u64,
+    source: Option<&std::path::Path>,
+    fit: wallflow_common::FitMode,
+    fit_str: &str,
+    background: &str,
+) -> Result<()> {
+    let start = Instant::now();
+    let timeout = if timeout_secs > 0 {
+        Some(Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+
+    // Validate config
+    let config = SoftbufferPresenterConfig {
+        width,
+        height,
+        title: format!("WallFlow Renderer – {}x{}", width, height),
+        source: source.map(|p| p.to_path_buf()),
+        fit: fit_str.to_string(),
+        background: background.to_string(),
+        timeout_secs,
+    };
+    if let Err(e) = config.validate() {
+        // For source not existing, just warn (might be test pattern)
+        if !e.contains("does not exist") {
+            let msg = format!("invalid presenter config: {e}");
+            warn!(?renderer_id, error = %msg, "config validation failed");
+            eprintln!("{msg}");
+            return Err(anyhow::anyhow!("{msg}"));
+        }
+    }
+
+    info!(
+        ?renderer_id,
+        width,
+        height,
+        source = ?source.map(|p| p.display()),
+        "windowed softbuffer presenter starting"
+    );
+
+    // Create the winit event loop
+    let event_loop = match winit::event_loop::EventLoop::new() {
+        Ok(el) => el,
+        Err(e) => {
+            let msg = format!("failed to create winit event loop (no display server?): {e}");
+            warn!(?renderer_id, error = %msg, "cannot open window");
+            eprintln!("{msg}");
+            return Err(anyhow::anyhow!("{msg}"));
+        }
+    };
+
+    let mut app = SoftbufferPresenterApp {
+        renderer_id,
+        viewport: RendererViewport::new(width, height),
+        source: source.map(|p| p.to_path_buf()),
+        fit,
+        fit_str: fit_str.to_string(),
+        background: background.to_string(),
+        timeout,
+        start,
+        window: None,
+        context: None,
+        surface: None,
+        needs_render: false,
+        last_render_output: None,
+    };
+
+    event_loop.run_app(&mut app)?;
+
+    info!(?renderer_id, "windowed softbuffer presenter exited");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Presenter simulation mode (cloud-safe)
+// ---------------------------------------------------------------------------
+
+/// Presenter simulation mode: no window, uses CPU reference renderer,
+/// performs RGBA → softbuffer format conversion, and outputs a structured JSON report.
+///
+/// This mode does NOT require a display server. It is suitable for CI and cloud testing.
+/// It validates the entire rendering + conversion pipeline without presenting to a surface.
+#[allow(clippy::too_many_arguments)]
+fn run_presenter_sim(
+    width: u32,
+    height: u32,
+    source: Option<&std::path::Path>,
+    fit: wallflow_common::FitMode,
+    fit_str: &str,
+    background: &str,
+    timeout_secs: u64,
+) -> Result<()> {
+    let start = Instant::now();
+
+    // Validate config
+    let config = SoftbufferPresenterConfig {
+        width,
+        height,
+        title: String::new(),
+        source: source.map(|p| p.to_path_buf()),
+        fit: fit_str.to_string(),
+        background: background.to_string(),
+        timeout_secs,
+    };
+    if let Err(e) = config.validate() {
+        let report = PresenterReport {
+            backend: PresenterBackend::SoftbufferCpu,
+            viewport: PresenterViewport { width, height },
+            source_path: source.map(|p| p.display().to_string()),
+            rendered: false,
+            presented: false,
+            presented_simulated: false,
+            checksum: None,
+            output_dimensions: None,
+            error: Some(format!("invalid config: {e}")),
+            exit_reason: Some("config-error".into()),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        };
+        let json = serde_json::to_string(&report)?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    // Wait for timeout if specified and no source
+    if source.is_none() && timeout_secs > 0 {
+        std::thread::sleep(Duration::from_secs(timeout_secs.min(1)));
+    }
+
+    // CPU render
+    let vp = wallflow_package::Viewport { width, height };
+
+    let render_result = match source {
+        Some(image_path) => {
+            let render_input = wallflow_render::StaticRenderInput {
+                image_path: image_path.to_path_buf(),
+                viewport: vp,
+                fit,
+                background: background.to_string(),
+                opacity: None,
+            };
+            wallflow_render::render_static_image_cpu(render_input).map_err(|e| format!("{e}"))
+        }
+        None => {
+            // No source: generate test pattern
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = ((y * width + x) * 4) as usize;
+                    let checker = ((x / 32) + (y / 32)) % 2;
+                    if checker == 0 {
+                        pixels[idx] = 48;
+                        pixels[idx + 1] = 48;
+                        pixels[idx + 2] = 56;
+                        pixels[idx + 3] = 255;
+                    } else {
+                        pixels[idx] = 32;
+                        pixels[idx + 1] = 32;
+                        pixels[idx + 2] = 40;
+                        pixels[idx + 3] = 255;
+                    }
+                }
+            }
+            Ok(wallflow_render::RenderOutput::new(width, height, pixels))
+        }
+    };
+
+    let report = match render_result {
+        Ok(output) => {
+            // Perform RGBA → softbuffer format conversion (validates the conversion pipeline)
+            let conversion_result =
+                rgba_to_softbuffer_u32(&output.pixels_rgba, output.width, output.height);
+
+            match conversion_result {
+                Ok(_softbuffer_pixels) => {
+                    let meta = output.metadata();
+                    PresenterReport {
+                        backend: PresenterBackend::SoftbufferCpu,
+                        viewport: PresenterViewport { width, height },
+                        source_path: source.map(|p| p.display().to_string()),
+                        rendered: true,
+                        presented: false,
+                        presented_simulated: true,
+                        checksum: meta.checksum,
+                        output_dimensions: Some(PresenterViewport {
+                            width: meta.width,
+                            height: meta.height,
+                        }),
+                        error: None,
+                        exit_reason: Some("simulated".into()),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    }
+                }
+                Err(e) => {
+                    let meta = output.metadata();
+                    PresenterReport {
+                        backend: PresenterBackend::SoftbufferCpu,
+                        viewport: PresenterViewport { width, height },
+                        source_path: source.map(|p| p.display().to_string()),
+                        rendered: true,
+                        presented: false,
+                        presented_simulated: false,
+                        checksum: meta.checksum,
+                        output_dimensions: Some(PresenterViewport {
+                            width: meta.width,
+                            height: meta.height,
+                        }),
+                        error: Some(format!("RGBA→softbuffer conversion failed: {e}")),
+                        exit_reason: Some("conversion-error".into()),
+                        duration_ms: Some(start.elapsed().as_millis() as u64),
+                    }
+                }
+            }
+        }
+        Err(e) => PresenterReport {
+            backend: PresenterBackend::SoftbufferCpu,
+            viewport: PresenterViewport { width, height },
+            source_path: source.map(|p| p.display().to_string()),
+            rendered: false,
+            presented: false,
+            presented_simulated: false,
+            checksum: None,
+            output_dimensions: None,
+            error: Some(e),
+            exit_reason: Some("render-error".into()),
+            duration_ms: Some(start.elapsed().as_millis() as u64),
+        },
+    };
+
+    let json = serde_json::to_string(&report)?;
+    println!("{json}");
+    Ok(())
+}
 
 /// IPC stdio mode: the primary communication mode for Core <-> Renderer.
 ///

@@ -37,4 +37,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+softbuffer = "0.4"
+raw-window-handle = "0.6"
 
