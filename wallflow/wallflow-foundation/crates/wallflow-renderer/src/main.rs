@@ -93,6 +93,10 @@ struct Args {
     /// Fit mode for static image rendering (used with --headless-render-sim --source --render-output).
     #[arg(long, default_value = "cover")]
     fit: String,
+
+    /// Render backend to use: "cpu" (default, cloud-testable) or "wgpu" (experimental, requires GPU).
+    #[arg(long, default_value = "cpu")]
+    backend: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +155,7 @@ fn main() -> Result<()> {
             args.source.as_deref(),
             args.render_output.as_deref(),
             fit,
+            &args.backend,
         );
     }
 
@@ -223,6 +228,7 @@ fn main() -> Result<()> {
 /// It goes through the state transitions Starting → Ready → Running → ShuttingDown → Exited,
 /// optionally applying a static wallpaper and calculating its layout for the given viewport.
 /// The result is a structured JSON report printed to stdout.
+#[allow(clippy::too_many_arguments)]
 fn run_headless_render_sim(
     renderer_id: RendererId,
     width: u32,
@@ -231,6 +237,7 @@ fn run_headless_render_sim(
     source: Option<&std::path::Path>,
     render_output_path: Option<&std::path::Path>,
     fit: wallflow_common::FitMode,
+    backend: &str,
 ) -> Result<()> {
     let start = Instant::now();
     let timeout = if timeout_secs > 0 {
@@ -272,7 +279,7 @@ fn run_headless_render_sim(
     if let Some(image_path) = source {
         // If render_output_path is specified, do actual rendering
         if let Some(output_path) = render_output_path {
-            match render_static_image_for_sim(image_path, &viewport, fit, output_path) {
+            match render_static_image_for_sim(image_path, &viewport, fit, output_path, backend) {
                 Ok((metadata, layout, output)) => {
                     wallpaper_applied = true;
                     layout_report = Some(RenderSimLayoutReport {
@@ -435,6 +442,7 @@ fn render_static_image_for_sim(
     viewport: &RendererViewport,
     fit: wallflow_common::FitMode,
     output_path: &std::path::Path,
+    backend: &str,
 ) -> Result<(
     wallflow_package::ImageMetadata,
     wallflow_package::StaticImageLayout,
@@ -454,21 +462,37 @@ fn render_static_image_for_sim(
     let layout =
         wallflow_package::calculate_static_image_layout(image_size, vp, fit, "#000000".into())?;
 
-    let render_input = wallflow_render::StaticRenderInput {
-        image_path: image_path.to_path_buf(),
-        viewport: vp,
-        fit,
-        background: "#000000".into(),
-        opacity: None,
+    let output = match backend {
+        "wgpu" => {
+            // Experimental wgpu offscreen render (clear-only, no image texture yet)
+            let mut output = wallflow_render::render_static_image_wgpu_offscreen(
+                viewport.width,
+                viewport.height,
+                "#000000",
+            )?;
+            output.save_png(output_path)?;
+            output
+        }
+        _ => {
+            // Default: CPU reference renderer
+            let render_input = wallflow_render::StaticRenderInput {
+                image_path: image_path.to_path_buf(),
+                viewport: vp,
+                fit,
+                background: "#000000".into(),
+                opacity: None,
+            };
+            let mut output = wallflow_render::render_static_image_cpu(render_input)?;
+            output.save_png(output_path)?;
+            output
+        }
     };
-
-    let mut output = wallflow_render::render_static_image_cpu(render_input)?;
-    output.save_png(output_path)?;
 
     info!(
         output_path = %output_path.display(),
         output_width = output.width,
         output_height = output.height,
+        backend = backend,
         "render output saved as PNG"
     );
 

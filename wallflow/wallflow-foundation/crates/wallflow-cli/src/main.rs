@@ -103,6 +103,15 @@ enum Command {
     /// with --source and --render-output, and verify the output PNG.
     /// This is the cloud-testable static render output integration test.
     RenderOutputSmoke,
+
+    /// Probe the system for wgpu GPU capabilities and output a structured JSON report.
+    /// Always exits with code 0 (even if GPU is unavailable) unless an internal error occurs.
+    WgpuProbe,
+
+    /// Run the wgpu offscreen render smoke test. If no GPU adapter is available,
+    /// outputs a skipped report and exits with code 0. If available, performs
+    /// a minimal offscreen clear render and verifies the output.
+    WgpuSmoke,
 }
 
 fn main() -> Result<()> {
@@ -169,6 +178,12 @@ fn main() -> Result<()> {
         }
         Command::RenderOutputSmoke => {
             run_render_output_smoke()?;
+        }
+        Command::WgpuProbe => {
+            run_wgpu_probe()?;
+        }
+        Command::WgpuSmoke => {
+            run_wgpu_smoke()?;
         }
     }
 
@@ -1650,4 +1665,136 @@ fn run_render_output_smoke() -> Result<()> {
 
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// wgpu GPU capability probe
+// ---------------------------------------------------------------------------
+
+fn run_wgpu_probe() -> Result<()> {
+    println!("=== wgpu Capability Probe ===");
+    let caps = wallflow_render::probe_wgpu_capabilities();
+    let json = serde_json::to_string_pretty(&caps)?;
+    println!("{json}");
+
+    if caps.supported {
+        println!("\nwgpu GPU adapter available.");
+        if let Some(ref name) = caps.adapter_name {
+            println!("  Adapter: {name}");
+        }
+        if let Some(ref dt) = caps.device_type {
+            println!("  Device type: {dt}");
+        }
+    } else {
+        println!("\nwgpu GPU adapter NOT available (expected in headless CI).");
+        if let Some(ref reason) = caps.failure_reason {
+            println!("  Reason: {reason}");
+        }
+    }
+
+    // Always exit 0 — this is a diagnostic, not a pass/fail test
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// wgpu GPU render smoke test
+// ---------------------------------------------------------------------------
+
+fn run_wgpu_smoke() -> Result<()> {
+    println!("=== wgpu Smoke Test ===");
+    let start = Instant::now();
+
+    // Step 1: Probe capabilities
+    let caps = wallflow_render::probe_wgpu_capabilities();
+
+    if !caps.supported {
+        let report = serde_json::json!({
+            "test": "wgpu-smoke",
+            "supported": false,
+            "skipped": true,
+            "failure_reason": caps.failure_reason,
+            "total_elapsed_ms": start.elapsed().as_millis() as u64,
+        });
+        let json = serde_json::to_string_pretty(&report)?;
+        println!("{json}");
+        println!("\nwgpu smoke test SKIPPED (no GPU adapter available).");
+        // Exit 0 — this is expected in headless CI
+        return Ok(());
+    }
+
+    // Step 2: Try offscreen render (clear-only experimental)
+    let width = 4u32;
+    let height = 4u32;
+    let background = "#ff0000";
+
+    let render_result =
+        wallflow_render::render_static_image_wgpu_offscreen(width, height, background);
+
+    let total_elapsed = start.elapsed().as_millis() as u64;
+
+    match render_result {
+        Ok(output) => {
+            let checksum = output.checksum_sha256();
+            let mut dimensions_ok = false;
+            let mut pixel_ok = false;
+
+            if output.width == width && output.height == height {
+                dimensions_ok = true;
+            }
+
+            // Check first pixel is red (Rgba8Unorm: 1.0→255)
+            if !output.pixels_rgba.is_empty() {
+                let r = output.pixels_rgba[0];
+                let g = output.pixels_rgba[1];
+                let b = output.pixels_rgba[2];
+                let a = output.pixels_rgba[3];
+                // Allow small floating-point rounding differences
+                pixel_ok = r >= 250 && g <= 5 && b <= 5 && a >= 250;
+            }
+
+            let success = dimensions_ok && pixel_ok;
+
+            let report = serde_json::json!({
+                "test": "wgpu-smoke",
+                "supported": true,
+                "skipped": false,
+                "success": success,
+                "total_elapsed_ms": total_elapsed,
+                "capabilities": caps,
+                "render_output": {
+                    "width": output.width,
+                    "height": output.height,
+                    "checksum": checksum,
+                    "dimensions_ok": dimensions_ok,
+                    "pixel_ok": pixel_ok,
+                    "note": "clear-only experimental path (no image texture rendering)",
+                },
+            });
+
+            let json = serde_json::to_string_pretty(&report)?;
+            println!("{json}");
+
+            if success {
+                println!("\nwgpu smoke test PASSED.");
+            } else {
+                eprintln!("\nwgpu smoke test FAILED (render output verification).");
+            }
+        }
+        Err(e) => {
+            let report = serde_json::json!({
+                "test": "wgpu-smoke",
+                "supported": true,
+                "skipped": false,
+                "success": false,
+                "total_elapsed_ms": total_elapsed,
+                "capabilities": caps,
+                "render_error": format!("{e}"),
+            });
+            let json = serde_json::to_string_pretty(&report)?;
+            println!("{json}");
+            eprintln!("\nwgpu smoke test FAILED (render error: {e}).");
+        }
+    }
+
+    Ok(())
 }

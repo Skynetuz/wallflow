@@ -200,6 +200,33 @@
 - Fullscreen detection pause policy.
 - Connect desktop attach to winit window on Windows.
 
+## MVP-2.3 Cloud-safe wgpu static backend skeleton ✅
+
+*Completed in stage 009.*
+
+- `wgpu` 29 added as workspace dependency for cross-platform GPU access.
+- `RenderBackend` enum: `CpuReference` (default, cloud-testable) and `WgpuExperimental` (optional).
+- `WgpuRenderCapabilities` type: adapter name, backend, device type, features, limits, supported flag, failure reason.
+- `WgpuRenderError` type: NoAdapter, DeviceCreation, RenderFailed, BufferMap, FeatureNotSupported, InvalidViewport, InvalidBackground, NotImplemented.
+- `probe_wgpu_capabilities()`: detects GPU adapter, creates device, reports capabilities. Never panics — returns structured error when GPU unavailable.
+- `render_static_image_wgpu_offscreen()`: **clear-only experimental** offscreen render path. Creates texture, runs clear pass with background color, copies to CPU buffer. Does NOT render image texture yet (Stage 010).
+- `wgpu-probe` CLI command: runs capability probe, outputs JSON, always exit 0.
+- `wgpu-smoke` CLI command: if no GPU, outputs `{ "supported": false, "skipped": true }` and exit 0; if GPU available, runs minimal offscreen render and verifies output.
+- `--backend cpu|wgpu` flag added to `wallflow-renderer --headless-render-sim`. Default: `cpu`.
+- 171 tests passing (7 new wgpu-related tests in wallflow-render).
+- wgpu-probe and wgpu-smoke work correctly. GPU smoke skips gracefully in headless CI.
+- CPU reference renderer remains stable and unchanged.
+- wgpu backend architecture documented in `docs/architecture/012-wgpu-static-backend.md`.
+
+### REQUIRES_REAL_WINDOWS_VALIDATION
+
+- `--windowed-static` on Windows with real GPU
+- Desktop attach with winit window
+- wgpu GPU rendering matching CPU reference output
+- DPI scale factor handling
+- Explorer restart tolerance with winit event loop
+- Real GPU adapter capabilities on Windows hardware
+
 ## MVP-3 video wallpaper
 
 - Implement Media Foundation backend.

@@ -65,11 +65,11 @@ Before investing in wgpu presentation (which requires a GPU context, surface con
 ```rust
 pub enum RenderBackend {
     CpuReference,
-    // WgpuExperimental — future stage
+    WgpuExperimental,
 }
 ```
 
-Prepared for multiple backends. The CPU reference renderer is the only implementation today. When wgpu is added later, the same `StaticRenderInput` flows through both paths.
+Prepared for multiple backends. The CPU reference renderer is the default and cloud-testable implementation. The `WgpuExperimental` variant (added in Stage 009) provides a clear-only offscreen render path. The same `StaticRenderInput` flows through both paths.
 
 ### StaticRenderInput
 
@@ -208,18 +208,39 @@ This:
 
 This runs in CI on Ubuntu without any display server.
 
+## wgpu Backend Skeleton (Stage 009)
+
+As of Stage 009, a wgpu backend skeleton is now available alongside the CPU reference renderer. The `RenderBackend` enum has been updated:
+
+```rust
+pub enum RenderBackend {
+    CpuReference,
+    WgpuExperimental,
+}
+```
+
+The `WgpuExperimental` variant is backed by `wgpu` 29 and provides:
+
+- `probe_wgpu_capabilities()`: detects GPU adapter, creates device, reports capabilities. Never panics — returns structured error when GPU unavailable.
+- `render_static_image_wgpu_offscreen()`: **clear-only experimental** offscreen render path. Creates texture, runs clear pass with background color, copies to CPU buffer. Does NOT render image texture yet (Stage 010).
+- `wgpu-probe` CLI command: runs capability probe, outputs JSON, always exit 0.
+- `wgpu-smoke` CLI command: if no GPU, outputs `{ "supported": false, "skipped": true }` and exit 0; if GPU available, runs minimal offscreen render and verifies output.
+- `--backend cpu|wgpu` flag added to `wallflow-renderer --headless-render-sim`. Default: `cpu`.
+
+The wgpu backend architecture is documented in `docs/architecture/012-wgpu-static-backend.md`.
+
 ## Relationship to Future wgpu Backend
 
-The CPU reference renderer and the future wgpu backend share the same input types (`StaticRenderInput`) and output types (`RenderOutput`). The `RenderBackend` enum is prepared for this:
+Stage 009 has added a clear-only experimental wgpu path. The CPU reference renderer and the wgpu backend share the same input types (`StaticRenderInput`) and output types (`RenderOutput`). The `RenderBackend` enum now dispatches to both:
 
 ```rust
 match backend {
     RenderBackend::CpuReference => render_static_image_cpu(input),
-    // RenderBackend::WgpuExperimental => render_static_image_wgpu(input, device, surface),
+    RenderBackend::WgpuExperimental => render_static_image_wgpu_offscreen(input),
 }
 ```
 
-The wgpu backend will produce the same RGBA pixel data (verified against the CPU reference) but using GPU shaders for performance. The CPU reference remains available for testing and as a fallback.
+The current wgpu path is clear-only (it fills the viewport with the background color but does not yet composite the image texture). Full GPU rendering with image compositing will be added in Stage 010. The CPU reference remains available for testing and as a fallback, and continues to produce the authoritative pixel output.
 
 ## What Remains REQUIRES_REAL_WINDOWS_VALIDATION
 

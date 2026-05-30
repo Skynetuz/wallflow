@@ -45,6 +45,9 @@ full IPC command/event lifecycle or the full renderer lifecycle via piped stdio.
 - CPU reference renderer producing actual RGBA pixel data for all fit modes
 - SHA-256 checksum stability tests
 - Pixel-level rendering tests (stretch, center, contain, tile)
+- `wgpu-probe` CLI command (GPU capability diagnostic, always exit 0)
+- `wgpu-smoke` CLI command (offscreen render smoke, skips gracefully without GPU)
+- wgpu capability probe and clear-only offscreen render (no GPU required)
 
 ### Tier 3: Windows Compile-Check (CI)
 
@@ -92,7 +95,7 @@ The GitHub Actions Windows runner provides a much simpler solution.
 │  1. cargo fmt --all -- --check            │
 │  2. cargo check --workspace               │
 │  3. cargo clippy (strict)                 │
-│  4. cargo test --workspace (164 tests)     │
+│  4. cargo test --workspace (171 tests)     │
 └──────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
@@ -279,6 +282,6 @@ This marker appears in:
 
 ## Next Steps
 
-- **Stage 009**: Add wgpu rendering pipeline to the windowed static renderer
-- **Stage 010**: Connect desktop attach to winit window on Windows
-- **Stage 011**: Real Windows validation with manual testing on Win10/11
+- **Stage 010**: Add wgpu rendering pipeline to the windowed static renderer
+- **Stage 011**: Connect desktop attach to winit window on Windows
+- **Stage 012**: Real Windows validation with manual testing on Win10/11

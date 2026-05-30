@@ -116,6 +116,11 @@ jobs:
           cargo run -p wallflow-cli -- render-output-smoke
           echo "Render output smoke test completed"
 
+      - name: wgpu probe diagnostic
+        run: |
+          cargo run -p wallflow-cli -- wgpu-probe
+          echo "wgpu probe diagnostic completed"
+
       - name: Legacy headless heartbeat smoke
         run: |
           timeout 15 ./target/debug/wallflow-renderer --headless-heartbeat --heartbeat-interval-ms 500 --timeout-secs 5 || true
