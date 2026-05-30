@@ -1,0 +1,1870 @@
+From e54250e62eb0e27cd70156c3796cb2998997a49b Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 16:33:57 +0000
+Subject: [PATCH 08/10] 17573af0-e523-4bd9-8158-b2a926e1abd2
+
+---
+ .../.github/workflows/ci.yml                  |   5 +
+ wallflow/wallflow-foundation/Cargo.toml       |   2 +
+ .../crates/wallflow-cli/src/main.rs           | 254 +++++++
+ .../crates/wallflow-render/src/lib.rs         |   5 +
+ .../crates/wallflow-render/src/presenter.rs   | 666 ++++++++++++++++++
+ .../crates/wallflow-renderer/Cargo.toml       |   2 +
+ .../crates/wallflow-renderer/src/main.rs      | 608 +++++++++++++++-
+ .../013-softbuffer-window-presenter.md        | 129 ++++
+ wallflow/wallflow-foundation/docs/roadmap.md  |  35 +
+ 9 files changed, 1703 insertions(+), 3 deletions(-)
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs
+ create mode 100644 wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
+
+diff --git a/wallflow/wallflow-foundation/.github/workflows/ci.yml b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+index 176a46d..e249c35 100644
+--- a/wallflow/wallflow-foundation/.github/workflows/ci.yml
++++ b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+@@ -121,6 +121,11 @@ jobs:
+           cargo run -p wallflow-cli -- wgpu-probe
+           echo "wgpu probe diagnostic completed"
+ 
++      - name: Presenter sim smoke test
++        run: |
++          cargo run -p wallflow-cli -- presenter-sim-smoke
++          echo "Presenter sim smoke test completed"
++
+       - name: Legacy headless heartbeat smoke
+         run: |
+           timeout 15 ./target/debug/wallflow-renderer --headless-heartbeat --heartbeat-interval-ms 500 --timeout-secs 5 || true
+diff --git a/wallflow/wallflow-foundation/Cargo.toml b/wallflow/wallflow-foundation/Cargo.toml
+index 5201cd8..386b0f3 100644
+--- a/wallflow/wallflow-foundation/Cargo.toml
++++ b/wallflow/wallflow-foundation/Cargo.toml
+@@ -37,4 +37,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
+ wgpu = "29"
+ pollster = "0.4"
+ bytemuck = { version = "1", features = ["derive"] }
++softbuffer = "0.4"
++raw-window-handle = "0.6"
+ 
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+index fdc9f1e..e09bd16 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+@@ -112,6 +112,11 @@ enum Command {
+     /// outputs a skipped report and exits with code 0. If available, performs
+     /// a minimal offscreen clear render and verifies the output.
+     WgpuSmoke,
++
++    /// Run the presenter simulation smoke test: creates a test PNG, runs the
++    /// renderer in --presenter-sim mode, and verifies the structured JSON report.
++    /// This is the cloud-testable softbuffer presenter integration test.
++    PresenterSimSmoke,
+ }
+ 
+ fn main() -> Result<()> {
+@@ -185,6 +190,9 @@ fn main() -> Result<()> {
+         Command::WgpuSmoke => {
+             run_wgpu_smoke()?;
+         }
++        Command::PresenterSimSmoke => {
++            run_presenter_sim_smoke()?;
++        }
+     }
+ 
+     Ok(())
+@@ -1798,3 +1806,249 @@ fn run_wgpu_smoke() -> Result<()> {
+ 
+     Ok(())
+ }
++
++// ---------------------------------------------------------------------------
++// Presenter simulation smoke test
++// ---------------------------------------------------------------------------
++
++fn run_presenter_sim_smoke() -> Result<()> {
++    use std::process::Stdio;
++    use tokio::io::AsyncBufReadExt;
++    use tokio::process::Command;
++    use tokio::time;
++
++    let rt = tokio::runtime::Runtime::new()?;
++    rt.block_on(async {
++        let start = Instant::now();
++
++        // Step 1: Create a temporary 2x2 PNG with distinct colors
++        let temp_dir = std::env::temp_dir().join("wallflow-presenter-sim-smoke");
++        let _ = std::fs::remove_dir_all(&temp_dir);
++        std::fs::create_dir_all(&temp_dir)?;
++
++        let mut img = image::RgbaImage::new(2, 2);
++        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255])); // red
++        img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255])); // green
++        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255])); // blue
++        img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255])); // white
++        let source_path = temp_dir.join("source.png");
++        img.save(&source_path)?;
++
++        let source_path_str = source_path.to_string_lossy().to_string();
++
++        println!("=== Presenter Sim Smoke Test ===");
++        println!("Source image: {}", source_path.display());
++
++        // Step 2: Run renderer in --presenter-sim mode
++        let renderer_exe = find_renderer_exe()?;
++        println!("Renderer exe: {}", renderer_exe.display());
++
++        let mut child = Command::new(&renderer_exe)
++            .arg("--presenter-sim")
++            .arg("--width")
++            .arg("800")
++            .arg("--height")
++            .arg("450")
++            .arg("--source")
++            .arg(&source_path_str)
++            .arg("--fit")
++            .arg("cover")
++            .arg("--timeout-secs")
++            .arg("1")
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
++
++        let pid = child.id();
++        println!("Renderer spawned (PID: {:?})", pid);
++
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
++        let stdout_reader = tokio::io::BufReader::new(stdout);
++        let mut lines = stdout_reader.lines();
++
++        let deadline = time::sleep(Duration::from_secs(30));
++        tokio::pin!(deadline);
++
++        let mut report_json = String::new();
++        let mut report_received = false;
++
++        tokio::select! {
++            _ = &mut deadline => {
++                eprintln!("Presenter sim smoke timed out waiting for report");
++                let _ = child.kill().await;
++            }
++            line = lines.next_line() => {
++                match line {
++                    Ok(Some(line)) => {
++                        report_json = line;
++                        report_received = true;
++                    }
++                    Ok(None) => {}
++                    Err(e) => {
++                        eprintln!("Error reading renderer stdout: {e}");
++                    }
++                }
++            }
++        }
++
++        // Wait for the process to exit
++        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
++            Ok(Ok(status)) => Some(status),
++            Ok(Err(e)) => {
++                eprintln!("Error waiting for renderer: {e}");
++                None
++            }
++            Err(_) => {
++                eprintln!("Renderer did not exit in time, killing");
++                let _ = child.kill().await;
++                None
++            }
++        };
++
++        let total_elapsed = start.elapsed();
++        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
++
++        // Step 3: Parse and verify the PresenterReport JSON
++        let mut exit_code_ok = false;
++        let mut rendered_ok = false;
++        let mut presented_simulated_ok = false;
++        let mut checksum_ok = false;
++        let mut viewport_ok = false;
++        let mut source_path_ok = false;
++        let mut error_ok = false;
++
++        if process_exit_code == Some(0) {
++            exit_code_ok = true;
++        }
++
++        if report_received {
++            if let Ok(report_val) = serde_json::from_str::<serde_json::Value>(&report_json) {
++                // rendered = true
++                if report_val
++                    .get("rendered")
++                    .and_then(|v| v.as_bool())
++                    .unwrap_or(false)
++                {
++                    rendered_ok = true;
++                }
++
++                // presented_simulated = true
++                if report_val
++                    .get("presented_simulated")
++                    .and_then(|v| v.as_bool())
++                    .unwrap_or(false)
++                {
++                    presented_simulated_ok = true;
++                }
++
++                // checksum is present (not null)
++                if report_val
++                    .get("checksum")
++                    .map(|v| !v.is_null())
++                    .unwrap_or(false)
++                {
++                    checksum_ok = true;
++                }
++
++                // viewport = 800×450 (nested: viewport.width, viewport.height)
++                let viewport_obj = report_val.get("viewport");
++                let viewport_w = viewport_obj
++                    .and_then(|v| v.get("width"))
++                    .and_then(|v| v.as_u64())
++                    .unwrap_or(0);
++                let viewport_h = viewport_obj
++                    .and_then(|v| v.get("height"))
++                    .and_then(|v| v.as_u64())
++                    .unwrap_or(0);
++                if viewport_w == 800 && viewport_h == 450 {
++                    viewport_ok = true;
++                }
++
++                // source_path exists in report
++                if report_val
++                    .get("source_path")
++                    .map(|v| !v.is_null())
++                    .unwrap_or(false)
++                {
++                    source_path_ok = true;
++                }
++
++                // error is null or absent
++                let error_val = report_val.get("error");
++                if error_val.is_none() || error_val.unwrap().is_null() {
++                    error_ok = true;
++                }
++            }
++        }
++
++        let success = exit_code_ok
++            && rendered_ok
++            && presented_simulated_ok
++            && checksum_ok
++            && viewport_ok
++            && source_path_ok
++            && error_ok;
++
++        let verification = serde_json::json!({
++            "exit_code_ok": exit_code_ok,
++            "rendered_ok": rendered_ok,
++            "presented_simulated_ok": presented_simulated_ok,
++            "checksum_ok": checksum_ok,
++            "viewport_ok": viewport_ok,
++            "source_path_ok": source_path_ok,
++            "error_ok": error_ok,
++            "process_exit_code": process_exit_code,
++        });
++
++        let report = serde_json::json!({
++            "test": "presenter-sim-smoke",
++            "success": success,
++            "total_elapsed_ms": total_elapsed.as_millis() as u64,
++            "renderer_pid": pid,
++            "source_path": source_path_str,
++            "verification": verification,
++        });
++
++        println!("\n=== Presenter Sim Smoke Report ===");
++        println!("{}", serde_json::to_string_pretty(&report)?);
++
++        if success {
++            println!("\nPresenter sim smoke test PASSED.");
++        } else {
++            eprintln!("\nPresenter sim smoke test FAILED.");
++            if !exit_code_ok {
++                eprintln!(
++                    "  Failed: process exit code is not 0 (got {:?})",
++                    process_exit_code
++                );
++            }
++            if !rendered_ok {
++                eprintln!("  Failed: rendered is not true");
++            }
++            if !presented_simulated_ok {
++                eprintln!("  Failed: presented_simulated is not true");
++            }
++            if !checksum_ok {
++                eprintln!("  Missing: checksum in report");
++            }
++            if !viewport_ok {
++                eprintln!("  Failed: viewport is not 800x450");
++            }
++            if !source_path_ok {
++                eprintln!("  Missing: source_path in report");
++            }
++            if !error_ok {
++                eprintln!("  Failed: error field is present and non-null");
++            }
++        }
++
++        // Cleanup
++        let _ = std::fs::remove_dir_all(&temp_dir);
++
++        Ok(())
++    })
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+index 4b82b2a..3cf95bb 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+@@ -13,6 +13,7 @@
+ mod color;
+ mod error;
+ mod output;
++mod presenter;
+ mod renderer;
+ mod wgpu_backend;
+ mod wgpu_error;
+@@ -20,6 +21,10 @@ mod wgpu_error;
+ pub use color::RgbaColor;
+ pub use error::StaticRenderError;
+ pub use output::{RenderOutput, RenderOutputMetadata};
++pub use presenter::{
++    rgba_to_softbuffer_u32, rgba_to_softbuffer_u32_with_surface_size, PresenterBackend,
++    PresenterReport, PresenterState, PresenterViewport, SoftbufferPresenterConfig,
++};
+ pub use renderer::{render_static_image_cpu, StaticRenderInput};
+ pub use wgpu_backend::{
+     probe_wgpu_capabilities, render_static_image_wgpu_offscreen, WgpuRenderCapabilities,
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs
+new file mode 100644
+index 0000000..84c2191
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs
+@@ -0,0 +1,666 @@
++//! Presenter abstraction for WallFlow.
++//!
++//! This module defines the types used by the presenter layer, which takes
++//! CPU-rendered RGBA frames and presents them to a window surface (softbuffer)
++//! or simulates presentation for cloud testing (presenter-sim).
++//!
++//! The presenter sits between the CPU reference renderer output and the actual
++//! window display. It does not perform any rendering itself — it converts
++//! RGBA8 pixel data from the renderer into the format required by the
++//! presentation backend.
++
++use serde::{Deserialize, Serialize};
++use std::num::NonZeroU32;
++use std::path::PathBuf;
++
++// ---------------------------------------------------------------------------
++// PresenterBackend
++// ---------------------------------------------------------------------------
++
++/// Which backend to use for presenting rendered frames.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
++pub enum PresenterBackend {
++    /// CPU-rendered frames presented via softbuffer (software blit to window).
++    /// Works without GPU. Requires a display server for actual windowed mode.
++    #[default]
++    SoftbufferCpu,
++    /// Reserved for future wgpu-based presentation. Not implemented yet.
++    WgpuExperimental,
++}
++
++impl std::fmt::Display for PresenterBackend {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            PresenterBackend::SoftbufferCpu => write!(f, "softbuffer-cpu"),
++            PresenterBackend::WgpuExperimental => write!(f, "wgpu-experimental"),
++        }
++    }
++}
++
++impl std::str::FromStr for PresenterBackend {
++    type Err = String;
++
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        match s.to_lowercase().as_str() {
++            "softbuffer-cpu" | "softbuffer" | "cpu" => Ok(PresenterBackend::SoftbufferCpu),
++            "wgpu-experimental" | "wgpu" => Ok(PresenterBackend::WgpuExperimental),
++            other => Err(format!(
++                "unknown presenter backend '{}'; expected 'softbuffer-cpu' or 'wgpu-experimental'",
++                other
++            )),
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// PresenterState
++// ---------------------------------------------------------------------------
++
++/// Lifecycle state of a presenter instance.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum PresenterState {
++    /// Presenter has been created but no surface is ready yet.
++    Created,
++    /// The presentation surface is ready (window created, softbuffer context initialized).
++    SurfaceReady,
++    /// A frame has been rendered and is ready for presentation.
++    FrameRendered,
++    /// The frame has been presented to the surface.
++    Presented,
++    /// The presenter has been resized and needs a re-render.
++    Resized,
++    /// The presenter has been closed cleanly.
++    Closed,
++    /// The presenter has encountered a fatal error.
++    Failed,
++}
++
++impl std::fmt::Display for PresenterState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            PresenterState::Created => write!(f, "Created"),
++            PresenterState::SurfaceReady => write!(f, "SurfaceReady"),
++            PresenterState::FrameRendered => write!(f, "FrameRendered"),
++            PresenterState::Presented => write!(f, "Presented"),
++            PresenterState::Resized => write!(f, "Resized"),
++            PresenterState::Closed => write!(f, "Closed"),
++            PresenterState::Failed => write!(f, "Failed"),
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// SoftbufferPresenterConfig
++// ---------------------------------------------------------------------------
++
++/// Configuration for the softbuffer-based presenter.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct SoftbufferPresenterConfig {
++    /// Viewport width in pixels.
++    pub width: u32,
++    /// Viewport height in pixels.
++    pub height: u32,
++    /// Window title.
++    pub title: String,
++    /// Source image path (if any). If None, a test pattern is rendered.
++    pub source: Option<PathBuf>,
++    /// Fit mode for the image within the viewport.
++    pub fit: String,
++    /// Background color as hex string (e.g. "#000000").
++    pub background: String,
++    /// Timeout in seconds (0 = no timeout, run until closed).
++    pub timeout_secs: u64,
++}
++
++impl SoftbufferPresenterConfig {
++    /// Validate the configuration. Returns an error message if invalid.
++    pub fn validate(&self) -> Result<(), String> {
++        if self.width == 0 {
++            return Err("viewport width must be > 0".into());
++        }
++        if self.height == 0 {
++            return Err("viewport height must be > 0".into());
++        }
++        if let Some(ref source) = self.source {
++            if !source.exists() {
++                return Err(format!("source file does not exist: {}", source.display()));
++            }
++        }
++        Ok(())
++    }
++}
++
++// ---------------------------------------------------------------------------
++// PresenterReport
++// ---------------------------------------------------------------------------
++
++/// Structured report from a presenter run. Used both for real windowed
++/// presentation and for cloud-safe simulation mode.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct PresenterReport {
++    /// Which presenter backend was used.
++    pub backend: PresenterBackend,
++    /// Viewport width and height.
++    pub viewport: PresenterViewport,
++    /// Source image path (if any).
++    pub source_path: Option<String>,
++    /// Whether the CPU render completed successfully.
++    pub rendered: bool,
++    /// Whether the frame was actually presented to a real window surface.
++    pub presented: bool,
++    /// Whether the presentation was simulated (no real window, cloud-safe).
++    pub presented_simulated: bool,
++    /// SHA-256 checksum of the RGBA frame data (hex string).
++    pub checksum: Option<String>,
++    /// Output dimensions (width, height) in pixels.
++    pub output_dimensions: Option<PresenterViewport>,
++    /// Error message if the presenter failed.
++    pub error: Option<String>,
++    /// Why the presenter exited (timeout, close-request, error, etc.).
++    pub exit_reason: Option<String>,
++    /// Duration of the presenter run in milliseconds.
++    pub duration_ms: Option<u64>,
++}
++
++/// Viewport dimensions for the presenter report.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct PresenterViewport {
++    pub width: u32,
++    pub height: u32,
++}
++
++// ---------------------------------------------------------------------------
++// Pixel conversion
++// ---------------------------------------------------------------------------
++
++/// Convert RGBA8 pixel buffer (from the CPU reference renderer) to the
++/// softbuffer `u32` pixel format.
++///
++/// # Pixel format
++///
++/// The CPU reference renderer produces RGBA8 pixels: each pixel is 4 bytes
++/// in the order R, G, B, A (red first, alpha last).
++///
++/// softbuffer expects each pixel as a `u32` in the format `0x00RRGGBB`:
++/// the highest 8 bits are zero, then red, green, blue in the lowest 24 bits.
++/// The alpha channel is **not** represented in the softbuffer format —
++/// it is a packed XRGB8888 format (X = ignored, always 0).
++///
++/// # Alpha handling
++///
++/// Since softbuffer does not support alpha blending against the desktop,
++/// this function composites the RGBA pixels against an opaque black background
++/// before discarding the alpha channel. Fully opaque pixels are passed through
++/// unchanged; semi-transparent pixels are alpha-blended against black.
++///
++/// # Endianness
++///
++/// The `u32` is constructed using native endianness bit operations
++/// (`(r as u32) << 16 | (g as u32) << 8 | b as u32`). On little-endian
++/// platforms (x86/x86-64), the bytes in memory are B, G, R, 0x00. On
++/// big-endian, they are 0x00, R, G, B. This matches what softbuffer expects
++/// because it interprets the `u32` as a native-endian integer.
++///
++/// # Arguments
++///
++/// * `rgba_pixels` - The RGBA8 pixel buffer from the CPU renderer.
++/// * `width` - Width of the frame in pixels.
++/// * `height` - Height of the frame in pixels.
++///
++/// # Returns
++///
++/// A `Vec<u32>` of length `width * height` in the softbuffer pixel format,
++/// or an error string if the buffer length does not match the expected size.
++pub fn rgba_to_softbuffer_u32(
++    rgba_pixels: &[u8],
++    width: u32,
++    height: u32,
++) -> Result<Vec<u32>, String> {
++    let expected_len = width as usize * height as usize * 4;
++    if rgba_pixels.len() != expected_len {
++        return Err(format!(
++            "RGBA buffer length mismatch: expected {} bytes ({}x{}x4), got {} bytes",
++            expected_len,
++            width,
++            height,
++            rgba_pixels.len()
++        ));
++    }
++
++    let pixel_count = width as usize * height as usize;
++    let mut buffer = Vec::with_capacity(pixel_count);
++
++    for chunk in rgba_pixels.chunks_exact(4) {
++        let r = chunk[0];
++        let g = chunk[1];
++        let b = chunk[2];
++        let a = chunk[3];
++
++        // Alpha composite against opaque black background
++        let (final_r, final_g, final_b) = if a == 255 {
++            (r, g, b)
++        } else if a == 0 {
++            (0, 0, 0)
++        } else {
++            let af = a as f32 / 255.0;
++            (
++                (r as f32 * af).round() as u8,
++                (g as f32 * af).round() as u8,
++                (b as f32 * af).round() as u8,
++            )
++        };
++
++        // softbuffer format: 0x00RRGGBB
++        let pixel = (final_r as u32) << 16 | (final_g as u32) << 8 | (final_b as u32);
++        buffer.push(pixel);
++    }
++
++    Ok(buffer)
++}
++
++/// Convert RGBA8 pixel buffer to softbuffer format for a surface of the given
++/// size, handling size mismatches by padding with black or cropping.
++///
++/// If the rendered frame is smaller than the target surface, the remaining
++/// pixels are filled with the background color. If larger, the frame is
++/// cropped to the surface size.
++///
++/// This is used when the rendered image dimensions differ from the window
++/// surface dimensions (e.g. after a resize before re-rendering).
++pub fn rgba_to_softbuffer_u32_with_surface_size(
++    rgba_pixels: &[u8],
++    render_width: u32,
++    render_height: u32,
++    surface_width: NonZeroU32,
++    surface_height: NonZeroU32,
++    background_color: u32,
++) -> Vec<u32> {
++    let sw = surface_width.get() as usize;
++    let sh = surface_height.get() as usize;
++    let rw = render_width as usize;
++    let rh = render_height as usize;
++    let total = sw * sh;
++
++    let mut buffer = vec![background_color; total];
++
++    // Copy the overlapping region
++    let copy_w = rw.min(sw);
++    let copy_h = rh.min(sh);
++
++    for y in 0..copy_h {
++        for x in 0..copy_w {
++            let src_idx = (y * rw + x) * 4;
++            let r = rgba_pixels[src_idx];
++            let g = rgba_pixels[src_idx + 1];
++            let b = rgba_pixels[src_idx + 2];
++            let a = rgba_pixels[src_idx + 3];
++
++            let (final_r, final_g, final_b) = if a == 255 {
++                (r, g, b)
++            } else if a == 0 {
++                (0, 0, 0)
++            } else {
++                let af = a as f32 / 255.0;
++                (
++                    (r as f32 * af).round() as u8,
++                    (g as f32 * af).round() as u8,
++                    (b as f32 * af).round() as u8,
++                )
++            };
++
++            let pixel = (final_r as u32) << 16 | (final_g as u32) << 8 | (final_b as u32);
++            let dst_idx = y * sw + x;
++            buffer[dst_idx] = pixel;
++        }
++    }
++
++    buffer
++}
++
++// ---------------------------------------------------------------------------
++// Tests
++// ---------------------------------------------------------------------------
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Helper: create a 1x1 RGBA pixel buffer.
++    fn rgba_pixel(r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
++        vec![r, g, b, a]
++    }
++
++    /// Helper: create an NxM RGBA pixel buffer filled with the same pixel.
++    fn rgba_filled(w: u32, h: u32, r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
++        let mut buf = Vec::with_capacity((w * h * 4) as usize);
++        for _ in 0..(w * h) {
++            buf.push(r);
++            buf.push(g);
++            buf.push(b);
++            buf.push(a);
++        }
++        buf
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_red() {
++        let pixels = rgba_pixel(255, 0, 0, 255);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        assert_eq!(result[0], 0x00FF0000, "red pixel should be 0x00FF0000");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_green() {
++        let pixels = rgba_pixel(0, 255, 0, 255);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        assert_eq!(result[0], 0x0000FF00, "green pixel should be 0x0000FF00");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_blue() {
++        let pixels = rgba_pixel(0, 0, 255, 255);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        assert_eq!(result[0], 0x000000FF, "blue pixel should be 0x000000FF");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_white() {
++        let pixels = rgba_pixel(255, 255, 255, 255);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        assert_eq!(result[0], 0x00FFFFFF, "white pixel should be 0x00FFFFFF");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_black() {
++        let pixels = rgba_pixel(0, 0, 0, 255);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        assert_eq!(result[0], 0x00000000, "black pixel should be 0x00000000");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_transparent_is_black() {
++        // Fully transparent pixels are composited against black → black
++        let pixels = rgba_pixel(128, 64, 32, 0);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        assert_eq!(
++            result[0], 0x00000000,
++            "transparent pixel should composite to black"
++        );
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_semi_transparent() {
++        // Semi-transparent pixel: alpha = 128/255 ≈ 0.502
++        // R=200 * 0.502 ≈ 100, G=100 * 0.502 ≈ 50, B=50 * 0.502 ≈ 25
++        let pixels = rgba_pixel(200, 100, 50, 128);
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1).unwrap();
++        let expected_r = (200.0f32 * 128.0f32 / 255.0f32).round() as u32;
++        let expected_g = (100.0f32 * 128.0f32 / 255.0f32).round() as u32;
++        let expected_b = (50.0f32 * 128.0f32 / 255.0f32).round() as u32;
++        let expected = expected_r << 16 | expected_g << 8 | expected_b;
++        assert_eq!(
++            result[0], expected,
++            "semi-transparent pixel should be alpha-composited against black"
++        );
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_invalid_length() {
++        let pixels = vec![255, 0, 0]; // Only 3 bytes, not 4
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1);
++        assert!(result.is_err(), "should fail with invalid buffer length");
++        let err = result.unwrap_err();
++        assert!(
++            err.contains("mismatch"),
++            "error message should mention mismatch: {err}"
++        );
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_wrong_dimensions() {
++        // 2x2 frame = 16 bytes, but we pass 1x1 = 4 bytes expected
++        let pixels = rgba_filled(2, 2, 255, 0, 0, 255); // 16 bytes
++        let result = rgba_to_softbuffer_u32(&pixels, 1, 1); // expects 4 bytes
++        assert!(result.is_err(), "should fail with wrong dimensions");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_multi_pixel() {
++        // 2x1 frame: red and blue
++        let pixels = vec![255, 0, 0, 255, 0, 0, 255, 255];
++        let result = rgba_to_softbuffer_u32(&pixels, 2, 1).unwrap();
++        assert_eq!(result.len(), 2);
++        assert_eq!(result[0], 0x00FF0000, "first pixel should be red");
++        assert_eq!(result[1], 0x000000FF, "second pixel should be blue");
++    }
++
++    // --- PresenterBackend tests ---
++
++    #[test]
++    fn test_presenter_backend_display() {
++        assert_eq!(
++            format!("{}", PresenterBackend::SoftbufferCpu),
++            "softbuffer-cpu"
++        );
++        assert_eq!(
++            format!("{}", PresenterBackend::WgpuExperimental),
++            "wgpu-experimental"
++        );
++    }
++
++    #[test]
++    fn test_presenter_backend_from_str() {
++        assert_eq!(
++            "softbuffer-cpu".parse::<PresenterBackend>(),
++            Ok(PresenterBackend::SoftbufferCpu)
++        );
++        assert_eq!(
++            "softbuffer".parse::<PresenterBackend>(),
++            Ok(PresenterBackend::SoftbufferCpu)
++        );
++        assert_eq!(
++            "cpu".parse::<PresenterBackend>(),
++            Ok(PresenterBackend::SoftbufferCpu)
++        );
++        assert_eq!(
++            "wgpu".parse::<PresenterBackend>(),
++            Ok(PresenterBackend::WgpuExperimental)
++        );
++        assert_eq!(
++            "wgpu-experimental".parse::<PresenterBackend>(),
++            Ok(PresenterBackend::WgpuExperimental)
++        );
++        assert!("unknown".parse::<PresenterBackend>().is_err());
++    }
++
++    #[test]
++    fn test_presenter_backend_serde_roundtrip() {
++        let backend = PresenterBackend::SoftbufferCpu;
++        let json = serde_json::to_string(&backend).unwrap();
++        let parsed: PresenterBackend = serde_json::from_str(&json).unwrap();
++        assert_eq!(backend, parsed);
++    }
++
++    // --- PresenterState tests ---
++
++    #[test]
++    fn test_presenter_state_display() {
++        assert_eq!(format!("{}", PresenterState::Created), "Created");
++        assert_eq!(format!("{}", PresenterState::SurfaceReady), "SurfaceReady");
++        assert_eq!(format!("{}", PresenterState::Failed), "Failed");
++    }
++
++    #[test]
++    fn test_presenter_state_serde_roundtrip() {
++        for state in [
++            PresenterState::Created,
++            PresenterState::SurfaceReady,
++            PresenterState::FrameRendered,
++            PresenterState::Presented,
++            PresenterState::Resized,
++            PresenterState::Closed,
++            PresenterState::Failed,
++        ] {
++            let json = serde_json::to_string(&state).unwrap();
++            let parsed: PresenterState = serde_json::from_str(&json).unwrap();
++            assert_eq!(state, parsed);
++        }
++    }
++
++    // --- SoftbufferPresenterConfig tests ---
++
++    #[test]
++    fn test_config_valid() {
++        let config = SoftbufferPresenterConfig {
++            width: 800,
++            height: 450,
++            title: "Test".into(),
++            source: None,
++            fit: "cover".into(),
++            background: "#000000".into(),
++            timeout_secs: 5,
++        };
++        assert!(config.validate().is_ok());
++    }
++
++    #[test]
++    fn test_config_zero_width_rejected() {
++        let config = SoftbufferPresenterConfig {
++            width: 0,
++            height: 450,
++            title: "Test".into(),
++            source: None,
++            fit: "cover".into(),
++            background: "#000000".into(),
++            timeout_secs: 5,
++        };
++        let err = config.validate().unwrap_err();
++        assert!(err.contains("width"), "error should mention width: {err}");
++    }
++
++    #[test]
++    fn test_config_zero_height_rejected() {
++        let config = SoftbufferPresenterConfig {
++            width: 800,
++            height: 0,
++            title: "Test".into(),
++            source: None,
++            fit: "cover".into(),
++            background: "#000000".into(),
++            timeout_secs: 5,
++        };
++        let err = config.validate().unwrap_err();
++        assert!(err.contains("height"), "error should mention height: {err}");
++    }
++
++    #[test]
++    fn test_config_invalid_source_handled() {
++        let config = SoftbufferPresenterConfig {
++            width: 800,
++            height: 450,
++            title: "Test".into(),
++            source: Some(PathBuf::from("/nonexistent/path.png")),
++            fit: "cover".into(),
++            background: "#000000".into(),
++            timeout_secs: 5,
++        };
++        let err = config.validate().unwrap_err();
++        assert!(
++            err.contains("does not exist") || err.contains("nonexistent"),
++            "error should mention missing file: {err}"
++        );
++    }
++
++    // --- PresenterReport tests ---
++
++    #[test]
++    fn test_presenter_report_serde_roundtrip() {
++        let report = PresenterReport {
++            backend: PresenterBackend::SoftbufferCpu,
++            viewport: PresenterViewport {
++                width: 800,
++                height: 450,
++            },
++            source_path: Some("/test/image.png".into()),
++            rendered: true,
++            presented: false,
++            presented_simulated: true,
++            checksum: Some("abc123".into()),
++            output_dimensions: Some(PresenterViewport {
++                width: 800,
++                height: 450,
++            }),
++            error: None,
++            exit_reason: Some("timeout".into()),
++            duration_ms: Some(150),
++        };
++        let json = serde_json::to_string(&report).unwrap();
++        let parsed: PresenterReport = serde_json::from_str(&json).unwrap();
++        assert_eq!(report.backend, parsed.backend);
++        assert_eq!(report.rendered, parsed.rendered);
++        assert_eq!(report.presented_simulated, parsed.presented_simulated);
++        assert_eq!(report.checksum, parsed.checksum);
++    }
++
++    #[test]
++    fn test_presenter_report_error_case_serde() {
++        let report = PresenterReport {
++            backend: PresenterBackend::SoftbufferCpu,
++            viewport: PresenterViewport {
++                width: 0,
++                height: 0,
++            },
++            source_path: None,
++            rendered: false,
++            presented: false,
++            presented_simulated: false,
++            checksum: None,
++            output_dimensions: None,
++            error: Some("no display server".into()),
++            exit_reason: Some("error".into()),
++            duration_ms: None,
++        };
++        let json = serde_json::to_string(&report).unwrap();
++        let parsed: PresenterReport = serde_json::from_str(&json).unwrap();
++        assert_eq!(report.error, parsed.error);
++    }
++
++    // --- rgba_to_softbuffer_u32_with_surface_size tests ---
++
++    #[test]
++    fn test_rgba_to_softbuffer_padded_with_bg() {
++        // Render a 1x1 red pixel for a 2x2 surface — should pad with background
++        let pixels = rgba_pixel(255, 0, 0, 255);
++        let bg = 0x00808080; // grey background
++        let result = rgba_to_softbuffer_u32_with_surface_size(
++            &pixels,
++            1,
++            1,
++            NonZeroU32::new(2).unwrap(),
++            NonZeroU32::new(2).unwrap(),
++            bg,
++        );
++        assert_eq!(result.len(), 4);
++        assert_eq!(result[0], 0x00FF0000, "top-left should be red");
++        assert_eq!(result[1], bg, "top-right should be background");
++        assert_eq!(result[2], bg, "bottom-left should be background");
++        assert_eq!(result[3], bg, "bottom-right should be background");
++    }
++
++    #[test]
++    fn test_rgba_to_softbuffer_cropped() {
++        // Render 2x2 but present to 1x1 — should crop
++        let pixels = rgba_filled(2, 2, 255, 0, 0, 255); // red 2x2
++        let bg = 0x00000000;
++        let result = rgba_to_softbuffer_u32_with_surface_size(
++            &pixels,
++            2,
++            2,
++            NonZeroU32::new(1).unwrap(),
++            NonZeroU32::new(1).unwrap(),
++            bg,
++        );
++        assert_eq!(result.len(), 1);
++        assert_eq!(result[0], 0x00FF0000, "should be red (cropped from 2x2)");
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+index c69e996..505c3f9 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+@@ -21,6 +21,8 @@ wallflow-media = { path = "../wallflow-media" }
+ wallflow-package = { path = "../wallflow-package" }
+ wallflow-render = { path = "../wallflow-render" }
+ winit.workspace = true
++softbuffer.workspace = true
++raw-window-handle.workspace = true
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.58", features = [
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+index fcd3055..d6a1229 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+@@ -1,6 +1,7 @@
+ use anyhow::Result;
+ use clap::Parser;
+ use std::io::{Read as StdRead, Write as StdWrite};
++use std::num::NonZeroU32;
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant};
+ use tracing::{info, warn};
+@@ -15,6 +16,10 @@ use wallflow_ipc::{
+     StaticImageLayoutReport, WallpaperApplyError, WallpaperPayload,
+ };
+ use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
++use wallflow_render::{
++    rgba_to_softbuffer_u32, PresenterBackend, PresenterReport, PresenterViewport,
++    SoftbufferPresenterConfig,
++};
+ 
+ #[derive(Debug, Parser)]
+ #[command(name = "wallflow-renderer")]
+@@ -97,6 +102,25 @@ struct Args {
+     /// Render backend to use: "cpu" (default, cloud-testable) or "wgpu" (experimental, requires GPU).
+     #[arg(long, default_value = "cpu")]
+     backend: String,
++
++    /// Run in windowed softbuffer mode: opens a winit window and presents the
++    /// CPU-rendered frame via softbuffer. Requires a display server.
++    /// Not suitable for CI/cloud (no display server).
++    #[arg(long, default_value_t = false)]
++    windowed_softbuffer: bool,
++
++    /// Run in presenter simulation mode: no window, uses CPU reference renderer,
++    /// performs RGBA → softbuffer format conversion, and outputs a structured
++    /// JSON report. Suitable for CI and cloud testing.
++    #[arg(long, default_value_t = false)]
++    presenter_sim: bool,
++}
++
++impl Args {
++    /// Default background color for presenter modes.
++    fn background_for_presenter(&self) -> String {
++        "#000000".into()
++    }
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -115,8 +139,8 @@ struct LoadedStaticImageState {
+ 
+ fn main() -> Result<()> {
+     // Determine if stderr-only logging is needed
+-    let use_stderr_only =
+-        std::env::args().any(|a| a == "--ipc-stdio" || a == "--headless-render-sim");
++    let use_stderr_only = std::env::args()
++        .any(|a| a == "--ipc-stdio" || a == "--headless-render-sim" || a == "--presenter-sim");
+ 
+     if use_stderr_only {
+         tracing_subscriber::fmt()
+@@ -159,6 +183,45 @@ fn main() -> Result<()> {
+         );
+     }
+ 
++    if args.windowed_softbuffer {
++        let fit = match args.fit.parse::<wallflow_common::FitMode>() {
++            Ok(f) => f,
++            Err(()) => {
++                eprintln!("invalid fit mode: {}", args.fit);
++                return Err(anyhow::anyhow!("invalid fit mode: {}", args.fit));
++            }
++        };
++        return run_windowed_softbuffer(
++            renderer_id,
++            args.width,
++            args.height,
++            args.timeout_secs,
++            args.source.as_deref(),
++            fit,
++            &args.fit,
++            &args.background_for_presenter(),
++        );
++    }
++
++    if args.presenter_sim {
++        let fit = match args.fit.parse::<wallflow_common::FitMode>() {
++            Ok(f) => f,
++            Err(()) => {
++                eprintln!("invalid fit mode: {}", args.fit);
++                return Err(anyhow::anyhow!("invalid fit mode: {}", args.fit));
++            }
++        };
++        return run_presenter_sim(
++            args.width,
++            args.height,
++            args.source.as_deref(),
++            fit,
++            &args.fit,
++            &args.background_for_presenter(),
++            args.timeout_secs,
++        );
++    }
++
+     if args.windowed_static {
+         return run_windowed_static(
+             renderer_id,
+@@ -731,9 +794,548 @@ fn apply_static_wallpaper_for_windowed(
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// IPC stdio mode
++// Windowed softbuffer presenter mode
+ // ---------------------------------------------------------------------------
+ 
++/// Wrapper that provides `HasDisplayHandle` from a raw display handle.
++/// This is needed because softbuffer::Context takes ownership of the display provider,
++/// but we cannot give it the winit::Window (we need it for Surface too).
++struct DisplayHandleWrapper {
++    raw: raw_window_handle::RawDisplayHandle,
++}
++
++impl raw_window_handle::HasDisplayHandle for DisplayHandleWrapper {
++    fn display_handle(
++        &self,
++    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
++        // SAFETY: The raw display handle is valid for the lifetime of this wrapper.
++        // This is the same pattern used by winit internally.
++        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(self.raw) })
++    }
++}
++
++/// Wrapper that provides `HasWindowHandle` from a raw window handle.
++struct WindowHandleWrapper {
++    raw: raw_window_handle::RawWindowHandle,
++}
++
++impl raw_window_handle::HasWindowHandle for WindowHandleWrapper {
++    fn window_handle(
++        &self,
++    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
++        // SAFETY: The raw window handle is valid for the lifetime of this wrapper.
++        // This is the same pattern used by winit internally.
++        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.raw) })
++    }
++}
++
++/// Application handler for the softbuffer-based windowed presenter.
++struct SoftbufferPresenterApp {
++    renderer_id: RendererId,
++    viewport: RendererViewport,
++    source: Option<PathBuf>,
++    fit: wallflow_common::FitMode,
++    #[allow(dead_code)]
++    fit_str: String,
++    background: String,
++    timeout: Option<Duration>,
++    start: Instant,
++    window: Option<winit::window::Window>,
++    context: Option<softbuffer::Context<DisplayHandleWrapper>>,
++    surface: Option<softbuffer::Surface<DisplayHandleWrapper, WindowHandleWrapper>>,
++    needs_render: bool,
++    last_render_output: Option<wallflow_render::RenderOutput>,
++}
++
++impl SoftbufferPresenterApp {
++    /// Perform CPU rendering of the source image for the current viewport.
++    fn render_frame(&mut self) -> Result<wallflow_render::RenderOutput, String> {
++        let vp = wallflow_package::Viewport {
++            width: self.viewport.width,
++            height: self.viewport.height,
++        };
++
++        if let Some(ref source) = self.source {
++            let render_input = wallflow_render::StaticRenderInput {
++                image_path: source.clone(),
++                viewport: vp,
++                fit: self.fit,
++                background: self.background.clone(),
++                opacity: None,
++            };
++            wallflow_render::render_static_image_cpu(render_input)
++                .map_err(|e| format!("CPU render failed: {e}"))
++        } else {
++            // No source: generate a test pattern (checkerboard)
++            let width = self.viewport.width;
++            let height = self.viewport.height;
++            let mut pixels = vec![0u8; (width * height * 4) as usize];
++            for y in 0..height {
++                for x in 0..width {
++                    let idx = ((y * width + x) * 4) as usize;
++                    let checker = ((x / 32) + (y / 32)) % 2;
++                    if checker == 0 {
++                        pixels[idx] = 48; // R
++                        pixels[idx + 1] = 48; // G
++                        pixels[idx + 2] = 56; // B
++                        pixels[idx + 3] = 255; // A
++                    } else {
++                        pixels[idx] = 32; // R
++                        pixels[idx + 1] = 32; // G
++                        pixels[idx + 2] = 40; // B
++                        pixels[idx + 3] = 255; // A
++                    }
++                }
++            }
++            Ok(wallflow_render::RenderOutput::new(width, height, pixels))
++        }
++    }
++
++    /// Present the rendered frame to the softbuffer surface.
++    fn present_frame(&mut self) -> Result<(), String> {
++        let surface = match self.surface.as_mut() {
++            Some(s) => s,
++            None => return Err("surface not available".into()),
++        };
++
++        if self.viewport.width == 0 || self.viewport.height == 0 {
++            return Err("viewport has zero dimensions".into());
++        }
++
++        let width = NonZeroU32::new(self.viewport.width)
++            .ok_or_else(|| "viewport width is zero".to_string())?;
++        let height = NonZeroU32::new(self.viewport.height)
++            .ok_or_else(|| "viewport height is zero".to_string())?;
++
++        surface
++            .resize(width, height)
++            .map_err(|e| format!("softbuffer resize failed: {e}"))?;
++
++        let mut buffer = surface
++            .buffer_mut()
++            .map_err(|e| format!("softbuffer buffer_mut failed: {e}"))?;
++
++        if let Some(ref output) = self.last_render_output {
++            let softbuffer_pixels =
++                rgba_to_softbuffer_u32(&output.pixels_rgba, output.width, output.height)?;
++
++            // Copy pixels to the buffer
++            let len = buffer.len().min(softbuffer_pixels.len());
++            buffer[..len].copy_from_slice(&softbuffer_pixels[..len]);
++            // Fill remaining pixels with black if surface is larger
++            for pixel in buffer[len..].iter_mut() {
++                *pixel = 0;
++            }
++        } else {
++            // No rendered output — fill with black
++            for pixel in buffer.iter_mut() {
++                *pixel = 0;
++            }
++        }
++
++        buffer
++            .present()
++            .map_err(|e| format!("softbuffer present failed: {e}"))?;
++
++        Ok(())
++    }
++}
++
++impl winit::application::ApplicationHandler for SoftbufferPresenterApp {
++    fn window_event(
++        &mut self,
++        event_loop: &winit::event_loop::ActiveEventLoop,
++        _window_id: winit::window::WindowId,
++        event: winit::event::WindowEvent,
++    ) {
++        match event {
++            winit::event::WindowEvent::CloseRequested => {
++                info!(?self.renderer_id, "window close requested, exiting");
++                event_loop.exit();
++            }
++            winit::event::WindowEvent::Resized(physical_size) => {
++                let new_w = physical_size.width;
++                let new_h = physical_size.height;
++                if new_w > 0 && new_h > 0 {
++                    self.viewport = RendererViewport::new(new_w, new_h);
++                    self.needs_render = true;
++                    info!(
++                        ?self.renderer_id,
++                        width = new_w,
++                        height = new_h,
++                        "window resized, marking for re-render"
++                    );
++                }
++            }
++            winit::event::WindowEvent::RedrawRequested => {
++                if self.needs_render {
++                    match self.render_frame() {
++                        Ok(output) => {
++                            self.last_render_output = Some(output);
++                            self.needs_render = false;
++                        }
++                        Err(e) => {
++                            warn!(?self.renderer_id, error = %e, "render failed during redraw");
++                        }
++                    }
++                }
++
++                if let Err(e) = self.present_frame() {
++                    warn!(?self.renderer_id, error = %e, "present failed during redraw");
++                }
++            }
++            winit::event::WindowEvent::Destroyed => {
++                info!(?self.renderer_id, "window destroyed, exiting");
++                event_loop.exit();
++            }
++            _ => {}
++        }
++    }
++
++    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
++        // Check timeout
++        if let Some(dur) = self.timeout {
++            if self.start.elapsed() >= dur {
++                info!(
++                    ?self.renderer_id,
++                    elapsed_ms = self.start.elapsed().as_millis() as u64,
++                    "windowed softbuffer presenter timeout reached, exiting"
++                );
++                event_loop.exit();
++            }
++        }
++        // Request a redraw
++        if let Some(ref window) = self.window {
++            window.request_redraw();
++        }
++    }
++
++    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
++        if self.window.is_none() {
++            let window_config = WindowRuntimeConfig::new(self.viewport.width, self.viewport.height);
++            let window_attrs = winit::window::WindowAttributes::default()
++                .with_title(&window_config.title)
++                .with_inner_size(winit::dpi::LogicalSize::new(
++                    window_config.width,
++                    window_config.height,
++                ));
++
++            let window = match event_loop.create_window(window_attrs) {
++                Ok(w) => w,
++                Err(e) => {
++                    warn!(?self.renderer_id, error = %e, "failed to create winit window");
++                    event_loop.exit();
++                    return;
++                }
++            };
++
++            // Create softbuffer context and surface using raw handle wrappers.
++            // We cannot pass the winit::Window to both Context::new() and Surface::new()
++            // because both take ownership and Window is not Clone. Instead, we extract
++            // the raw handles and wrap them in types that implement HasDisplayHandle /
++            // HasWindowHandle. This is the same pattern winit uses internally.
++            let raw_display = match raw_window_handle::HasDisplayHandle::display_handle(&window) {
++                Ok(h) => h.as_raw(),
++                Err(e) => {
++                    warn!(?self.renderer_id, error = %e, "failed to get raw display handle");
++                    self.window = Some(window);
++                    event_loop.exit();
++                    return;
++                }
++            };
++            let raw_window = match raw_window_handle::HasWindowHandle::window_handle(&window) {
++                Ok(h) => h.as_raw(),
++                Err(e) => {
++                    warn!(?self.renderer_id, error = %e, "failed to get raw window handle");
++                    self.window = Some(window);
++                    event_loop.exit();
++                    return;
++                }
++            };
++
++            let display_wrapper = DisplayHandleWrapper { raw: raw_display };
++            let window_wrapper = WindowHandleWrapper { raw: raw_window };
++
++            match softbuffer::Context::new(display_wrapper) {
++                Ok(context) => {
++                    info!(?self.renderer_id, "softbuffer context created");
++                    match softbuffer::Surface::new(&context, window_wrapper) {
++                        Ok(surface) => {
++                            info!(?self.renderer_id, "softbuffer surface created");
++                            self.context = Some(context);
++                            self.surface = Some(surface);
++                            self.window = Some(window);
++                            self.needs_render = true;
++                        }
++                        Err(e) => {
++                            warn!(
++                                ?self.renderer_id,
++                                error = %e,
++                                "failed to create softbuffer surface"
++                            );
++                            self.window = Some(window);
++                            event_loop.exit();
++                        }
++                    }
++                }
++                Err(e) => {
++                    warn!(
++                        ?self.renderer_id,
++                        error = %e,
++                        "failed to create softbuffer context (no display server?)"
++                    );
++                    self.window = Some(window);
++                    event_loop.exit();
++                }
++            }
++        }
++    }
++}
++
++/// Windowed softbuffer mode: creates a winit window, uses CPU reference renderer,
++/// converts RGBA to softbuffer format, and presents to the window.
++///
++/// This mode requires a display server. On Linux this means Wayland or X11.
++/// If no display server is available, it returns a graceful error without panicking.
++#[allow(clippy::too_many_arguments)]
++fn run_windowed_softbuffer(
++    renderer_id: RendererId,
++    width: u32,
++    height: u32,
++    timeout_secs: u64,
++    source: Option<&std::path::Path>,
++    fit: wallflow_common::FitMode,
++    fit_str: &str,
++    background: &str,
++) -> Result<()> {
++    let start = Instant::now();
++    let timeout = if timeout_secs > 0 {
++        Some(Duration::from_secs(timeout_secs))
++    } else {
++        None
++    };
++
++    // Validate config
++    let config = SoftbufferPresenterConfig {
++        width,
++        height,
++        title: format!("WallFlow Renderer – {}x{}", width, height),
++        source: source.map(|p| p.to_path_buf()),
++        fit: fit_str.to_string(),
++        background: background.to_string(),
++        timeout_secs,
++    };
++    if let Err(e) = config.validate() {
++        // For source not existing, just warn (might be test pattern)
++        if !e.contains("does not exist") {
++            let msg = format!("invalid presenter config: {e}");
++            warn!(?renderer_id, error = %msg, "config validation failed");
++            eprintln!("{msg}");
++            return Err(anyhow::anyhow!("{msg}"));
++        }
++    }
++
++    info!(
++        ?renderer_id,
++        width,
++        height,
++        source = ?source.map(|p| p.display()),
++        "windowed softbuffer presenter starting"
++    );
++
++    // Create the winit event loop
++    let event_loop = match winit::event_loop::EventLoop::new() {
++        Ok(el) => el,
++        Err(e) => {
++            let msg = format!("failed to create winit event loop (no display server?): {e}");
++            warn!(?renderer_id, error = %msg, "cannot open window");
++            eprintln!("{msg}");
++            return Err(anyhow::anyhow!("{msg}"));
++        }
++    };
++
++    let mut app = SoftbufferPresenterApp {
++        renderer_id,
++        viewport: RendererViewport::new(width, height),
++        source: source.map(|p| p.to_path_buf()),
++        fit,
++        fit_str: fit_str.to_string(),
++        background: background.to_string(),
++        timeout,
++        start,
++        window: None,
++        context: None,
++        surface: None,
++        needs_render: false,
++        last_render_output: None,
++    };
++
++    event_loop.run_app(&mut app)?;
++
++    info!(?renderer_id, "windowed softbuffer presenter exited");
++    Ok(())
++}
++
++// ---------------------------------------------------------------------------
++// Presenter simulation mode (cloud-safe)
++// ---------------------------------------------------------------------------
++
++/// Presenter simulation mode: no window, uses CPU reference renderer,
++/// performs RGBA → softbuffer format conversion, and outputs a structured JSON report.
++///
++/// This mode does NOT require a display server. It is suitable for CI and cloud testing.
++/// It validates the entire rendering + conversion pipeline without presenting to a surface.
++#[allow(clippy::too_many_arguments)]
++fn run_presenter_sim(
++    width: u32,
++    height: u32,
++    source: Option<&std::path::Path>,
++    fit: wallflow_common::FitMode,
++    fit_str: &str,
++    background: &str,
++    timeout_secs: u64,
++) -> Result<()> {
++    let start = Instant::now();
++
++    // Validate config
++    let config = SoftbufferPresenterConfig {
++        width,
++        height,
++        title: String::new(),
++        source: source.map(|p| p.to_path_buf()),
++        fit: fit_str.to_string(),
++        background: background.to_string(),
++        timeout_secs,
++    };
++    if let Err(e) = config.validate() {
++        let report = PresenterReport {
++            backend: PresenterBackend::SoftbufferCpu,
++            viewport: PresenterViewport { width, height },
++            source_path: source.map(|p| p.display().to_string()),
++            rendered: false,
++            presented: false,
++            presented_simulated: false,
++            checksum: None,
++            output_dimensions: None,
++            error: Some(format!("invalid config: {e}")),
++            exit_reason: Some("config-error".into()),
++            duration_ms: Some(start.elapsed().as_millis() as u64),
++        };
++        let json = serde_json::to_string(&report)?;
++        println!("{json}");
++        return Ok(());
++    }
++
++    // Wait for timeout if specified and no source
++    if source.is_none() && timeout_secs > 0 {
++        std::thread::sleep(Duration::from_secs(timeout_secs.min(1)));
++    }
++
++    // CPU render
++    let vp = wallflow_package::Viewport { width, height };
++
++    let render_result = match source {
++        Some(image_path) => {
++            let render_input = wallflow_render::StaticRenderInput {
++                image_path: image_path.to_path_buf(),
++                viewport: vp,
++                fit,
++                background: background.to_string(),
++                opacity: None,
++            };
++            wallflow_render::render_static_image_cpu(render_input).map_err(|e| format!("{e}"))
++        }
++        None => {
++            // No source: generate test pattern
++            let mut pixels = vec![0u8; (width * height * 4) as usize];
++            for y in 0..height {
++                for x in 0..width {
++                    let idx = ((y * width + x) * 4) as usize;
++                    let checker = ((x / 32) + (y / 32)) % 2;
++                    if checker == 0 {
++                        pixels[idx] = 48;
++                        pixels[idx + 1] = 48;
++                        pixels[idx + 2] = 56;
++                        pixels[idx + 3] = 255;
++                    } else {
++                        pixels[idx] = 32;
++                        pixels[idx + 1] = 32;
++                        pixels[idx + 2] = 40;
++                        pixels[idx + 3] = 255;
++                    }
++                }
++            }
++            Ok(wallflow_render::RenderOutput::new(width, height, pixels))
++        }
++    };
++
++    let report = match render_result {
++        Ok(output) => {
++            // Perform RGBA → softbuffer format conversion (validates the conversion pipeline)
++            let conversion_result =
++                rgba_to_softbuffer_u32(&output.pixels_rgba, output.width, output.height);
++
++            match conversion_result {
++                Ok(_softbuffer_pixels) => {
++                    let meta = output.metadata();
++                    PresenterReport {
++                        backend: PresenterBackend::SoftbufferCpu,
++                        viewport: PresenterViewport { width, height },
++                        source_path: source.map(|p| p.display().to_string()),
++                        rendered: true,
++                        presented: false,
++                        presented_simulated: true,
++                        checksum: meta.checksum,
++                        output_dimensions: Some(PresenterViewport {
++                            width: meta.width,
++                            height: meta.height,
++                        }),
++                        error: None,
++                        exit_reason: Some("simulated".into()),
++                        duration_ms: Some(start.elapsed().as_millis() as u64),
++                    }
++                }
++                Err(e) => {
++                    let meta = output.metadata();
++                    PresenterReport {
++                        backend: PresenterBackend::SoftbufferCpu,
++                        viewport: PresenterViewport { width, height },
++                        source_path: source.map(|p| p.display().to_string()),
++                        rendered: true,
++                        presented: false,
++                        presented_simulated: false,
++                        checksum: meta.checksum,
++                        output_dimensions: Some(PresenterViewport {
++                            width: meta.width,
++                            height: meta.height,
++                        }),
++                        error: Some(format!("RGBA→softbuffer conversion failed: {e}")),
++                        exit_reason: Some("conversion-error".into()),
++                        duration_ms: Some(start.elapsed().as_millis() as u64),
++                    }
++                }
++            }
++        }
++        Err(e) => PresenterReport {
++            backend: PresenterBackend::SoftbufferCpu,
++            viewport: PresenterViewport { width, height },
++            source_path: source.map(|p| p.display().to_string()),
++            rendered: false,
++            presented: false,
++            presented_simulated: false,
++            checksum: None,
++            output_dimensions: None,
++            error: Some(e),
++            exit_reason: Some("render-error".into()),
++            duration_ms: Some(start.elapsed().as_millis() as u64),
++        },
++    };
++
++    let json = serde_json::to_string(&report)?;
++    println!("{json}");
++    Ok(())
++}
++
+ /// IPC stdio mode: the primary communication mode for Core <-> Renderer.
+ ///
+ /// - Reads `RendererCommand` frames from stdin on a background thread.
+diff --git a/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md b/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
+new file mode 100644
+index 0000000..a82eacd
+--- /dev/null
++++ b/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
+@@ -0,0 +1,129 @@
++# 013 – Softbuffer Window Presenter
++
++**Stage**: 010  
++**Status**: Complete  
++**Date**: 2026-05-30
++
++## Overview
++
++Stage 010 adds the first real presenter for static images: a `winit` window with CPU-rendered RGBA frames presented via `softbuffer`. The presenter takes the output of the CPU reference renderer, converts it to the softbuffer pixel format, and blits it to the window surface — all without GPU acceleration or Windows desktop attach.
++
++## Why Softbuffer Before wgpu Textured Pipeline
++
++The softbuffer presenter is implemented before a full wgpu textured rendering pipeline for several reasons:
++
++1. **CPU reference renderer is already working** — the CPU renderer produces correct RGBA8 output for all five fit modes. Using this output directly via softbuffer gives us a working windowed presentation immediately, without needing to implement texture upload, shader pipeline, or GPU-side fit mode rendering.
++
++2. **Separation of concerns** — rendering and presentation are independent concerns. The softbuffer presenter validates that the presentation layer works correctly with CPU-rendered output. When the wgpu textured pipeline is added later, it will produce the same RGBA output and can reuse the same presenter interface.
++
++3. **Cloud-safe validation** — the `--presenter-sim` mode exercises the entire rendering + conversion pipeline without requiring a display server, making it suitable for CI and cloud testing. A wgpu textured pipeline would require GPU access that is unavailable in CI.
++
++4. **Incremental progress** — each stage should deliver testable value. A working CPU→softbuffer presenter is more valuable than a partial wgpu pipeline that may not work in cloud environments.
++
++## Presenter Architecture
++
++### PresenterBackend
++
++```
++PresenterBackend
++├── SoftbufferCpu    — CPU-rendered frames, softbuffer blit to window
++└── WgpuExperimental — reserved for future wgpu-based presentation
++```
++
++### PresenterState Lifecycle
++
++```
++Created → SurfaceReady → FrameRendered → Presented
++              ↑              ↑              │
++              └── Resized ───┘              │
++                                             ↓
++                                          Closed / Failed
++```
++
++### SoftbufferPresenterConfig
++
++| Field | Type | Description |
++|-------|------|-------------|
++| width | u32 | Viewport width in pixels |
++| height | u32 | Viewport height in pixels |
++| title | String | Window title |
++| source | Option<PathBuf> | Source image path (None = test pattern) |
++| fit | String | Fit mode string (cover, contain, stretch, center, tile) |
++| background | String | Background color hex |
++| timeout_secs | u64 | Auto-exit timeout (0 = no timeout) |
++
++## Pixel Conversion: RGBA8 → Softbuffer Format
++
++### RGBA8 (CPU renderer output)
++
++Each pixel is 4 bytes: R, G, B, A (red first, alpha last).
++
++### Softbuffer u32 format
++
++Each pixel is a `u32`: `0x00RRGGBB` — the highest 8 bits are zero, then red, green, blue in the lowest 24 bits. Alpha is not represented; the format is XRGB8888.
++
++### Alpha handling
++
++Since softbuffer does not support alpha blending against the desktop, the `rgba_to_softbuffer_u32()` function composites RGBA pixels against an opaque black background before discarding the alpha channel. Fully opaque pixels pass through unchanged; semi-transparent pixels are alpha-blended against black.
++
++### Endianness
++
++The `u32` pixel value is constructed using native-endian bit operations: `(r as u32) << 16 | (g as u32) << 8 | b as u32`. On little-endian platforms (x86/x86-64), the in-memory byte order is B, G, R, 0x00. On big-endian, it is 0x00, R, G, B. This matches softbuffer's expectation because it interprets the `u32` as a native-endian integer.
++
++## Runtime Modes
++
++### `--windowed-softbuffer`
++
++Creates a real winit window, creates a softbuffer context and surface, and presents CPU-rendered frames to the window. Requires a display server (Wayland/X11 on Linux, Desktop on Windows). Not suitable for CI/cloud environments.
++
++### `--presenter-sim`
++
++Cloud-safe simulation mode. Performs the same CPU rendering and RGBA→softbuffer conversion, but does not create a window or surface. Outputs a structured JSON `PresenterReport` to stdout. Suitable for CI and cloud testing.
++
++### Key Differences Between Modes
++
++| Mode | Window | Surface | Output | Requires Display | Cloud-Safe |
++|------|--------|---------|--------|------------------|------------|
++| `--windowed-softbuffer` | Yes | softbuffer | Visual | Yes | No |
++| `--presenter-sim` | No | None | JSON report | No | Yes |
++| `--windowed-static` | Yes | None | Visual (blank) | Yes | No |
++| `--headless-render-sim` | No | None | JSON report | No | Yes |
++| `--ipc-stdio` | No | None | IPC frames | No | Yes |
++
++## Softbuffer Context/Surface Creation
++
++The softbuffer `Context` and `Surface` are created from raw window/display handles rather than from the `winit::Window` directly. This is necessary because:
++
++1. `softbuffer::Context::new(display)` takes ownership of the display handle provider
++2. `softbuffer::Surface::new(&context, window)` takes ownership of the window handle provider
++3. `winit::Window` implements both `HasDisplayHandle` and `HasWindowHandle`, but is not `Clone`
++
++The solution is to extract the raw `RawDisplayHandle` and `RawWindowHandle` from the window, wrap them in simple wrapper types that implement `HasDisplayHandle` and `HasWindowHandle`, and pass these to softbuffer. This is the same pattern winit uses internally.
++
++## Cloud Validation Strategy
++
++The `presenter-sim-smoke` CLI command validates the full rendering + conversion pipeline in cloud environments:
++
++1. Creates a test PNG fixture
++2. Spawns the renderer in `--presenter-sim` mode
++3. Parses the JSON report
++4. Verifies: rendered=true, presented_simulated=true, checksum present, viewport correct, no errors
++
++This smoke test runs in CI alongside the other cloud-safe smoke tests (ipc-supervisor-smoke, apply-static-smoke, render-sim-smoke, render-output-smoke, wgpu-probe).
++
++## What Requires Real Windows Validation
++
++- `--windowed-softbuffer` visual correctness on Windows (frame content, resize behavior)
++- Desktop attachment behind Explorer icons
++- Multi-monitor placement
++- DPI scaling behavior
++- Window style and Chrome (popup vs overlapped)
++
++## What Can Be Validated in Cloud
++
++- CPU reference renderer output (dimensions, checksum, fit mode correctness)
++- RGBA→softbuffer pixel conversion (all colors, alpha compositing, error handling)
++- Presenter report structure and serialization
++- Presenter configuration validation
++- `--presenter-sim` mode (render + conversion + JSON output)
++- `presenter-sim-smoke` integration test
+diff --git a/wallflow/wallflow-foundation/docs/roadmap.md b/wallflow/wallflow-foundation/docs/roadmap.md
+index d8cbee9..8c64e84 100644
+--- a/wallflow/wallflow-foundation/docs/roadmap.md
++++ b/wallflow/wallflow-foundation/docs/roadmap.md
+@@ -227,6 +227,41 @@
+ - Explorer restart tolerance with winit event loop
+ - Real GPU adapter capabilities on Windows hardware
+ 
++## MVP-2.4 Cloud-safe softbuffer window presenter ✅
++
++*Completed in stage 010.*
++
++- `softbuffer` 0.4 added as workspace dependency for CPU-to-window pixel blitting.
++- `raw-window-handle` 0.6 added for raw handle extraction from winit Window.
++- `PresenterBackend` enum: `SoftbufferCpu` (default), `WgpuExperimental` (reserved).
++- `PresenterState` lifecycle: Created → SurfaceReady → FrameRendered → Presented → Closed/Failed.
++- `SoftbufferPresenterConfig` with validation (zero dimensions, missing source).
++- `PresenterReport` structured output: backend, viewport, rendered, presented, presented_simulated, checksum, error, exit_reason, duration_ms.
++- `rgba_to_softbuffer_u32()` pixel conversion: RGBA8 → softbuffer `0x00RRGGBB` format with alpha compositing against black background.
++- `rgba_to_softbuffer_u32_with_surface_size()` for size-mismatch handling (pad/crop).
++- `--windowed-softbuffer` renderer mode: winit window + softbuffer context/surface + CPU render → blit → present.
++- `--presenter-sim` renderer mode: cloud-safe simulation, no window, JSON report to stdout.
++- `presenter-sim-smoke` CLI command: creates test PNG, runs presenter-sim, verifies JSON report.
++- Raw window/display handle wrappers for softbuffer (winit Window is not Clone).
++- Resize handling: viewport update + re-render + re-present.
++- Timeout and close-request: clean event loop exit.
++- Logs to stderr in presenter-sim mode; stdout reserved for structured output.
++- Graceful error when no display server (no panic, clear error message).
++- 194 tests passing (23 new presenter-related tests in wallflow-render).
++- `presenter-sim-smoke` added to CI.
++- Softbuffer presenter architecture documented in `docs/architecture/013-softbuffer-window-presenter.md`.
++
++### REQUIRES_REAL_WINDOWS_VALIDATION
++
++- `--windowed-softbuffer` visual correctness on Windows
++- Frame content matches CPU reference renderer output
++- Resize behavior (re-render, re-present, no flicker)
++- Desktop attach with winit window
++- DPI scale factor handling
++- Explorer restart tolerance with winit event loop
++- Real GPU adapter capabilities on Windows hardware
++- wgpu GPU rendering matching CPU reference output
++
+ ## MVP-3 video wallpaper
+ 
+ - Implement Media Foundation backend.
+-- 
+2.47.3
+

@@ -1,0 +1,931 @@
+From 9546ad4a12f1abe9f8521dec56116dbaf059e1e0 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 19:40:44 +0000
+Subject: [PATCH 09/10] 010 add cloud-safe softbuffer window presenter
+
+---
+ .../.github/workflows/ci.yml                  |   0
+ wallflow/wallflow-foundation/.gitignore       |   0
+ wallflow/wallflow-foundation/Cargo.toml       |   0
+ wallflow/wallflow-foundation/README.md        |   0
+ .../apps/wallflow-ui/README.md                |   0
+ .../crates/wallflow-cli/Cargo.toml            |   0
+ .../crates/wallflow-cli/src/main.rs           |   0
+ .../crates/wallflow-common/Cargo.toml         |   0
+ .../crates/wallflow-common/src/error.rs       |   0
+ .../crates/wallflow-common/src/fit_mode.rs    |   0
+ .../crates/wallflow-common/src/lib.rs         |   0
+ .../crates/wallflow-common/src/monitor.rs     |   0
+ .../crates/wallflow-common/src/renderer.rs    |   0
+ .../crates/wallflow-common/src/runtime.rs     |   0
+ .../crates/wallflow-common/src/wallpaper.rs   |   0
+ .../crates/wallflow-config/Cargo.toml         |   0
+ .../crates/wallflow-config/src/lib.rs         |   0
+ .../crates/wallflow-core/Cargo.toml           |   0
+ .../crates/wallflow-core/src/app.rs           |   0
+ .../crates/wallflow-core/src/lib.rs           |   0
+ .../wallflow-core/src/renderer_process.rs     |   0
+ .../crates/wallflow-core/src/supervisor.rs    |   0
+ .../crates/wallflow-core/src/watchdog.rs      |   0
+ .../crates/wallflow-desktop/Cargo.toml        |   0
+ .../crates/wallflow-desktop/src/lib.rs        |   0
+ .../crates/wallflow-ipc/Cargo.toml            |   0
+ .../crates/wallflow-ipc/src/frame.rs          |   0
+ .../crates/wallflow-ipc/src/lib.rs            |   0
+ .../crates/wallflow-ipc/src/protocol.rs       |   0
+ .../crates/wallflow-media/Cargo.toml          |   0
+ .../crates/wallflow-media/src/lib.rs          |   0
+ .../crates/wallflow-monitor/Cargo.toml        |   0
+ .../crates/wallflow-monitor/src/diff.rs       |   0
+ .../crates/wallflow-monitor/src/lib.rs        |   0
+ .../crates/wallflow-monitor/src/provider.rs   |   0
+ .../crates/wallflow-package/Cargo.toml        |   0
+ .../crates/wallflow-package/src/error.rs      |   0
+ .../crates/wallflow-package/src/layout.rs     |   0
+ .../crates/wallflow-package/src/lib.rs        |   0
+ .../crates/wallflow-package/src/manifest.rs   |   0
+ .../crates/wallflow-package/src/validation.rs |   0
+ .../crates/wallflow-render/Cargo.toml         |   0
+ .../crates/wallflow-render/src/color.rs       |   0
+ .../crates/wallflow-render/src/error.rs       |   0
+ .../crates/wallflow-render/src/lib.rs         |   0
+ .../crates/wallflow-render/src/output.rs      |   0
+ .../crates/wallflow-render/src/presenter.rs   |   0
+ .../crates/wallflow-render/src/renderer.rs    |   0
+ .../wallflow-render/src/wgpu_backend.rs       |   0
+ .../crates/wallflow-render/src/wgpu_error.rs  |   0
+ .../crates/wallflow-renderer/Cargo.toml       |   0
+ .../crates/wallflow-renderer/src/main.rs      |   0
+ .../docs/agent/000-agent-rules.md             |   0
+ .../docs/agent/001-task-template.md           |   0
+ .../agent/prompts/001-foundation-review.md    |   0
+ .../002-windows-desktop-attach-hardening.md   |   0
+ .../docs/architecture/000-overview.md         |   0
+ .../docs/architecture/002-ipc-contract.md     |   0
+ .../architecture/003-renderer-lifecycle.md    |   0
+ .../004-windows-desktop-attach.md             |   0
+ .../007-cloud-validation-strategy.md          |  46 ++-
+ .../008-wallpaper-package-format.md           |   0
+ .../009-static-image-rendering-model.md       |   0
+ .../010-renderer-window-runtime.md            |  51 +++-
+ .../architecture/011-static-render-output.md  |  20 +-
+ .../architecture/012-wgpu-static-backend.md   |   0
+ .../013-softbuffer-window-presenter.md        | 273 +++++++++++++++++-
+ wallflow/wallflow-foundation/docs/roadmap.md  |   9 +
+ 68 files changed, 374 insertions(+), 25 deletions(-)
+ mode change 100644 => 100755 wallflow/wallflow-foundation/.github/workflows/ci.yml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/.gitignore
+ mode change 100644 => 100755 wallflow/wallflow-foundation/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/README.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/apps/wallflow-ui/README.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/error.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/monitor.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/renderer.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-config/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-config/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-core/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-core/src/app.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-core/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-core/src/renderer_process.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-core/src/watchdog.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-desktop/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-desktop/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-ipc/src/frame.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-ipc/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-media/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-media/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-monitor/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-monitor/src/diff.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-monitor/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-monitor/src/provider.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/wgpu_backend.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-render/src/wgpu_error.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+ mode change 100644 => 100755 wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/agent/000-agent-rules.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/agent/001-task-template.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/agent/prompts/001-foundation-review.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/agent/prompts/002-windows-desktop-attach-hardening.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/000-overview.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/004-windows-desktop-attach.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/012-wgpu-static-backend.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
+ mode change 100644 => 100755 wallflow/wallflow-foundation/docs/roadmap.md
+
+diff --git a/wallflow/wallflow-foundation/.github/workflows/ci.yml b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/.gitignore b/wallflow/wallflow-foundation/.gitignore
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/Cargo.toml b/wallflow/wallflow-foundation/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/README.md b/wallflow/wallflow-foundation/README.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/apps/wallflow-ui/README.md b/wallflow/wallflow-foundation/apps/wallflow-ui/README.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/error.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/error.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/monitor.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/monitor.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/renderer.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/renderer.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-config/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-config/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-config/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-config/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-core/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/src/app.rs b/wallflow/wallflow-foundation/crates/wallflow-core/src/app.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-core/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/src/renderer_process.rs b/wallflow/wallflow-foundation/crates/wallflow-core/src/renderer_process.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs b/wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/src/watchdog.rs b/wallflow/wallflow-foundation/crates/wallflow-core/src/watchdog.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-desktop/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-desktop/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-desktop/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-desktop/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/frame.rs b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/frame.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-media/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-media/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-media/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-media/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-monitor/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-monitor/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-monitor/src/diff.rs b/wallflow/wallflow-foundation/crates/wallflow-monitor/src/diff.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-monitor/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-monitor/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-monitor/src/provider.rs b/wallflow/wallflow-foundation/crates/wallflow-monitor/src/provider.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/presenter.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/wgpu_backend.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/wgpu_backend.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/wgpu_error.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/wgpu_error.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/agent/000-agent-rules.md b/wallflow/wallflow-foundation/docs/agent/000-agent-rules.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/agent/001-task-template.md b/wallflow/wallflow-foundation/docs/agent/001-task-template.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/agent/prompts/001-foundation-review.md b/wallflow/wallflow-foundation/docs/agent/prompts/001-foundation-review.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/agent/prompts/002-windows-desktop-attach-hardening.md b/wallflow/wallflow-foundation/docs/agent/prompts/002-windows-desktop-attach-hardening.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/000-overview.md b/wallflow/wallflow-foundation/docs/architecture/000-overview.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md b/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md b/wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/004-windows-desktop-attach.md b/wallflow/wallflow-foundation/docs/architecture/004-windows-desktop-attach.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md b/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+old mode 100644
+new mode 100755
+index 4ff0747..e529763
+--- a/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
++++ b/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+@@ -48,6 +48,10 @@ full IPC command/event lifecycle or the full renderer lifecycle via piped stdio.
+ - `wgpu-probe` CLI command (GPU capability diagnostic, always exit 0)
+ - `wgpu-smoke` CLI command (offscreen render smoke, skips gracefully without GPU)
+ - wgpu capability probe and clear-only offscreen render (no GPU required)
++- `presenter-sim-smoke` CLI command (CPU render + RGBA→softbuffer conversion + JSON report verification)
++- `--presenter-sim` renderer mode (cloud-safe presenter simulation without display server)
++- RGBA→softbuffer pixel conversion (all colors, alpha compositing, error handling, size mismatch)
++- Presenter type serialization and configuration validation
+ 
+ ### Tier 3: Windows Compile-Check (CI)
+ 
+@@ -95,7 +99,7 @@ The GitHub Actions Windows runner provides a much simpler solution.
+ │  1. cargo fmt --all -- --check            │
+ │  2. cargo check --workspace               │
+ │  3. cargo clippy (strict)                 │
+-│  4. cargo test --workspace (171 tests)     │
++│  4. cargo test --workspace (194 tests)     │
+ └──────────────────────────────────────────┘
+ 
+ ┌──────────────────────────────────────────┐
+@@ -107,7 +111,9 @@ The GitHub Actions Windows runner provides a much simpler solution.
+ │  4. apply-static-smoke (wallpaper apply)  │
+ │  5. render-sim-smoke (full lifecycle)     │
+ │  6. render-output-smoke (pixel render)    │
+-│  7. legacy headless heartbeat smoke       │
++│  7. wgpu-probe (GPU diagnostic)           │
++│  8. presenter-sim-smoke (presenter)       │
++│  9. legacy headless heartbeat smoke       │
+ └──────────────────────────────────────────┘
+ 
+ ┌──────────────────────────────────────────┐
+@@ -247,6 +253,38 @@ CI runner after the existing IPC smoke tests:
+ These tests run in seconds and require no special hardware, display server,
+ or GPU — making them ideal for every pull request and merge to main.
+ 
++## Presenter Sim Smoke Test (presenter-sim-smoke)
++
++*Added in Stage 010.*
++
++The `presenter-sim-smoke` CLI command validates the full rendering + presentation
++conversion pipeline in cloud environments. It goes beyond `render-output-smoke`
++by also exercising the RGBA→softbuffer pixel format conversion:
++
++1. Creates a 2×2 test PNG fixture with distinct pixel colors.
++2. Spawns the renderer in `--presenter-sim` mode with the test image.
++3. Captures the JSON `PresenterReport` from stdout.
++4. Verifies: `rendered == true`, `presented_simulated == true`, checksum present,
++   viewport correct, no error.
++5. Outputs a structured summary and JSON report.
++
++This test validates the complete data flow from image decode through CPU rendering,
++RGBA→softbuffer format conversion, and structured reporting — all without a display
++server or GPU. The `--windowed-softbuffer` mode is NOT tested in CI because it
++requires a display server; its graceful error handling when no display server is
++available has been verified manually.
++
++### What It Validates vs. What It Does Not
++
++| Validated | Not validated |
++|-----------|---------------|
++| CPU render produces RGBA output | Actual pixel presentation to window surface |
++| RGBA→softbuffer u32 conversion correctness | Visual appearance on a real display |
++| PresenterReport structure and serialization | Resize/re-render behavior |
++| Presenter config validation | DPI scale factor handling |
++| Alpha compositing against black background | Frame timing or refresh rate |
++| Error handling for invalid configs | Desktop attachment |
++
+ ## Render Output Smoke Test (render-output-smoke)
+ 
+ The `render-output-smoke` CLI command validates the full CPU render pipeline
+@@ -282,6 +320,6 @@ This marker appears in:
+ 
+ ## Next Steps
+ 
+-- **Stage 010**: Add wgpu rendering pipeline to the windowed static renderer
+-- **Stage 011**: Connect desktop attach to winit window on Windows
++- **Stage 011**: Connect desktop attach to winit window on Windows (requires REQUIRES_REAL_WINDOWS_VALIDATION)
++- **Stage 011+**: wgpu textured rendering pipeline (GPU image compositing, replacing softbuffer for production)
+ - **Stage 012**: Real Windows validation with manual testing on Win10/11
+diff --git a/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md b/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md b/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md b/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
+old mode 100644
+new mode 100755
+index cae3891..f570b13
+--- a/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
++++ b/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
+@@ -87,10 +87,47 @@ Use this mode when:
+ - Preparing for the future wgpu rendering pipeline (the window is already open)
+ - Manual visual verification of wallpaper display
+ 
+-Note: The current `--windowed-static` mode does not yet render pixels to the
+-window surface. It opens the window, tracks viewport state, and recalculates
+-layout on resize, but the actual GPU blit will be added when wgpu is
+-integrated in a future stage.
++Note: The `--windowed-static` mode does not render pixels to the window
++surface. It opens the window, tracks viewport state, and recalculates
++layout on resize, but no pixel blit occurs. For actual pixel presentation,
++use `--windowed-softbuffer` (Stage 010), which uses the CPU reference renderer
++and softbuffer to blit RGBA frames to the window surface.
++
++### `--windowed-softbuffer` (WindowedSoftbuffer)
++
++*Added in Stage 010.*
++
++The windowed softbuffer mode opens a real winit window and presents CPU-rendered
++frames via softbuffer. This is the first mode that actually renders visible pixels
++to a window surface. It uses the CPU reference renderer to produce RGBA frames,
++converts them to the softbuffer `0x00RRGGBB` pixel format, and blits them to the
++window. The mode supports resize handling (viewport update + re-render + re-present),
++timeout-based auto-exit, and clean close on window close request.
++
++Requires a display server (Wayland/X11 on Linux, Desktop on Windows). Not suitable
++for CI/cloud environments. When no display server is available, the mode returns a
++clear error message without panicking.
++
++Use this mode when:
++- Testing the first real visual presentation of wallpaper images
++- Validating the softbuffer pixel conversion pipeline on a real surface
++- Manual visual verification of fit modes and resize behavior
++- Diagnosing display server availability (non-zero exit = no display)
++
++### `--presenter-sim` (PresenterSim)
++
++*Added in Stage 010.*
++
++The presenter simulation mode exercises the same CPU rendering and RGBA→softbuffer
++conversion pipeline as `--windowed-softbuffer`, but without creating a window or
++surface. It outputs a structured `PresenterReport` as JSON to stdout, making it
++fully cloud-safe and suitable for CI.
++
++Use this mode when:
++- Running in CI/cloud environments without a display server
++- Validating the full render + conversion pipeline end-to-end
++- Running `presenter-sim-smoke` integration test
++- Debugging pixel conversion without visual output
+ 
+ ## Core Types
+ 
+@@ -240,6 +277,10 @@ environments without any display server:
+ | IPC stdio mode | `--ipc-stdio` | `cargo run -p wallflow-cli -- ipc-supervisor-smoke` |
+ | Apply static smoke | `--ipc-stdio` | `cargo run -p wallflow-cli -- apply-static-smoke` |
+ | Layout calculation | All | `cargo test -p wallflow-package` |
++| Presenter simulation | `--presenter-sim` | `cargo run -p wallflow-cli -- presenter-sim-smoke` |
++| RGBA→softbuffer pixel conversion | All | `cargo test -p wallflow-render` |
++| Presenter type serialization | All | `cargo test -p wallflow-render` |
++| Presenter config validation | All | `cargo test -p wallflow-render` |
+ 
+ The `render-sim-smoke` CLI command is the primary integration test for the
+ renderer runtime. It creates a test wallpaper package, spawns the renderer in
+@@ -258,12 +299,14 @@ The following items cannot be validated without a real Windows desktop session:
+ | Item | Reason |
+ |------|--------|
+ | `--windowed-static` on Windows | Requires a Windows desktop session; winit creates a Win32 window |
++| `--windowed-softbuffer` on Windows | Requires display server; visual correctness of frame content, resize |
+ | Desktop attach with winit window | `SetParent()` on a winit-managed HWND is untested |
+ | Viewport resize from real monitor events | Requires actual display hardware or VM display |
+ | Layout with actual monitor dimensions | Currently uses synthetic 1920×1080; real monitors may differ |
+ | Visual correctness of fit modes | Cover cropping, contain letterboxing, tile repeat — must be seen |
+ | DPI scale factor changes (WM_DPICHANGED) | Requires Windows HiDPI environment |
+ | Explorer restart tolerance | Must kill and restart Explorer to test |
++| softbuffer frame content vs CPU reference | Must compare visual output on real display |
+ 
+ All code paths that depend on a real Windows desktop are marked with the
+ `REQUIRES_REAL_WINDOWS_VALIDATION` comment convention.
+diff --git a/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md b/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
+old mode 100644
+new mode 100755
+index 52e0e76..62da27c
+--- a/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
++++ b/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
+@@ -240,10 +240,28 @@ match backend {
+ }
+ ```
+ 
+-The current wgpu path is clear-only (it fills the viewport with the background color but does not yet composite the image texture). Full GPU rendering with image compositing will be added in Stage 010. The CPU reference remains available for testing and as a fallback, and continues to produce the authoritative pixel output.
++The current wgpu path is clear-only (it fills the viewport with the background color but does not yet composite the image texture). Full GPU rendering with image compositing will be added in a future stage. The CPU reference remains available for testing and as a fallback, and continues to produce the authoritative pixel output.
++
++## Integration with Softbuffer Presenter (Stage 010)
++
++Stage 010 introduces a presenter layer that consumes the `RenderOutput` from the CPU reference renderer and presents it to a window surface via softbuffer. The data flow is:
++
++```
++StaticRenderInput → render_static_image_cpu() → RenderOutput → rgba_to_softbuffer_u32() → softbuffer surface
++```
++
++The `rgba_to_softbuffer_u32()` function converts the RGBA8 pixel buffer from `RenderOutput.pixels_rgba` into the softbuffer `0x00RRGGBB` format, performing alpha compositing against black for semi-transparent pixels. The `RenderOutput.checksum_sha256()` is included in the `PresenterReport` for cloud-safe validation.
++
++Two renderer modes use this pipeline:
++
++- **`--windowed-softbuffer`**: Creates a real winit window, renders via CPU, converts to softbuffer format, and blits to the surface. Requires a display server.
++- **`--presenter-sim`**: Performs CPU render + conversion without a window, outputs a structured JSON report. Cloud-safe.
++
++The `presenter-sim-smoke` CLI command validates this pipeline end-to-end in CI.
+ 
+ ## What Remains REQUIRES_REAL_WINDOWS_VALIDATION
+ 
++- `--windowed-softbuffer` visual correctness on Windows (frame content matches CPU reference)
+ - Desktop attach behind desktop icons (WorkerW/Progman)
+ - Real Explorer window integration
+ - Multi-monitor layout
+diff --git a/wallflow/wallflow-foundation/docs/architecture/012-wgpu-static-backend.md b/wallflow/wallflow-foundation/docs/architecture/012-wgpu-static-backend.md
+old mode 100644
+new mode 100755
+diff --git a/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md b/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
+old mode 100644
+new mode 100755
+index a82eacd..cfde825
+--- a/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
++++ b/wallflow/wallflow-foundation/docs/architecture/013-softbuffer-window-presenter.md
+@@ -1,13 +1,15 @@
+ # 013 – Softbuffer Window Presenter
+ 
+-**Stage**: 010  
+-**Status**: Complete  
+-**Date**: 2026-05-30
++**Stage**: 010
++**Status**: Complete
++**Date**: 2026-05-31
+ 
+ ## Overview
+ 
+ Stage 010 adds the first real presenter for static images: a `winit` window with CPU-rendered RGBA frames presented via `softbuffer`. The presenter takes the output of the CPU reference renderer, converts it to the softbuffer pixel format, and blits it to the window surface — all without GPU acceleration or Windows desktop attach.
+ 
++The implementation introduces two new renderer modes (`--windowed-softbuffer` and `--presenter-sim`), the presenter type system (`PresenterBackend`, `PresenterState`, `SoftbufferPresenterConfig`, `PresenterReport`), pixel conversion functions (`rgba_to_softbuffer_u32`, `rgba_to_softbuffer_u32_with_surface_size`), and the `presenter-sim-smoke` CLI integration test. Total test count rose from 171 to 194.
++
+ ## Why Softbuffer Before wgpu Textured Pipeline
+ 
+ The softbuffer presenter is implemented before a full wgpu textured rendering pipeline for several reasons:
+@@ -24,14 +26,36 @@ The softbuffer presenter is implemented before a full wgpu textured rendering pi
+ 
+ ### PresenterBackend
+ 
++```rust
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
++pub enum PresenterBackend {
++    #[default]
++    SoftbufferCpu,
++    WgpuExperimental,
++}
+ ```
+-PresenterBackend
+-├── SoftbufferCpu    — CPU-rendered frames, softbuffer blit to window
+-└── WgpuExperimental — reserved for future wgpu-based presentation
+-```
++
++The `PresenterBackend` enum identifies which presentation backend is in use. `SoftbufferCpu` is the default and only implemented backend — it uses the CPU reference renderer output and blits it to a softbuffer window surface. `WgpuExperimental` is reserved for a future wgpu-based presentation path that would use GPU texture upload and a swap chain instead of CPU blitting.
++
++`PresenterBackend` implements `Display`, `FromStr` (accepting "softbuffer-cpu", "softbuffer", "cpu", "wgpu-experimental", "wgpu"), and `Serialize`/`Deserialize` for use in structured reports and CLI flags.
+ 
+ ### PresenterState Lifecycle
+ 
++```rust
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum PresenterState {
++    Created,
++    SurfaceReady,
++    FrameRendered,
++    Presented,
++    Resized,
++    Closed,
++    Failed,
++}
++```
++
++The presenter follows a state machine that mirrors the real window lifecycle:
++
+ ```
+ Created → SurfaceReady → FrameRendered → Presented
+               ↑              ↑              │
+@@ -40,18 +64,87 @@ Created → SurfaceReady → FrameRendered → Presented
+                                           Closed / Failed
+ ```
+ 
++- **Created**: The presenter has been constructed but no window or surface exists yet.
++- **SurfaceReady**: The winit window has been created and the softbuffer context/surface initialized. This state is reached inside the `resumed()` callback of `SoftbufferPresenterApp`.
++- **FrameRendered**: The CPU reference renderer has produced an RGBA frame. In `--windowed-softbuffer` mode, this happens during `RedrawRequested` events.
++- **Presented**: The frame has been blitted to the softbuffer surface via `buffer_mut()` and `present()`.
++- **Resized**: The window was resized; the viewport is updated and `needs_render` is set to trigger re-rendering.
++- **Closed**: The window was closed or the event loop exited normally.
++- **Failed**: An unrecoverable error occurred (e.g., softbuffer context creation failed, no display server).
++
+ ### SoftbufferPresenterConfig
+ 
++```rust
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct SoftbufferPresenterConfig {
++    pub width: u32,
++    pub height: u32,
++    pub title: String,
++    pub source: Option<PathBuf>,
++    pub fit: String,
++    pub background: String,
++    pub timeout_secs: u64,
++}
++```
++
+ | Field | Type | Description |
+ |-------|------|-------------|
+-| width | u32 | Viewport width in pixels |
+-| height | u32 | Viewport height in pixels |
++| width | u32 | Viewport width in pixels (must be > 0) |
++| height | u32 | Viewport height in pixels (must be > 0) |
+ | title | String | Window title |
+ | source | Option<PathBuf> | Source image path (None = test pattern) |
+ | fit | String | Fit mode string (cover, contain, stretch, center, tile) |
+-| background | String | Background color hex |
++| background | String | Background color hex (e.g. "#000000") |
+ | timeout_secs | u64 | Auto-exit timeout (0 = no timeout) |
+ 
++The `validate()` method checks that width and height are non-zero and that the source file exists (if specified). Invalid configurations produce an error message string rather than panicking.
++
++### PresenterReport
++
++```rust
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct PresenterReport {
++    pub backend: PresenterBackend,
++    pub viewport: PresenterViewport,
++    pub source_path: Option<String>,
++    pub rendered: bool,
++    pub presented: bool,
++    pub presented_simulated: bool,
++    pub checksum: Option<String>,
++    pub output_dimensions: Option<PresenterViewport>,
++    pub error: Option<String>,
++    pub exit_reason: Option<String>,
++    pub duration_ms: Option<u64>,
++}
++```
++
++The `PresenterReport` is the structured output of both `--presenter-sim` and `--windowed-softbuffer` modes. Key fields:
++
++- **rendered**: Whether the CPU render completed successfully (image decode + pixel compositing).
++- **presented**: Whether the frame was actually presented to a real window surface. Always `false` in `--presenter-sim` mode.
++- **presented_simulated**: Whether the presentation was simulated (RGBA→softbuffer conversion succeeded without a real surface). Always `false` in `--windowed-softbuffer` mode.
++- **checksum**: SHA-256 hex digest of the RGBA pixel data from the CPU renderer (same checksum as `RenderOutput::checksum_sha256()`).
++- **exit_reason**: Why the presenter exited. Possible values: "simulated", "config-error", "conversion-error", "timeout", "close-requested", "error".
++- **duration_ms**: Wall-clock time of the presenter run in milliseconds.
++
++Example `--presenter-sim` output:
++
++```json
++{
++  "backend": "SoftbufferCpu",
++  "viewport": { "width": 800, "height": 450 },
++  "source_path": "/tmp/wallflow-presenter-sim-smoke/test_image.png",
++  "rendered": true,
++  "presented": false,
++  "presented_simulated": true,
++  "checksum": "a1b2c3d4...",
++  "output_dimensions": { "width": 800, "height": 450 },
++  "error": null,
++  "exit_reason": "simulated",
++  "duration_ms": 42
++}
++```
++
+ ## Pixel Conversion: RGBA8 → Softbuffer Format
+ 
+ ### RGBA8 (CPU renderer output)
+@@ -66,20 +159,48 @@ Each pixel is a `u32`: `0x00RRGGBB` — the highest 8 bits are zero, then red, g
+ 
+ Since softbuffer does not support alpha blending against the desktop, the `rgba_to_softbuffer_u32()` function composites RGBA pixels against an opaque black background before discarding the alpha channel. Fully opaque pixels pass through unchanged; semi-transparent pixels are alpha-blended against black.
+ 
++The compositing formula for each channel is: `final = round(component * alpha / 255)`. Two fast paths are used: `a == 255` passes through unchanged, `a == 0` becomes pure black.
++
+ ### Endianness
+ 
+ The `u32` pixel value is constructed using native-endian bit operations: `(r as u32) << 16 | (g as u32) << 8 | b as u32`. On little-endian platforms (x86/x86-64), the in-memory byte order is B, G, R, 0x00. On big-endian, it is 0x00, R, G, B. This matches softbuffer's expectation because it interprets the `u32` as a native-endian integer.
+ 
++### rgba_to_softbuffer_u32_with_surface_size
++
++A companion function that handles size mismatches between the rendered frame and the target surface. When the rendered frame is smaller than the surface, the remaining pixels are filled with the specified background color. When larger, the frame is cropped. This is used after a window resize before the next re-render completes.
++
+ ## Runtime Modes
+ 
+ ### `--windowed-softbuffer`
+ 
+-Creates a real winit window, creates a softbuffer context and surface, and presents CPU-rendered frames to the window. Requires a display server (Wayland/X11 on Linux, Desktop on Windows). Not suitable for CI/cloud environments.
++Creates a real winit window, creates a softbuffer context and surface, and presents CPU-rendered frames to the window. The mode works as follows:
++
++1. **Config validation**: `SoftbufferPresenterConfig::validate()` checks dimensions and source existence.
++2. **Event loop creation**: `winit::event_loop::EventLoop::new()` is called. If no display server is available, this returns a clear error without panicking.
++3. **Window creation**: In the `resumed()` callback, a `winit::Window` is created with the configured dimensions and title.
++4. **Softbuffer setup**: Raw display/window handles are extracted from the winit window and wrapped in `DisplayHandleWrapper`/`WindowHandleWrapper`. A `softbuffer::Context` and `softbuffer::Surface` are created from these wrappers.
++5. **Initial render**: `needs_render` is set to `true` after surface creation.
++6. **Redraw loop**: On `RedrawRequested`, if `needs_render` is true, the CPU reference renderer produces an RGBA frame. The frame is converted via `rgba_to_softbuffer_u32()` and copied to the softbuffer buffer, then `present()` is called.
++7. **Resize handling**: `WindowEvent::Resized` updates the viewport and sets `needs_render = true`, triggering re-render on the next redraw.
++8. **Timeout**: `about_to_wait()` checks if the configured timeout has elapsed and calls `event_loop.exit()` if so.
++9. **Close handling**: `WindowEvent::CloseRequested` and `WindowEvent::Destroyed` call `event_loop.exit()`.
++
++If no `--source` is specified, a checkerboard test pattern is rendered instead of an image.
+ 
+ ### `--presenter-sim`
+ 
+ Cloud-safe simulation mode. Performs the same CPU rendering and RGBA→softbuffer conversion, but does not create a window or surface. Outputs a structured JSON `PresenterReport` to stdout. Suitable for CI and cloud testing.
+ 
++The simulation mode:
++
++1. Validates the `SoftbufferPresenterConfig`.
++2. Runs the CPU reference renderer (or generates a test pattern if no source).
++3. Calls `rgba_to_softbuffer_u32()` to convert the RGBA output — this validates the conversion pipeline without requiring a surface.
++4. Constructs a `PresenterReport` with `rendered: true`, `presented: false`, `presented_simulated: true`.
++5. Prints the report as JSON to stdout. All diagnostic logs go to stderr.
++
++If the config is invalid, the mode outputs a report with `rendered: false` and the error details, still exits with code 0 (the report itself indicates failure).
++
+ ### Key Differences Between Modes
+ 
+ | Mode | Window | Surface | Output | Requires Display | Cloud-Safe |
+@@ -90,6 +211,34 @@ Cloud-safe simulation mode. Performs the same CPU rendering and RGBA→softbuffe
+ | `--headless-render-sim` | No | None | JSON report | No | Yes |
+ | `--ipc-stdio` | No | None | IPC frames | No | Yes |
+ 
++## SoftbufferPresenterApp (ApplicationHandler)
++
++The `--windowed-softbuffer` mode is implemented via a `SoftbufferPresenterApp` struct that implements winit 0.30's `ApplicationHandler` trait:
++
++```rust
++struct SoftbufferPresenterApp {
++    renderer_id: RendererId,
++    viewport: RendererViewport,
++    source: Option<PathBuf>,
++    fit: FitMode,
++    fit_str: String,
++    background: String,
++    timeout: Option<Duration>,
++    start: Instant,
++    window: Option<winit::window::Window>,
++    context: Option<softbuffer::Context<DisplayHandleWrapper>>,
++    surface: Option<softbuffer::Surface<DisplayHandleWrapper, WindowHandleWrapper>>,
++    needs_render: bool,
++    last_render_output: Option<RenderOutput>,
++}
++```
++
++Key design points:
++
++- The `window`, `context`, and `surface` fields are `Option` because they are created inside `resumed()`, not at construction time.
++- `needs_render` is a dirty flag that prevents re-rendering on every `RedrawRequested` when nothing has changed.
++- `last_render_output` caches the most recent CPU render output, enabling re-presentation after resize without re-rendering.
++
+ ## Softbuffer Context/Surface Creation
+ 
+ The softbuffer `Context` and `Surface` are created from raw window/display handles rather than from the `winit::Window` directly. This is necessary because:
+@@ -100,24 +249,115 @@ The softbuffer `Context` and `Surface` are created from raw window/display handl
+ 
+ The solution is to extract the raw `RawDisplayHandle` and `RawWindowHandle` from the window, wrap them in simple wrapper types that implement `HasDisplayHandle` and `HasWindowHandle`, and pass these to softbuffer. This is the same pattern winit uses internally.
+ 
++```rust
++struct DisplayHandleWrapper {
++    raw: raw_window_handle::RawDisplayHandle,
++}
++
++impl raw_window_handle::HasDisplayHandle for DisplayHandleWrapper {
++    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
++        Ok(unsafe { DisplayHandle::borrow_raw(self.raw) })
++    }
++}
++
++struct WindowHandleWrapper {
++    raw: raw_window_handle::RawWindowHandle,
++}
++
++impl raw_window_handle::HasWindowHandle for WindowHandleWrapper {
++    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
++        Ok(unsafe { WindowHandle::borrow_raw(self.raw) })
++    }
++}
++```
++
++The `unsafe` blocks are safe because the raw handles are valid for the lifetime of the wrapper structs, which are not moved or dropped while softbuffer holds references to them.
++
+ ## Cloud Validation Strategy
+ 
+ The `presenter-sim-smoke` CLI command validates the full rendering + conversion pipeline in cloud environments:
+ 
+-1. Creates a test PNG fixture
+-2. Spawns the renderer in `--presenter-sim` mode
+-3. Parses the JSON report
+-4. Verifies: rendered=true, presented_simulated=true, checksum present, viewport correct, no errors
++1. Creates a temporary directory and generates a 2×2 test PNG fixture with distinct pixel colors.
++2. Spawns the renderer in `--presenter-sim` mode with the test image as source.
++3. Captures the JSON report from stdout (logs go to stderr, so there is no noise).
++4. Parses the JSON into a `PresenterReport`-compatible structure.
++5. Verifies: `rendered == true`, `presented_simulated == true`, `checksum` is present, `viewport` matches expected dimensions, no `error` field.
+ 
+ This smoke test runs in CI alongside the other cloud-safe smoke tests (ipc-supervisor-smoke, apply-static-smoke, render-sim-smoke, render-output-smoke, wgpu-probe).
+ 
++## Behavior Without a Display Server
++
++When `--windowed-softbuffer` is run in an environment without a display server (e.g., CI, SSH, container), the behavior is:
++
++1. `winit::event_loop::EventLoop::new()` fails with an error.
++2. The renderer catches this error, logs a warning, prints a clear error message to stderr, and returns `Err(anyhow!("failed to create winit event loop (no display server?): {e}"))`.
++3. The process exits with a non-zero code.
++4. **No panic occurs.** This is a strict design requirement: the renderer must never panic due to a missing display server.
++
++This graceful degradation means `--windowed-softbuffer` can be used in diagnostic scripts that test whether a display server is available — the exit code and stderr message provide a clear answer.
++
++## Test Coverage
++
++Stage 010 adds 23 new tests to `wallflow-render`, bringing the total from 171 to 194:
++
++### Pixel conversion tests (12)
++
++| Test | Description |
++|------|-------------|
++| `test_rgba_to_softbuffer_red` | Red pixel → `0x00FF0000` |
++| `test_rgba_to_softbuffer_green` | Green pixel → `0x0000FF00` |
++| `test_rgba_to_softbuffer_blue` | Blue pixel → `0x000000FF` |
++| `test_rgba_to_softbuffer_white` | White pixel → `0x00FFFFFF` |
++| `test_rgba_to_softbuffer_black` | Black pixel → `0x00000000` |
++| `test_rgba_to_softbuffer_transparent_is_black` | Fully transparent → black (composited) |
++| `test_rgba_to_softbuffer_semi_transparent` | Semi-transparent alpha compositing against black |
++| `test_rgba_to_softbuffer_invalid_length` | Buffer too short → error |
++| `test_rgba_to_softbuffer_wrong_dimensions` | Width×height mismatch → error |
++| `test_rgba_to_softbuffer_multi_pixel` | 2×1 frame with red + blue pixels |
++| `test_rgba_to_softbuffer_padded_with_bg` | 1×1 render → 2×2 surface with background fill |
++| `test_rgba_to_softbuffer_cropped` | 2×2 render → 1×1 surface with cropping |
++
++### PresenterBackend tests (3)
++
++| Test | Description |
++|------|-------------|
++| `test_presenter_backend_display` | Display trait formatting |
++| `test_presenter_backend_from_str` | FromStr parsing with aliases |
++| `test_presenter_backend_serde_roundtrip` | JSON serialization roundtrip |
++
++### PresenterState tests (2)
++
++| Test | Description |
++|------|-------------|
++| `test_presenter_state_display` | Display trait formatting |
++| `test_presenter_state_serde_roundtrip` | JSON roundtrip for all 7 states |
++
++### Config validation tests (4)
++
++| Test | Description |
++|------|-------------|
++| `test_config_valid` | Valid config passes |
++| `test_config_zero_width_rejected` | Width=0 rejected |
++| `test_config_zero_height_rejected` | Height=0 rejected |
++| `test_config_invalid_source_handled` | Missing source file detected |
++
++### PresenterReport serialization tests (2)
++
++| Test | Description |
++|------|-------------|
++| `test_presenter_report_serde_roundtrip` | Full report roundtrip |
++| `test_presenter_report_error_case_serde` | Error report roundtrip |
++
+ ## What Requires Real Windows Validation
+ 
+ - `--windowed-softbuffer` visual correctness on Windows (frame content, resize behavior)
++- Frame content matches CPU reference renderer output on a real display
++- Resize behavior (re-render, re-present, no flicker, no black flash)
+ - Desktop attachment behind Explorer icons
+ - Multi-monitor placement
+ - DPI scaling behavior
+-- Window style and Chrome (popup vs overlapped)
++- Window style and chrome (popup vs overlapped)
++- Explorer restart tolerance with winit event loop
+ 
+ ## What Can Be Validated in Cloud
+ 
+@@ -127,3 +367,4 @@ This smoke test runs in CI alongside the other cloud-safe smoke tests (ipc-super
+ - Presenter configuration validation
+ - `--presenter-sim` mode (render + conversion + JSON output)
+ - `presenter-sim-smoke` integration test
++- `--windowed-softbuffer` graceful error when no display server (no panic, clear message)
+diff --git a/wallflow/wallflow-foundation/docs/roadmap.md b/wallflow/wallflow-foundation/docs/roadmap.md
+old mode 100644
+new mode 100755
+index 8c64e84..0975ff6
+--- a/wallflow/wallflow-foundation/docs/roadmap.md
++++ b/wallflow/wallflow-foundation/docs/roadmap.md
+@@ -262,6 +262,15 @@
+ - Real GPU adapter capabilities on Windows hardware
+ - wgpu GPU rendering matching CPU reference output
+ 
++## MVP-2.5 Windows desktop attach integration (planned: Stage 011)
++
++- Connect `wallflow-desktop` desktop attach to the winit window from `--windowed-softbuffer`.
++- Extract HWND from winit window via `raw_window_handle()` and call `attach_window_to_desktop()`.
++- Handle Explorer restart by monitoring WorkerW handle validity in the event loop.
++- Detach on shutdown via `detach_window_from_desktop()`.
++- Requires REQUIRES_REAL_WINDOWS_VALIDATION — cannot be tested in CI.
++- Alternative: wgpu textured rendering pipeline (GPU image compositing, replacing softbuffer for production).
++
+ ## MVP-3 video wallpaper
+ 
+ - Implement Media Foundation backend.
+-- 
+2.47.3
+

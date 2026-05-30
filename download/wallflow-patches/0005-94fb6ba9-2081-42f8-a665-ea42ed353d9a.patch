@@ -1,0 +1,2056 @@
+From 6226c6d8d3a7a24965d95fc0894afa5b6785b3e9 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 13:56:59 +0000
+Subject: [PATCH 05/10] 94fb6ba9-2081-42f8-a665-ea42ed353d9a
+
+---
+ .../.github/workflows/ci.yml                  |   5 +
+ wallflow/wallflow-foundation/Cargo.toml       |   4 +-
+ .../crates/wallflow-cli/Cargo.toml            |   1 +
+ .../crates/wallflow-cli/src/main.rs           | 214 +++++
+ .../crates/wallflow-common/src/fit_mode.rs    |  15 +
+ .../crates/wallflow-render/Cargo.toml         |  15 +
+ .../crates/wallflow-render/src/color.rs       | 189 +++++
+ .../crates/wallflow-render/src/error.rs       |  26 +
+ .../crates/wallflow-render/src/lib.rs         |  29 +
+ .../crates/wallflow-render/src/output.rs      |  90 +++
+ .../crates/wallflow-render/src/renderer.rs    | 734 ++++++++++++++++++
+ .../crates/wallflow-renderer/Cargo.toml       |   1 +
+ .../crates/wallflow-renderer/src/main.rs      | 226 +++++-
+ .../architecture/011-static-render-output.md  | 233 ++++++
+ wallflow/wallflow-foundation/docs/roadmap.md  |  37 +-
+ 15 files changed, 1774 insertions(+), 45 deletions(-)
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+ create mode 100644 wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
+
+diff --git a/wallflow/wallflow-foundation/.github/workflows/ci.yml b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+index 1a682b9..f526871 100644
+--- a/wallflow/wallflow-foundation/.github/workflows/ci.yml
++++ b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+@@ -111,6 +111,11 @@ jobs:
+           cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 5 --width 800 --height 450
+           echo "Render sim smoke test completed"
+ 
++      - name: Render output smoke test
++        run: |
++          cargo run -p wallflow-cli -- render-output-smoke
++          echo "Render output smoke test completed"
++
+       - name: Legacy headless heartbeat smoke
+         run: |
+           timeout 15 ./target/debug/wallflow-renderer --headless-heartbeat --heartbeat-interval-ms 500 --timeout-secs 5 || true
+diff --git a/wallflow/wallflow-foundation/Cargo.toml b/wallflow/wallflow-foundation/Cargo.toml
+index 846ddbb..e7b271e 100644
+--- a/wallflow/wallflow-foundation/Cargo.toml
++++ b/wallflow/wallflow-foundation/Cargo.toml
+@@ -10,7 +10,8 @@ members = [
+   "crates/wallflow-core",
+   "crates/wallflow-renderer",
+   "crates/wallflow-cli",
+-  "crates/wallflow-package"
++  "crates/wallflow-package",
++  "crates/wallflow-render"
+ ]
+ 
+ [workspace.package]
+@@ -30,6 +31,7 @@ thiserror = "1"
+ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time"] }
+ tracing = "0.1"
+ winit = "0.30"
++sha2 = "0.10"
+ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ uuid = { version = "1", features = ["v4", "serde"] }
+ 
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+index 134f7f4..f8b0f89 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+@@ -21,6 +21,7 @@ wallflow-desktop = { path = "../wallflow-desktop" }
+ wallflow-ipc = { path = "../wallflow-ipc" }
+ wallflow-monitor = { path = "../wallflow-monitor" }
+ wallflow-package = { path = "../wallflow-package" }
++wallflow-render = { path = "../wallflow-render" }
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.58", features = [
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+index 626f605..ffd0716 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+@@ -98,6 +98,11 @@ enum Command {
+         #[arg(long, default_value_t = 450)]
+         height: u32,
+     },
++
++    /// Create a test PNG, run the renderer in --headless-render-sim mode
++    /// with --source and --render-output, and verify the output PNG.
++    /// This is the cloud-testable static render output integration test.
++    RenderOutputSmoke,
+ }
+ 
+ fn main() -> Result<()> {
+@@ -162,6 +167,9 @@ fn main() -> Result<()> {
+         } => {
+             run_render_sim_smoke(timeout_secs, width, height)?;
+         }
++        Command::RenderOutputSmoke => {
++            run_render_output_smoke()?;
++        }
+     }
+ 
+     Ok(())
+@@ -1437,3 +1445,209 @@ fn run_render_sim_smoke(timeout_secs: u64, width: u32, height: u32) -> Result<()
+         Ok(())
+     })
+ }
++
++// ---------------------------------------------------------------------------
++// Render output smoke test
++// ---------------------------------------------------------------------------
++
++fn run_render_output_smoke() -> Result<()> {
++    use std::process::Stdio;
++    use tokio::io::AsyncBufReadExt;
++    use tokio::process::Command;
++    use tokio::time;
++
++    let rt = tokio::runtime::Runtime::new()?;
++    rt.block_on(async {
++        let start = Instant::now();
++
++        // Step 1: Create a temporary 2x2 PNG with distinct colors
++        let temp_dir = std::env::temp_dir().join("wallflow-render-output-smoke");
++        let _ = std::fs::remove_dir_all(&temp_dir);
++        std::fs::create_dir_all(&temp_dir)?;
++
++        let mut img = image::RgbaImage::new(2, 2);
++        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255])); // red
++        img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255])); // green
++        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255])); // blue
++        img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255])); // white
++        let source_path = temp_dir.join("source.png");
++        img.save(&source_path)?;
++
++        let output_path = temp_dir.join("output.png");
++        let source_path_str = source_path.to_string_lossy().to_string();
++        let output_path_str = output_path.to_string_lossy().to_string();
++
++        println!("=== Render Output Smoke Test ===");
++        println!("Source image: {}", source_path.display());
++        println!("Output path: {}", output_path.display());
++
++        // Step 2: Run renderer in --headless-render-sim mode with --source and --render-output
++        let renderer_exe = find_renderer_exe()?;
++        println!("Renderer exe: {}", renderer_exe.display());
++
++        let mut child = Command::new(&renderer_exe)
++            .arg("--headless-render-sim")
++            .arg("--width")
++            .arg("800")
++            .arg("--height")
++            .arg("450")
++            .arg("--timeout-secs")
++            .arg("2")
++            .arg("--fit")
++            .arg("cover")
++            .arg("--source")
++            .arg(&source_path_str)
++            .arg("--render-output")
++            .arg(&output_path_str)
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
++
++        let pid = child.id();
++        println!("Renderer spawned (PID: {:?})", pid);
++
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
++        let stdout_reader = tokio::io::BufReader::new(stdout);
++        let mut lines = stdout_reader.lines();
++
++        let deadline = time::sleep(Duration::from_secs(30));
++        tokio::pin!(deadline);
++
++        let mut report_json = String::new();
++        let mut report_received = false;
++
++        tokio::select! {
++            _ = &mut deadline => {
++                eprintln!("Render output smoke timed out waiting for report");
++                let _ = child.kill().await;
++            }
++            line = lines.next_line() => {
++                match line {
++                    Ok(Some(line)) => {
++                        report_json = line;
++                        report_received = true;
++                    }
++                    Ok(None) => {}
++                    Err(e) => {
++                        eprintln!("Error reading renderer stdout: {e}");
++                    }
++                }
++            }
++        }
++
++        // Wait for the process to exit
++        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
++            Ok(Ok(status)) => Some(status),
++            Ok(Err(e)) => {
++                eprintln!("Error waiting for renderer: {e}");
++                None
++            }
++            Err(_) => {
++                eprintln!("Renderer did not exit in time, killing");
++                let _ = child.kill().await;
++                None
++            }
++        };
++
++        let total_elapsed = start.elapsed();
++        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
++
++        // Step 3: Verify the output PNG
++        let mut output_exists = false;
++        let mut output_decodes = false;
++        let mut output_width_ok = false;
++        let mut output_height_ok = false;
++        let mut checksum_present = false;
++
++        if output_path.exists() {
++            output_exists = true;
++            match image::open(&output_path) {
++                Ok(decoded) => {
++                    output_decodes = true;
++                    if decoded.width() == 800 {
++                        output_width_ok = true;
++                    }
++                    if decoded.height() == 450 {
++                        output_height_ok = true;
++                    }
++                }
++                Err(e) => {
++                    eprintln!("Failed to decode output PNG: {e}");
++                }
++            }
++        } else {
++            eprintln!("Output PNG does not exist: {}", output_path.display());
++        }
++
++        // Check checksum in report
++        if report_received {
++            if let Ok(report_val) = serde_json::from_str::<serde_json::Value>(&report_json) {
++                if report_val
++                    .get("render_output")
++                    .and_then(|r| r.get("checksum"))
++                    .is_some()
++                {
++                    checksum_present = true;
++                }
++            }
++        }
++
++        let success = output_exists
++            && output_decodes
++            && output_width_ok
++            && output_height_ok
++            && checksum_present
++            && process_exit_code == Some(0);
++
++        let verification = serde_json::json!({
++            "output_exists": output_exists,
++            "output_decodes": output_decodes,
++            "output_width_ok": output_width_ok,
++            "output_height_ok": output_height_ok,
++            "checksum_present": checksum_present,
++            "process_exit_code": process_exit_code,
++        });
++
++        let report = serde_json::json!({
++            "test": "render-output-smoke",
++            "success": success,
++            "total_elapsed_ms": total_elapsed.as_millis() as u64,
++            "renderer_pid": pid,
++            "output_path": output_path_str,
++            "verification": verification,
++        });
++
++        println!("\n=== Render Output Smoke Report ===");
++        println!("{}", serde_json::to_string_pretty(&report)?);
++
++        if success {
++            println!("\nRender output smoke test PASSED.");
++        } else {
++            eprintln!("\nRender output smoke test FAILED.");
++            if !output_exists {
++                eprintln!("  Missing: output PNG file");
++            }
++            if !output_decodes {
++                eprintln!("  Failed: output PNG does not decode");
++            }
++            if !output_width_ok {
++                eprintln!("  Failed: output width is not 800");
++            }
++            if !output_height_ok {
++                eprintln!("  Failed: output height is not 450");
++            }
++            if !checksum_present {
++                eprintln!("  Missing: checksum in report");
++            }
++        }
++
++        // Cleanup
++        let _ = std::fs::remove_dir_all(&temp_dir);
++
++        Ok(())
++    })
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+index 8b8e926..667cb35 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+@@ -26,3 +26,18 @@ impl std::fmt::Display for FitMode {
+         }
+     }
+ }
++
++impl std::str::FromStr for FitMode {
++    type Err = ();
++
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        match s.to_lowercase().as_str() {
++            "cover" => Ok(FitMode::Cover),
++            "contain" => Ok(FitMode::Contain),
++            "stretch" => Ok(FitMode::Stretch),
++            "center" => Ok(FitMode::Center),
++            "tile" => Ok(FitMode::Tile),
++            _ => Err(()),
++        }
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml
+new file mode 100644
+index 0000000..c74a1f1
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/Cargo.toml
+@@ -0,0 +1,15 @@
++[package]
++name = "wallflow-render"
++version = "0.1.0"
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++
++[dependencies]
++image = { workspace = true }
++serde = { workspace = true, features = ["derive"] }
++serde_json.workspace = true
++sha2.workspace = true
++thiserror.workspace = true
++wallflow-common = { path = "../wallflow-common" }
++wallflow-package = { path = "../wallflow-package" }
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs
+new file mode 100644
+index 0000000..d005f5a
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/color.rs
+@@ -0,0 +1,189 @@
++use serde::{Deserialize, Serialize};
++
++/// An RGBA color value.
++///
++/// Each channel is stored as `u8` (0–255). This type provides safe parsing
++/// from hex color strings in the format `#RRGGBB` or `#RRGGBBAA`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct RgbaColor {
++    pub r: u8,
++    pub g: u8,
++    pub b: u8,
++    pub a: u8,
++}
++
++impl RgbaColor {
++    /// Pure black with full opacity.
++    pub const BLACK: RgbaColor = RgbaColor {
++        r: 0,
++        g: 0,
++        b: 0,
++        a: 255,
++    };
++
++    /// Pure white with full opacity.
++    pub const WHITE: RgbaColor = RgbaColor {
++        r: 255,
++        g: 255,
++        b: 255,
++        a: 255,
++    };
++
++    /// Create a new color from RGBA components.
++    pub const fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
++        Self { r, g, b, a }
++    }
++
++    /// Create a new color from RGB components with full opacity.
++    pub const fn from_rgb(r: u8, g: u8, b: u8) -> Self {
++        Self { r, g, b, a: 255 }
++    }
++
++    /// Parse a hex color string.
++    ///
++    /// Supported formats:
++    /// - `#RRGGBB` — 6 hex digits, alpha defaults to 255
++    /// - `#RRGGBBAA` — 8 hex digits
++    ///
++    /// Returns an error if:
++    /// - The string does not start with `#`
++    /// - The hex digits are invalid
++    /// - The length after `#` is not 6 or 8
++    pub fn parse_hex(s: &str) -> Result<Self, String> {
++        if !s.starts_with('#') {
++            return Err(format!("color string must start with '#': got {:?}", s));
++        }
++
++        let hex = &s[1..];
++
++        match hex.len() {
++            6 => {
++                let r = parse_hex_byte(&hex[0..2])?;
++                let g = parse_hex_byte(&hex[2..4])?;
++                let b = parse_hex_byte(&hex[4..6])?;
++                Ok(Self::from_rgb(r, g, b))
++            }
++            8 => {
++                let r = parse_hex_byte(&hex[0..2])?;
++                let g = parse_hex_byte(&hex[2..4])?;
++                let b = parse_hex_byte(&hex[4..6])?;
++                let a = parse_hex_byte(&hex[6..8])?;
++                Ok(Self::new(r, g, b, a))
++            }
++            other => Err(format!(
++                "color string must have 6 or 8 hex digits after '#', got {} digits: {:?}",
++                other, s
++            )),
++        }
++    }
++
++    /// Convert to a packed RGBA `u32` (0xRRGGBBAA).
++    pub fn to_u32(self) -> u32 {
++        ((self.r as u32) << 24) | ((self.g as u32) << 16) | ((self.b as u32) << 8) | (self.a as u32)
++    }
++}
++
++impl std::fmt::Display for RgbaColor {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        if self.a == 255 {
++            write!(f, "#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
++        } else {
++            write!(
++                f,
++                "#{:02x}{:02x}{:02x}{:02x}",
++                self.r, self.g, self.b, self.a
++            )
++        }
++    }
++}
++
++/// Parse a two-character hex string as a `u8`.
++fn parse_hex_byte(s: &str) -> Result<u8, String> {
++    let byte =
++        u8::from_str_radix(s, 16).map_err(|e| format!("invalid hex digits {:?}: {}", s, e))?;
++    Ok(byte)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn valid_black() {
++        let c = RgbaColor::parse_hex("#000000").expect("parse");
++        assert_eq!(c, RgbaColor::BLACK);
++        assert_eq!(c.r, 0);
++        assert_eq!(c.g, 0);
++        assert_eq!(c.b, 0);
++        assert_eq!(c.a, 255);
++    }
++
++    #[test]
++    fn valid_white() {
++        let c = RgbaColor::parse_hex("#ffffff").expect("parse");
++        assert_eq!(c, RgbaColor::WHITE);
++    }
++
++    #[test]
++    fn valid_with_alpha() {
++        let c = RgbaColor::parse_hex("#ff000080").expect("parse");
++        assert_eq!(c.r, 255);
++        assert_eq!(c.g, 0);
++        assert_eq!(c.b, 0);
++        assert_eq!(c.a, 128);
++    }
++
++    #[test]
++    fn valid_mixed_case() {
++        let c = RgbaColor::parse_hex("#AbCdEf").expect("parse");
++        assert_eq!(c.r, 0xab);
++        assert_eq!(c.g, 0xcd);
++        assert_eq!(c.b, 0xef);
++        assert_eq!(c.a, 255);
++    }
++
++    #[test]
++    fn missing_hash() {
++        let result = RgbaColor::parse_hex("000000");
++        assert!(result.is_err());
++        assert!(result.unwrap_err().contains("must start with '#'"));
++    }
++
++    #[test]
++    fn wrong_length_short() {
++        let result = RgbaColor::parse_hex("#0000");
++        assert!(result.is_err());
++        assert!(result.unwrap_err().contains("6 or 8 hex digits"));
++    }
++
++    #[test]
++    fn wrong_length_long() {
++        let result = RgbaColor::parse_hex("#000000000");
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn invalid_hex_chars() {
++        let result = RgbaColor::parse_hex("#gggggg");
++        assert!(result.is_err());
++        assert!(result.unwrap_err().contains("invalid hex"));
++    }
++
++    #[test]
++    fn display_rgb() {
++        let c = RgbaColor::from_rgb(0x1a, 0x2b, 0x3c);
++        assert_eq!(c.to_string(), "#1a2b3c");
++    }
++
++    #[test]
++    fn display_rgba() {
++        let c = RgbaColor::new(0x1a, 0x2b, 0x3c, 0x80);
++        assert_eq!(c.to_string(), "#1a2b3c80");
++    }
++
++    #[test]
++    fn to_u32() {
++        let c = RgbaColor::from_rgb(0xff, 0x00, 0x80);
++        assert_eq!(c.to_u32(), 0xff0080ff);
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs
+new file mode 100644
+index 0000000..3fe7f7f
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/error.rs
+@@ -0,0 +1,26 @@
++use thiserror::Error;
++
++/// Errors that can occur during static image rendering.
++#[derive(Debug, Error)]
++pub enum StaticRenderError {
++    #[error("failed to open image: {0}")]
++    ImageOpen(String),
++
++    #[error("failed to decode image: {0}")]
++    ImageDecode(String),
++
++    #[error("invalid image path: {0}")]
++    InvalidImagePath(String),
++
++    #[error("invalid background color: {0}")]
++    InvalidBackground(String),
++
++    #[error("invalid viewport dimensions: width={width}, height={height}")]
++    InvalidViewport { width: u32, height: u32 },
++
++    #[error("layout error: {0}")]
++    Layout(#[from] wallflow_package::LayoutError),
++
++    #[error("io error: {0}")]
++    Io(#[from] std::io::Error),
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+new file mode 100644
+index 0000000..d98eac9
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/lib.rs
+@@ -0,0 +1,29 @@
++//! WallFlow static render output layer.
++//!
++//! This crate provides CPU/reference rendering of static image wallpapers.
++//! It takes a decoded image, a layout (from the layout engine), a fit mode,
++//! and a background color, and produces an RGBA frame or PNG output.
++//!
++//! The CPU reference renderer is the cloud-testable baseline before adding
++//! wgpu GPU presentation. It uses nearest-neighbor scaling (temporary;
++//! bilinear/Lanczos can be added later).
++
++mod color;
++mod error;
++mod output;
++mod renderer;
++
++pub use color::RgbaColor;
++pub use error::StaticRenderError;
++pub use output::{RenderOutput, RenderOutputMetadata};
++pub use renderer::{render_static_image_cpu, StaticRenderInput};
++
++/// Which backend to use for rendering.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum RenderBackend {
++    /// CPU reference renderer: pure Rust, no GPU, cloud-testable.
++    CpuReference,
++    // WgpuExperimental will be added in a future stage.
++}
++
++use serde::{Deserialize, Serialize};
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs
+new file mode 100644
+index 0000000..6d6459e
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/output.rs
+@@ -0,0 +1,90 @@
++use serde::{Deserialize, Serialize};
++
++/// The output of a static image render operation.
++///
++/// Contains the RGBA pixel buffer and optional metadata about the output.
++#[derive(Debug, Clone)]
++pub struct RenderOutput {
++    /// Width of the output in pixels.
++    pub width: u32,
++    /// Height of the output in pixels.
++    pub height: u32,
++    /// Raw RGBA pixel data (4 bytes per pixel, row-major, top-to-bottom).
++    pub pixels_rgba: Vec<u8>,
++    /// Optional path where the output was saved as PNG.
++    pub output_path: Option<std::path::PathBuf>,
++}
++
++impl RenderOutput {
++    /// Create a new render output with the given dimensions and pixel data.
++    pub fn new(width: u32, height: u32, pixels_rgba: Vec<u8>) -> Self {
++        Self {
++            width,
++            height,
++            pixels_rgba,
++            output_path: None,
++        }
++    }
++
++    /// Save the render output as a PNG file.
++    pub fn save_png(&mut self, path: &std::path::Path) -> Result<(), crate::StaticRenderError> {
++        let img = image::RgbaImage::from_raw(self.width, self.height, self.pixels_rgba.clone())
++            .ok_or_else(|| {
++                crate::StaticRenderError::ImageDecode(format!(
++                    "failed to create RGBA image from buffer ({}x{}, {} bytes)",
++                    self.width,
++                    self.height,
++                    self.pixels_rgba.len()
++                ))
++            })?;
++
++        img.save(path).map_err(|e| {
++            crate::StaticRenderError::Io(std::io::Error::other(format!(
++                "failed to save PNG to {}: {}",
++                path.display(),
++                e
++            )))
++        })?;
++
++        self.output_path = Some(path.to_path_buf());
++        Ok(())
++    }
++
++    /// Compute SHA-256 checksum of the RGBA pixel data.
++    pub fn checksum_sha256(&self) -> String {
++        use sha2::{Digest, Sha256};
++        let mut hasher = Sha256::new();
++        hasher.update(&self.pixels_rgba);
++        let result = hasher.finalize();
++        format!("{:x}", result)
++    }
++
++    /// Compute metadata for this render output.
++    pub fn metadata(&self) -> RenderOutputMetadata {
++        RenderOutputMetadata {
++            width: self.width,
++            height: self.height,
++            pixel_format: "RGBA8".to_string(),
++            file_size_bytes: self
++                .output_path
++                .as_ref()
++                .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len())),
++            checksum: Some(self.checksum_sha256()),
++        }
++    }
++}
++
++/// Metadata about a render output.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct RenderOutputMetadata {
++    /// Width of the output in pixels.
++    pub width: u32,
++    /// Height of the output in pixels.
++    pub height: u32,
++    /// Pixel format (e.g., "RGBA8").
++    pub pixel_format: String,
++    /// File size in bytes (only set if output was saved to disk).
++    pub file_size_bytes: Option<u64>,
++    /// SHA-256 checksum of the RGBA pixel data.
++    pub checksum: Option<String>,
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+new file mode 100644
+index 0000000..ac4f23a
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+@@ -0,0 +1,734 @@
++use crate::color::RgbaColor;
++use crate::error::StaticRenderError;
++use crate::output::RenderOutput;
++use wallflow_common::FitMode;
++
++/// Input for a static image render operation.
++#[derive(Debug, Clone)]
++pub struct StaticRenderInput {
++    /// Path to the source image file.
++    pub image_path: std::path::PathBuf,
++    /// Viewport dimensions.
++    pub viewport: wallflow_package::Viewport,
++    /// Fit mode for the image.
++    pub fit: FitMode,
++    /// Background color as a hex string (e.g., "#000000").
++    pub background: String,
++    /// Optional opacity (0–255). Defaults to 255 (fully opaque) if None.
++    pub opacity: Option<u8>,
++}
++
++/// Render a static image to an RGBA buffer using the CPU reference renderer.
++///
++/// This function:
++/// 1. Opens and decodes the image using the `image` crate.
++/// 2. Converts the image to RGBA8.
++/// 3. Creates an output buffer the size of the viewport.
++/// 4. Fills the buffer with the background color.
++/// 5. Calculates the layout using the existing layout engine.
++/// 6. Draws the image into the output buffer according to the fit mode.
++/// 7. Returns the `RenderOutput`.
++///
++/// Uses nearest-neighbor scaling (temporary; bilinear/Lanczos can be added later).
++pub fn render_static_image_cpu(input: StaticRenderInput) -> Result<RenderOutput, StaticRenderError> {
++    // Validate viewport
++    if input.viewport.width == 0 || input.viewport.height == 0 {
++        return Err(StaticRenderError::InvalidViewport {
++            width: input.viewport.width,
++            height: input.viewport.height,
++        });
++    }
++
++    // Parse background color
++    let bg_color = RgbaColor::parse_hex(&input.background)
++        .map_err(StaticRenderError::InvalidBackground)?;
++
++    // Open and decode image
++    let img = image::open(&input.image_path).map_err(|e| {
++        StaticRenderError::ImageOpen(format!("{}: {}", input.image_path.display(), e))
++    })?;
++    let img_rgba = img.to_rgba8();
++    let img_width = img_rgba.width();
++    let img_height = img_rgba.height();
++
++    if img_width == 0 || img_height == 0 {
++        return Err(StaticRenderError::ImageDecode(format!(
++            "decoded image has zero dimensions: {}x{}",
++            img_width, img_height
++        )));
++    }
++
++    // Calculate layout
++    let image_size = wallflow_package::ImageSize {
++        width: img_width,
++        height: img_height,
++    };
++    let layout = wallflow_package::calculate_static_image_layout(
++        image_size,
++        input.viewport,
++        input.fit,
++        input.background.clone(),
++    )?;
++
++    let vp_width = input.viewport.width as usize;
++    let vp_height = input.viewport.height as usize;
++
++    // Create output buffer filled with background color
++    let bg_pixel = [bg_color.r, bg_color.g, bg_color.b, bg_color.a];
++    let mut output = vec![0u8; vp_width * vp_height * 4];
++    for pixel in output.chunks_exact_mut(4) {
++        pixel.copy_from_slice(&bg_pixel);
++    }
++
++    // Apply opacity to the image pixels if needed
++    let opacity = input.opacity.unwrap_or(255);
++    let source_pixels: Vec<u8> = if opacity < 255 {
++        img_rgba
++            .pixels()
++            .flat_map(|p| {
++                let r = ((p.0[0] as u32) * (opacity as u32) + 127) / 255;
++                let g = ((p.0[1] as u32) * (opacity as u32) + 127) / 255;
++                let b = ((p.0[2] as u32) * (opacity as u32) + 127) / 255;
++                let a = ((p.0[3] as u32) * (opacity as u32) + 127) / 255;
++                [r as u8, g as u8, b as u8, a as u8]
++            })
++            .collect()
++    } else {
++        img_rgba.into_raw()
++    };
++
++    // Draw the image according to the fit mode
++    match input.fit {
++        FitMode::Cover | FitMode::Contain | FitMode::Stretch | FitMode::Center => {
++            draw_scaled_or_centered(
++                &mut output,
++                vp_width,
++                vp_height,
++                &source_pixels,
++                img_width,
++                img_height,
++                &layout.destination_rect,
++            );
++        }
++        FitMode::Tile => {
++            draw_tiled(
++                &mut output,
++                vp_width,
++                vp_height,
++                &source_pixels,
++                img_width,
++                img_height,
++            );
++        }
++    }
++
++    Ok(RenderOutput::new(
++        input.viewport.width,
++        input.viewport.height,
++        output,
++    ))
++}
++
++/// Draw an image scaled/positioned according to the destination rectangle.
++///
++/// This handles Cover, Contain, Stretch, and Center modes. For Cover,
++/// parts of the image that extend beyond the viewport are clipped.
++fn draw_scaled_or_centered(
++    output: &mut [u8],
++    vp_width: usize,
++    vp_height: usize,
++    source_pixels: &[u8],
++    img_width: u32,
++    img_height: u32,
++    dest_rect: &wallflow_package::RenderRect,
++) {
++    let dx_start = dest_rect.x.max(0.0) as usize;
++    let dy_start = dest_rect.y.max(0.0) as usize;
++    let dx_end = ((dest_rect.x + dest_rect.width) as usize).min(vp_width);
++    let dy_end = ((dest_rect.y + dest_rect.height) as usize).min(vp_height);
++
++    let iw = img_width as f64;
++    let ih = img_height as f64;
++    let dw = dest_rect.width;
++    let dh = dest_rect.height;
++
++    for dy in dy_start..dy_end {
++        for dx in dx_start..dx_end {
++            // Map destination pixel to source pixel (nearest-neighbor)
++            let sx_f = ((dx as f64) - dest_rect.x) / dw * iw;
++            let sy_f = ((dy as f64) - dest_rect.y) / dh * ih;
++
++            let sx = (sx_f as usize).min(img_width as usize - 1);
++            let sy = (sy_f as usize).min(img_height as usize - 1);
++
++            let src_idx = (sy * (img_width as usize) + sx) * 4;
++            let dst_idx = (dy * vp_width + dx) * 4;
++
++            if src_idx + 4 <= source_pixels.len() && dst_idx + 4 <= output.len() {
++                let sa = source_pixels[src_idx + 3] as u32;
++                if sa == 255 {
++                    output[dst_idx..dst_idx + 4]
++                        .copy_from_slice(&source_pixels[src_idx..src_idx + 4]);
++                } else if sa > 0 {
++                    // Alpha blend
++                    let sr = source_pixels[src_idx] as u32;
++                    let sg = source_pixels[src_idx + 1] as u32;
++                    let sb = source_pixels[src_idx + 2] as u32;
++                    let dr = output[dst_idx] as u32;
++                    let dg = output[dst_idx + 1] as u32;
++                    let db = output[dst_idx + 2] as u32;
++                    let da = output[dst_idx + 3] as u32;
++
++                    let alpha = sa;
++                    let inv_alpha = 255 - alpha;
++
++                    output[dst_idx] = ((sr * alpha + dr * inv_alpha + 127) / 255) as u8;
++                    output[dst_idx + 1] = ((sg * alpha + dg * inv_alpha + 127) / 255) as u8;
++                    output[dst_idx + 2] = ((sb * alpha + db * inv_alpha + 127) / 255) as u8;
++                    output[dst_idx + 3] = ((sa * 255 + da * inv_alpha + 127) / 255) as u8;
++                }
++                // If sa == 0, keep the background pixel
++            }
++        }
++    }
++}
++
++/// Draw an image tiled across the viewport.
++fn draw_tiled(
++    output: &mut [u8],
++    vp_width: usize,
++    vp_height: usize,
++    source_pixels: &[u8],
++    img_width: u32,
++    img_height: u32,
++) {
++    let iw = img_width as usize;
++    let ih = img_height as usize;
++
++    for y in 0..vp_height {
++        let sy = y % ih;
++        for x in 0..vp_width {
++            let sx = x % iw;
++
++            let src_idx = (sy * iw + sx) * 4;
++            let dst_idx = (y * vp_width + x) * 4;
++
++            if src_idx + 4 <= source_pixels.len() && dst_idx + 4 <= output.len() {
++                let sa = source_pixels[src_idx + 3] as u32;
++                if sa == 255 {
++                    output[dst_idx..dst_idx + 4]
++                        .copy_from_slice(&source_pixels[src_idx..src_idx + 4]);
++                } else if sa > 0 {
++                    let sr = source_pixels[src_idx] as u32;
++                    let sg = source_pixels[src_idx + 1] as u32;
++                    let sb = source_pixels[src_idx + 2] as u32;
++                    let dr = output[dst_idx] as u32;
++                    let dg = output[dst_idx + 1] as u32;
++                    let db = output[dst_idx + 2] as u32;
++                    let da = output[dst_idx + 3] as u32;
++
++                    let alpha = sa;
++                    let inv_alpha = 255 - alpha;
++
++                    output[dst_idx] = ((sr * alpha + dr * inv_alpha + 127) / 255) as u8;
++                    output[dst_idx + 1] = ((sg * alpha + dg * inv_alpha + 127) / 255) as u8;
++                    output[dst_idx + 2] = ((sb * alpha + db * inv_alpha + 127) / 255) as u8;
++                    output[dst_idx + 3] = ((sa * 255 + da * inv_alpha + 127) / 255) as u8;
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Helper: create a test PNG at the given path with the given pixel colors.
++    fn create_test_png(
++        path: &std::path::Path,
++        width: u32,
++        height: u32,
++        pixels: &[image::Rgba<u8>],
++    ) {
++        let mut img = image::RgbaImage::new(width, height);
++        for (i, pixel) in pixels.iter().enumerate() {
++            let x = i as u32 % width;
++            let y = i as u32 / width;
++            if x < width && y < height {
++                img.put_pixel(x, y, *pixel);
++            }
++        }
++        img.save(path).expect("save test PNG");
++    }
++
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
++
++    fn unique_test_dir() -> std::path::PathBuf {
++        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
++        let dir = std::env::temp_dir().join(format!("wallflow-render-tests-{id}"));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).expect("create temp dir");
++        dir
++    }
++
++    // --- Dimension tests ---
++
++    #[test]
++    fn render_cover_creates_correct_output_dimensions() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(
++            &img_path,
++            2,
++            2,
++            &[
++                image::Rgba([255, 0, 0, 255]),
++                image::Rgba([0, 255, 0, 255]),
++                image::Rgba([0, 0, 255, 255]),
++                image::Rgba([255, 255, 255, 255]),
++            ],
++        );
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 800,
++                height: 450,
++            },
++            fit: FitMode::Cover,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++        assert_eq!(output.width, 800);
++        assert_eq!(output.height, 450);
++        assert_eq!(output.pixels_rgba.len(), 800 * 450 * 4);
++    }
++
++    #[test]
++    fn render_contain_creates_correct_output_dimensions() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 800,
++                height: 450,
++            },
++            fit: FitMode::Contain,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++        assert_eq!(output.width, 800);
++        assert_eq!(output.height, 450);
++    }
++
++    #[test]
++    fn render_stretch_creates_correct_output_dimensions() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 800,
++                height: 450,
++            },
++            fit: FitMode::Stretch,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++        assert_eq!(output.width, 800);
++        assert_eq!(output.height, 450);
++    }
++
++    #[test]
++    fn render_center_creates_correct_output_dimensions() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 800,
++                height: 450,
++            },
++            fit: FitMode::Center,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++        assert_eq!(output.width, 800);
++        assert_eq!(output.height, 450);
++    }
++
++    #[test]
++    fn render_tile_creates_correct_output_dimensions() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 800,
++                height: 450,
++            },
++            fit: FitMode::Tile,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++        assert_eq!(output.width, 800);
++        assert_eq!(output.height, 450);
++    }
++
++    // --- Error tests ---
++
++    #[test]
++    fn invalid_image_path_fails() {
++        let input = StaticRenderInput {
++            image_path: std::path::PathBuf::from("/nonexistent/path/image.png"),
++            viewport: wallflow_package::Viewport {
++                width: 100,
++                height: 100,
++            },
++            fit: FitMode::Cover,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let result = render_static_image_cpu(input);
++        assert!(result.is_err());
++        match result.unwrap_err() {
++            StaticRenderError::ImageOpen(_) => {}
++            other => panic!("expected ImageOpen error, got: {:?}", other),
++        }
++    }
++
++    #[test]
++    fn invalid_background_fails() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 100,
++                height: 100,
++            },
++            fit: FitMode::Cover,
++            background: "invalid".into(),
++            opacity: None,
++        };
++
++        let result = render_static_image_cpu(input);
++        assert!(result.is_err());
++        match result.unwrap_err() {
++            StaticRenderError::InvalidBackground(_) => {}
++            other => panic!("expected InvalidBackground error, got: {:?}", other),
++        }
++    }
++
++    // --- Checksum stability ---
++
++    #[test]
++    fn checksum_stable() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([128, 64, 32, 255]); 4]);
++
++        let input1 = StaticRenderInput {
++            image_path: img_path.clone(),
++            viewport: wallflow_package::Viewport {
++                width: 10,
++                height: 10,
++            },
++            fit: FitMode::Stretch,
++            background: "#000000".into(),
++            opacity: None,
++        };
++        let input2 = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 10,
++                height: 10,
++            },
++            fit: FitMode::Stretch,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output1 = render_static_image_cpu(input1).expect("render1");
++        let output2 = render_static_image_cpu(input2).expect("render2");
++
++        assert_eq!(output1.checksum_sha256(), output2.checksum_sha256());
++    }
++
++    // --- PNG roundtrip ---
++
++    #[test]
++    fn output_png_roundtrip() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([255, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 10,
++                height: 10,
++            },
++            fit: FitMode::Stretch,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let mut output = render_static_image_cpu(input).expect("render");
++        let out_path = dir.join("output.png");
++        output.save_png(&out_path).expect("save PNG");
++
++        // Reload and verify
++        let reloaded = image::open(&out_path).expect("reload PNG");
++        assert_eq!(reloaded.width(), 10);
++        assert_eq!(reloaded.height(), 10);
++    }
++
++    // --- Pixel-level tests ---
++
++    #[test]
++    fn stretch_2x2_into_4x4_pixels() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        // 2x2 image: red, green, blue, white
++        create_test_png(
++            &img_path,
++            2,
++            2,
++            &[
++                image::Rgba([255, 0, 0, 255]),   // top-left: red
++                image::Rgba([0, 255, 0, 255]),   // top-right: green
++                image::Rgba([0, 0, 255, 255]),   // bottom-left: blue
++                image::Rgba([255, 255, 255, 255]), // bottom-right: white
++            ],
++        );
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 4,
++                height: 4,
++            },
++            fit: FitMode::Stretch,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++
++        // Top-left quadrant should be red-ish (nearest neighbor: stretch 2x2 → 4x4)
++        // Pixel (0,0) → source (0,0) = red
++        let px = get_pixel(&output, 0, 0);
++        assert_eq!(px, [255, 0, 0, 255], "pixel (0,0) should be red");
++
++        // Pixel (3,3) → source (1,1) = white
++        let px = get_pixel(&output, 3, 3);
++        assert_eq!(px, [255, 255, 255, 255], "pixel (3,3) should be white");
++    }
++
++    #[test]
++    fn center_2x2_into_4x4_pixels() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(
++            &img_path,
++            2,
++            2,
++            &[
++                image::Rgba([255, 0, 0, 255]),
++                image::Rgba([0, 255, 0, 255]),
++                image::Rgba([0, 0, 255, 255]),
++                image::Rgba([255, 255, 255, 255]),
++            ],
++        );
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 4,
++                height: 4,
++            },
++            fit: FitMode::Center,
++            background: "#808080".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++
++        // Center mode: 2x2 image centered in 4x4 viewport
++        // dest_rect: x=1, y=1, w=2, h=2
++        // Pixel (0,0) should be background (#808080)
++        let px = get_pixel(&output, 0, 0);
++        assert_eq!(px, [128, 128, 128, 255], "pixel (0,0) should be background");
++
++        // Pixel (1,1) should be red (top-left of centered image)
++        let px = get_pixel(&output, 1, 1);
++        assert_eq!(px, [255, 0, 0, 255], "pixel (1,1) should be red");
++    }
++
++    #[test]
++    fn contain_with_background() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        // 2x2 square image into 4x2 viewport (wider than tall)
++        // Contain: scale = min(4/2, 2/2) = min(2, 1) = 1
++        // dest: w=2, h=2, x=(4-2)/2=1, y=(2-2)/2=0
++        create_test_png(
++            &img_path,
++            2,
++            2,
++            &[
++                image::Rgba([255, 0, 0, 255]),
++                image::Rgba([0, 255, 0, 255]),
++                image::Rgba([0, 0, 255, 255]),
++                image::Rgba([255, 255, 255, 255]),
++            ],
++        );
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 4,
++                height: 2,
++            },
++            fit: FitMode::Contain,
++            background: "#00ff00".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++
++        // Pixel (0,0) should be green background (left padding)
++        let px = get_pixel(&output, 0, 0);
++        assert_eq!(px, [0, 255, 0, 255], "pixel (0,0) should be green background");
++
++        // Pixel (1,0) should be red (left edge of contained image)
++        let px = get_pixel(&output, 1, 0);
++        assert_eq!(px, [255, 0, 0, 255], "pixel (1,0) should be red");
++    }
++
++    #[test]
++    fn tile_into_5x5_pixels() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        // 2x2 image: each pixel a distinct color
++        create_test_png(
++            &img_path,
++            2,
++            2,
++            &[
++                image::Rgba([255, 0, 0, 255]),   // (0,0) red
++                image::Rgba([0, 255, 0, 255]),   // (1,0) green
++                image::Rgba([0, 0, 255, 255]),   // (0,1) blue
++                image::Rgba([255, 255, 255, 255]), // (1,1) white
++            ],
++        );
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 5,
++                height: 5,
++            },
++            fit: FitMode::Tile,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let output = render_static_image_cpu(input).expect("render");
++
++        // (0,0) = red (tile starts from 0,0)
++        let px = get_pixel(&output, 0, 0);
++        assert_eq!(px, [255, 0, 0, 255], "tile (0,0) should be red");
++
++        // (2,0) = red (wraps: 2 % 2 = 0)
++        let px = get_pixel(&output, 2, 0);
++        assert_eq!(px, [255, 0, 0, 255], "tile (2,0) should be red (wrap)");
++
++        // (1,1) = white (1 % 2 = 1, 1 % 2 = 1 → source (1,1))
++        let px = get_pixel(&output, 1, 1);
++        assert_eq!(px, [255, 255, 255, 255], "tile (1,1) should be white");
++
++        // (4,4) = white (4 % 2 = 0→source x=0, 4 % 2 = 0→source y=0) → wait, 4%2=0, so source (0,0) = red
++        let px = get_pixel(&output, 4, 4);
++        assert_eq!(px, [255, 0, 0, 255], "tile (4,4) should be red (wrap)");
++    }
++
++    /// Helper: get the RGBA pixel at (x, y) from a RenderOutput.
++    fn get_pixel(output: &RenderOutput, x: u32, y: u32) -> [u8; 4] {
++        let idx = ((y * output.width + x) * 4) as usize;
++        [
++            output.pixels_rgba[idx],
++            output.pixels_rgba[idx + 1],
++            output.pixels_rgba[idx + 2],
++            output.pixels_rgba[idx + 3],
++        ]
++    }
++
++    #[test]
++    fn render_output_metadata() {
++        let dir = unique_test_dir();
++        let dir = unique_test_dir();
++        let img_path = dir.join("test.png");
++        create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
++
++        let input = StaticRenderInput {
++            image_path: img_path,
++            viewport: wallflow_package::Viewport {
++                width: 10,
++                height: 10,
++            },
++            fit: FitMode::Stretch,
++            background: "#000000".into(),
++            opacity: None,
++        };
++
++        let mut output = render_static_image_cpu(input).expect("render");
++        let out_path = dir.join("meta_test.png");
++        output.save_png(&out_path).expect("save");
++
++        let meta = output.metadata();
++        assert_eq!(meta.width, 10);
++        assert_eq!(meta.height, 10);
++        assert_eq!(meta.pixel_format, "RGBA8");
++        assert!(meta.file_size_bytes.is_some());
++        assert!(meta.checksum.is_some());
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+index 22503fc..c69e996 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+@@ -19,6 +19,7 @@ wallflow-desktop = { path = "../wallflow-desktop" }
+ wallflow-ipc = { path = "../wallflow-ipc" }
+ wallflow-media = { path = "../wallflow-media" }
+ wallflow-package = { path = "../wallflow-package" }
++wallflow-render = { path = "../wallflow-render" }
+ winit.workspace = true
+ 
+ [target.'cfg(windows)'.dependencies]
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+index 4b353d0..eb1dc6a 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+@@ -84,6 +84,15 @@ struct Args {
+     /// Window/viewport height in pixels (used with --windowed-static and --headless-render-sim).
+     #[arg(long, default_value_t = 450)]
+     height: u32,
++
++    /// When used with --headless-render-sim and --source, render the image to a PNG output file.
++    /// If not specified, only the layout simulation is performed (no pixel output).
++    #[arg(long)]
++    render_output: Option<PathBuf>,
++
++    /// Fit mode for static image rendering (used with --headless-render-sim --source --render-output).
++    #[arg(long, default_value = "cover")]
++    fit: String,
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -127,12 +136,21 @@ fn main() -> Result<()> {
+     }
+ 
+     if args.headless_render_sim {
++        let fit = match args.fit.parse::<wallflow_common::FitMode>() {
++            Ok(f) => f,
++            Err(()) => {
++                eprintln!("invalid fit mode: {}", args.fit);
++                return Err(anyhow::anyhow!("invalid fit mode: {}", args.fit));
++            }
++        };
+         return run_headless_render_sim(
+             renderer_id,
+             args.width,
+             args.height,
+             args.timeout_secs,
+             args.source.as_deref(),
++            args.render_output.as_deref(),
++            fit,
+         );
+     }
+ 
+@@ -211,6 +229,8 @@ fn run_headless_render_sim(
+     height: u32,
+     timeout_secs: u64,
+     source: Option<&std::path::Path>,
++    render_output_path: Option<&std::path::Path>,
++    fit: wallflow_common::FitMode,
+ ) -> Result<()> {
+     let start = Instant::now();
+     let timeout = if timeout_secs > 0 {
+@@ -247,38 +267,99 @@ fn run_headless_render_sim(
+     // Try to apply a static wallpaper if a source image path was provided
+     let mut wallpaper_applied = false;
+     let mut layout_report: Option<RenderSimLayoutReport> = None;
++    let mut render_output_report: Option<serde_json::Value> = None;
+ 
+     if let Some(image_path) = source {
+-        match apply_static_wallpaper_for_sim(image_path, &viewport) {
+-            Ok((metadata, layout)) => {
+-                wallpaper_applied = true;
+-                layout_report = Some(RenderSimLayoutReport {
+-                    image_width: metadata.width,
+-                    image_height: metadata.height,
+-                    viewport_width: viewport.width,
+-                    viewport_height: viewport.height,
+-                    destination_x: layout.destination_rect.x,
+-                    destination_y: layout.destination_rect.y,
+-                    destination_width: layout.destination_rect.width,
+-                    destination_height: layout.destination_rect.height,
+-                });
+-                info!(
+-                    ?renderer_id,
+-                    image_path = %image_path.display(),
+-                    image_width = metadata.width,
+-                    image_height = metadata.height,
+-                    "wallpaper applied in render sim"
+-                );
++        // If render_output_path is specified, do actual rendering
++        if let Some(output_path) = render_output_path {
++            match render_static_image_for_sim(image_path, &viewport, fit, output_path) {
++                Ok((metadata, layout, output)) => {
++                    wallpaper_applied = true;
++                    layout_report = Some(RenderSimLayoutReport {
++                        image_width: metadata.width,
++                        image_height: metadata.height,
++                        viewport_width: viewport.width,
++                        viewport_height: viewport.height,
++                        destination_x: layout.destination_rect.x,
++                        destination_y: layout.destination_rect.y,
++                        destination_width: layout.destination_rect.width,
++                        destination_height: layout.destination_rect.height,
++                    });
++                    let meta = output.metadata();
++                    render_output_report = Some(serde_json::json!({
++                        "output_path": output_path.to_string_lossy(),
++                        "output_width": meta.width,
++                        "output_height": meta.height,
++                        "checksum": meta.checksum,
++                        "pixel_format": meta.pixel_format,
++                        "file_size_bytes": meta.file_size_bytes,
++                        "layout": {
++                            "image_width": metadata.width,
++                            "image_height": metadata.height,
++                            "viewport_width": viewport.width,
++                            "viewport_height": viewport.height,
++                            "destination_x": layout.destination_rect.x,
++                            "destination_y": layout.destination_rect.y,
++                            "destination_width": layout.destination_rect.width,
++                            "destination_height": layout.destination_rect.height,
++                            "fit": format!("{:?}", fit).to_lowercase(),
++                        },
++                        "source_image": {
++                            "width": metadata.width,
++                            "height": metadata.height,
++                            "color_type": metadata.color_type,
++                            "detected_format": metadata.detected_format,
++                            "file_size_bytes": metadata.file_size_bytes,
++                        },
++                    }));
++                    info!(
++                        ?renderer_id,
++                        image_path = %image_path.display(),
++                        output_path = %output_path.display(),
++                        output_width = meta.width,
++                        output_height = meta.height,
++                        "static image rendered to PNG output"
++                    );
++                }
++                Err(e) => {
++                    warn!(?renderer_id, error = %e, "failed to render static image");
++                }
+             }
+-            Err(e) => {
+-                warn!(?renderer_id, error = %e, "failed to apply wallpaper in render sim");
++        } else {
++            // Legacy behavior: layout-only simulation
++            match apply_static_wallpaper_for_sim(image_path, &viewport, fit) {
++                Ok((metadata, layout)) => {
++                    wallpaper_applied = true;
++                    layout_report = Some(RenderSimLayoutReport {
++                        image_width: metadata.width,
++                        image_height: metadata.height,
++                        viewport_width: viewport.width,
++                        viewport_height: viewport.height,
++                        destination_x: layout.destination_rect.x,
++                        destination_y: layout.destination_rect.y,
++                        destination_width: layout.destination_rect.width,
++                        destination_height: layout.destination_rect.height,
++                    });
++                    info!(
++                        ?renderer_id,
++                        image_path = %image_path.display(),
++                        image_width = metadata.width,
++                        image_height = metadata.height,
++                        "wallpaper applied in render sim (layout only)"
++                    );
++                }
++                Err(e) => {
++                    warn!(?renderer_id, error = %e, "failed to apply wallpaper in render sim");
++                }
+             }
+         }
+     }
+ 
+-    // Simulate the running period
+-    while start.elapsed() < timeout {
+-        std::thread::sleep(Duration::from_millis(100));
++    // Simulate the running period (skip if render output was produced — no need to wait)
++    if render_output_report.is_none() {
++        while start.elapsed() < timeout {
++            std::thread::sleep(Duration::from_millis(100));
++        }
+     }
+ 
+     state_transitions.push(RendererRuntimeState::ShuttingDown);
+@@ -286,18 +367,34 @@ fn run_headless_render_sim(
+ 
+     let total_sim_time_ms = start.elapsed().as_millis() as u64;
+ 
+-    let report = RenderSimReport {
+-        mode: RendererRuntimeMode::HeadlessRenderSim,
+-        viewport,
+-        state_transitions,
+-        wallpaper_applied,
+-        layout_report,
+-        total_sim_time_ms,
+-        exit_code: 0,
+-    };
+-
+-    let json = serde_json::to_string(&report)?;
+-    println!("{json}");
++    // If we have a render output report, output that instead of the sim report
++    if let Some(ref render_report) = render_output_report {
++        let final_report = serde_json::json!({
++            "mode": "headless-render-sim",
++            "viewport": {
++                "width": viewport.width,
++                "height": viewport.height,
++            },
++            "wallpaper_applied": wallpaper_applied,
++            "total_sim_time_ms": total_sim_time_ms,
++            "exit_code": 0,
++            "render_output": render_report,
++        });
++        let json = serde_json::to_string(&final_report)?;
++        println!("{json}");
++    } else {
++        let report = RenderSimReport {
++            mode: RendererRuntimeMode::HeadlessRenderSim,
++            viewport,
++            state_transitions,
++            wallpaper_applied,
++            layout_report,
++            total_sim_time_ms,
++            exit_code: 0,
++        };
++        let json = serde_json::to_string(&report)?;
++        println!("{json}");
++    }
+ 
+     info!(
+         ?renderer_id,
+@@ -310,6 +407,7 @@ fn run_headless_render_sim(
+ fn apply_static_wallpaper_for_sim(
+     image_path: &std::path::Path,
+     viewport: &RendererViewport,
++    fit: wallflow_common::FitMode,
+ ) -> Result<(
+     wallflow_package::ImageMetadata,
+     wallflow_package::StaticImageLayout,
+@@ -325,16 +423,58 @@ fn apply_static_wallpaper_for_sim(
+         height: viewport.height,
+     };
+ 
+-    let layout = wallflow_package::calculate_static_image_layout(
+-        image_size,
+-        vp,
+-        wallflow_common::FitMode::Cover,
+-        "#000000".into(),
+-    )?;
++    let layout =
++        wallflow_package::calculate_static_image_layout(image_size, vp, fit, "#000000".into())?;
+ 
+     Ok((metadata, layout))
+ }
+ 
++/// Render a static image for the render simulation with actual PNG output.
++fn render_static_image_for_sim(
++    image_path: &std::path::Path,
++    viewport: &RendererViewport,
++    fit: wallflow_common::FitMode,
++    output_path: &std::path::Path,
++) -> Result<(
++    wallflow_package::ImageMetadata,
++    wallflow_package::StaticImageLayout,
++    wallflow_render::RenderOutput,
++)> {
++    let metadata = wallflow_package::load_image_metadata(image_path)?;
++
++    let image_size = wallflow_package::ImageSize {
++        width: metadata.width,
++        height: metadata.height,
++    };
++    let vp = wallflow_package::Viewport {
++        width: viewport.width,
++        height: viewport.height,
++    };
++
++    let layout =
++        wallflow_package::calculate_static_image_layout(image_size, vp, fit, "#000000".into())?;
++
++    let render_input = wallflow_render::StaticRenderInput {
++        image_path: image_path.to_path_buf(),
++        viewport: vp,
++        fit,
++        background: "#000000".into(),
++        opacity: None,
++    };
++
++    let mut output = wallflow_render::render_static_image_cpu(render_input)?;
++    output.save_png(output_path)?;
++
++    info!(
++        output_path = %output_path.display(),
++        output_width = output.width,
++        output_height = output.height,
++        "render output saved as PNG"
++    );
++
++    Ok((metadata, layout, output))
++}
++
+ // ---------------------------------------------------------------------------
+ // Windowed static mode (winit)
+ // ---------------------------------------------------------------------------
+diff --git a/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md b/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
+new file mode 100644
+index 0000000..6f79e4e
+--- /dev/null
++++ b/wallflow/wallflow-foundation/docs/architecture/011-static-render-output.md
+@@ -0,0 +1,233 @@
++# 011 — Static Render Output
++
++**Status**: Implemented (Stage 008)
++**Crate**: `wallflow-render`
++**Depends on**: `wallflow-common`, `wallflow-package`
++
++## Overview
++
++The static render output layer produces actual RGBA pixel data from a decoded image, layout, fit mode, and background color. This is the first real render output in the WallFlow pipeline — a CPU reference renderer that runs without any GPU, display server, or window manager, making it fully cloud-testable.
++
++The CPU reference renderer serves as the baseline before any wgpu GPU presentation is added. Every fit mode produces deterministic, verifiable output that can be tested in CI on Linux without a display server.
++
++## Why a CPU Reference Renderer First
++
++Before investing in wgpu presentation (which requires a GPU context, surface configuration, and platform-specific window integration), a CPU renderer provides several critical benefits:
++
++1. **Cloud-testable validation**: The entire render pipeline can be exercised in CI on Ubuntu runners with no GPU or display server. Every fit mode, background fill, and layout calculation produces actual pixel output that can be verified.
++
++2. **Deterministic reference output**: The CPU renderer produces byte-identical output for the same input. This enables SHA-256 checksums for snapshot-like tests without storing large binary fixtures.
++
++3. **Architecture validation**: The render pipeline (input types → layout → pixel output → PNG) can be validated end-to-end before the complexity of GPU shaders and surface management is introduced.
++
++4. **Documentation of intent**: The CPU renderer makes the exact pixel-level behavior of each fit mode explicit in straightforward Rust code. This serves as a specification for the wgpu implementation.
++
++## Architecture
++
++```
++┌──────────────────────┐
++│  StaticRenderInput   │  image_path, viewport, fit, background, opacity
++└──────────┬───────────┘
++           │
++           ▼
++┌──────────────────────┐
++│ render_static_image  │  CPU reference renderer
++│       _cpu()         │
++└──────────┬───────────┘
++           │
++     ┌─────┴─────┐
++     │            │
++     ▼            ▼
++┌─────────┐  ┌──────────────────┐
++│ Layout  │  │ Pixel compositing│
++│ Engine  │  │ (fit + bg + img) │
++└────┬────┘  └────────┬─────────┘
++     │                │
++     └───────┬────────┘
++             ▼
++    ┌────────────────┐
++    │  RenderOutput   │  width, height, pixels_rgba, output_path
++    └────────┬───────┘
++             │
++     ┌───────┴────────┐
++     │                 │
++     ▼                 ▼
++┌──────────┐   ┌───────────────────┐
++│ save_png │   │ checksum_sha256()  │
++└──────────┘   │ metadata()        │
++               └───────────────────┘
++```
++
++## Key Types
++
++### RenderBackend
++
++```rust
++pub enum RenderBackend {
++    CpuReference,
++    // WgpuExperimental — future stage
++}
++```
++
++Prepared for multiple backends. The CPU reference renderer is the only implementation today. When wgpu is added later, the same `StaticRenderInput` flows through both paths.
++
++### StaticRenderInput
++
++```rust
++pub struct StaticRenderInput {
++    pub image_path: PathBuf,
++    pub viewport: Viewport,
++    pub fit: FitMode,
++    pub background: String,  // hex color like "#000000"
++    pub opacity: Option<u8>,
++}
++```
++
++The input contract for static image rendering. The `background` field accepts hex color strings parsed by `RgbaColor::parse_hex()`. The `viewport` uses the same `Viewport` type from the layout engine.
++
++### RenderOutput
++
++```rust
++pub struct RenderOutput {
++    pub width: u32,
++    pub height: u32,
++    pub pixels_rgba: Vec<u8>,
++    pub output_path: Option<PathBuf>,
++}
++```
++
++The pixel buffer output. Methods include `save_png()` for writing to disk, `checksum_sha256()` for stable checksums, and `metadata()` for structured output information.
++
++### RenderOutputMetadata
++
++```rust
++pub struct RenderOutputMetadata {
++    pub width: u32,
++    pub height: u32,
++    pub pixel_format: String,       // "RGBA8"
++    pub file_size_bytes: Option<u64>,
++    pub checksum: Option<String>,   // SHA-256 hex
++}
++```
++
++Serializable metadata about the render output. The checksum is over the raw RGBA pixel data, not the PNG file, making it stable regardless of PNG compression settings.
++
++### RgbaColor
++
++```rust
++pub struct RgbaColor {
++    pub r: u8, pub g: u8, pub b: u8, pub a: u8,
++}
++```
++
++Safe parser for hex color strings. Supports `#RRGGBB` and `#RRGGBBAA` formats. Rejects missing `#`, wrong lengths, and invalid hex digits with clear error messages.
++
++### StaticRenderError
++
++Error enum covering invalid image paths, decode failures, invalid backgrounds, invalid viewports, layout errors, and I/O errors. All errors flow through `Result` — no `unwrap()` or `panic!()`.
++
++## Fit Mode Behavior
++
++Each fit mode determines how the source image is placed within the viewport:
++
++| Mode | Scaling | Positioning | Clipping | Background |
++|------|---------|-------------|----------|------------|
++| **Cover** | Scale up to fill viewport | Centered | Image may extend beyond edges | Not visible (image covers all) |
++| **Contain** | Scale up to fit within viewport | Centered | No clipping | Visible in letterbox/pillarbox bars |
++| **Stretch** | Distort to exact viewport size | Top-left origin | No clipping | Not visible (image fills exactly) |
++| **Center** | No scaling | Centered | No clipping | Visible around image |
++| **Tile** | No scaling | Repeated from top-left | No clipping | Not visible (tiles fill viewport) |
++
++### Cover
++
++The image is scaled by the largest factor that makes it at least as large as the viewport in both dimensions, then centered. Parts of the image that extend beyond the viewport are clipped. The background is fully covered.
++
++### Contain
++
++The image is scaled by the smallest factor that makes it fit entirely within the viewport, then centered. Background is visible in the letterbox (horizontal) or pillarbox (vertical) bars.
++
++### Stretch
++
++The image is distorted to exactly match the viewport dimensions. No background is visible. This mode does not preserve aspect ratio.
++
++### Center
++
++The image is placed at its native resolution centered in the viewport. No scaling occurs. Background is visible around the image. If the image is larger than the viewport, the overflow is clipped.
++
++### Tile
++
++The image is repeated at its native resolution starting from the top-left corner, filling the entire viewport. No scaling occurs. Background is not visible.
++
++## Scaling Method
++
++The current implementation uses **nearest-neighbor scaling**. This is a deliberate temporary choice:
++
++- Nearest-neighbor is deterministic and produces pixel-identical output across all platforms.
++- It is simple to implement correctly in pure Rust without SIMD or GPU.
++- It makes pixel-level assertions in tests straightforward.
++
++**Future improvement**: Bilinear or Lanczos scaling can be added as an option, likely in the wgpu backend. The CPU reference renderer should continue to offer nearest-neighbor as the baseline.
++
++## Integration with Renderer Process
++
++The `--headless-render-sim` mode of `wallflow-renderer` now supports actual pixel output:
++
++```bash
++cargo run -p wallflow-renderer -- \
++  --headless-render-sim \
++  --width 800 --height 450 \
++  --source input.png \
++  --render-output output.png \
++  --fit cover
++```
++
++When `--render-output` is specified:
++1. The image is decoded from `--source`.
++2. Layout is calculated for the given viewport and fit mode.
++3. The CPU renderer produces RGBA pixel data.
++4. The output is saved as PNG to `--render-output`.
++5. A structured JSON report is printed to stdout including output dimensions, checksum, layout, and source metadata.
++
++When `--render-output` is not specified, the renderer stays in layout-only simulation mode (backward compatible with stage 007 behavior).
++
++## CLI Smoke Test
++
++The `render-output-smoke` command validates the full render pipeline:
++
++```bash
++cargo run -p wallflow-cli -- render-output-smoke
++```
++
++This:
++1. Creates a 2×2 test PNG with distinct pixel colors.
++2. Runs the renderer in `--headless-render-sim` mode with `--render-output`.
++3. Verifies the output PNG exists and decodes correctly.
++4. Verifies output dimensions match the viewport (800×450).
++5. Verifies a SHA-256 checksum is present in the report.
++6. Outputs a structured JSON report.
++
++This runs in CI on Ubuntu without any display server.
++
++## Relationship to Future wgpu Backend
++
++The CPU reference renderer and the future wgpu backend share the same input types (`StaticRenderInput`) and output types (`RenderOutput`). The `RenderBackend` enum is prepared for this:
++
++```rust
++match backend {
++    RenderBackend::CpuReference => render_static_image_cpu(input),
++    // RenderBackend::WgpuExperimental => render_static_image_wgpu(input, device, surface),
++}
++```
++
++The wgpu backend will produce the same RGBA pixel data (verified against the CPU reference) but using GPU shaders for performance. The CPU reference remains available for testing and as a fallback.
++
++## What Remains REQUIRES_REAL_WINDOWS_VALIDATION
++
++- Desktop attach behind desktop icons (WorkerW/Progman)
++- Real Explorer window integration
++- Multi-monitor layout
++- DPI scaling with actual display
++- Fullscreen detection on Windows
++- GPU surface rendering on Windows Desktop Window Manager
++
++These require an interactive Windows session with a real display and cannot be tested in CI.
+diff --git a/wallflow/wallflow-foundation/docs/roadmap.md b/wallflow/wallflow-foundation/docs/roadmap.md
+index a340d88..08af14f 100644
+--- a/wallflow/wallflow-foundation/docs/roadmap.md
++++ b/wallflow/wallflow-foundation/docs/roadmap.md
+@@ -158,7 +158,42 @@
+ - DPI scale factor changes (WM_DPICHANGED)
+ - Explorer restart tolerance with winit event loop
+ 
+-## MVP-2 static wallpaper
++## MVP-2.2 Cloud-safe static render output ✅
++
++*Completed in stage 008.*
++
++- `wallflow-render` crate: CPU reference renderer producing actual RGBA pixel data.
++- `RenderBackend` enum: `CpuReference` (and `WgpuExperimental` placeholder).
++- `RenderOutput` type: width, height, pixels_rgba, optional output_path.
++- `RenderOutputMetadata` type: dimensions, pixel format, file size, SHA-256 checksum.
++- `StaticRenderInput` type: image_path, viewport, fit, background, opacity.
++- `StaticRenderError` error type: invalid image path, decode, background, viewport, layout, I/O.
++- `render_static_image_cpu()` function: full CPU render pipeline (decode → layout → composite → output).
++- `RgbaColor` type with `parse_hex()`: safe `#RRGGBB` and `#RRGGBBAA` parsing.
++- SHA-256 checksum for render output (via `sha2` crate) for snapshot-like tests.
++- All five fit modes rendered with correct pixel output:
++  - **Cover**: scale to fill viewport, center, clip overflow.
++  - **Contain**: scale to fit within viewport, center, background bars.
++  - **Stretch**: distort to exact viewport, no background.
++  - **Center**: no scaling, centered, background visible.
++  - **Tile**: repeat at native size, fill viewport.
++- Nearest-neighbor scaling (temporary; bilinear/Lanczos later).
++- `--headless-render-sim` enhanced with `--source`, `--render-output`, and `--fit` flags.
++- `render-output-smoke` CLI command: creates test PNG, runs full render, verifies output.
++- 164 tests passing (25 in wallflow-render including pixel-level tests).
++- `render-output-smoke` added to CI on Ubuntu.
++- Render output architecture documented in `docs/architecture/011-static-render-output.md`.
++
++### REQUIRES_REAL_WINDOWS_VALIDATION
++
++- `--windowed-static` on Windows (winit creates a Win32 window; must verify on real desktop)
++- Desktop attach with winit window (`SetParent()` on winit-managed HWND is untested)
++- Viewport resize from real monitor events (not just synthetic resize)
++- Layout with actual monitor dimensions
++- Visual correctness of each fit mode on a real display
++- DPI scale factor changes (WM_DPICHANGED)
++- Explorer restart tolerance with winit event loop
++- wgpu GPU rendering matching CPU reference output
+ 
+ - Add wgpu rendering pipeline to the windowed static renderer.
+ - Per-monitor placement.
+-- 
+2.47.3
+

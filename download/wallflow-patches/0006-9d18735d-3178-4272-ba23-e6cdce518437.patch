@@ -1,0 +1,317 @@
+From a06eed586f68b1d599c4fdb0ae28441a5383594c Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 14:40:57 +0000
+Subject: [PATCH 06/10] 9d18735d-3178-4272-ba23-e6cdce518437
+
+---
+ .../crates/wallflow-render/src/renderer.rs    | 39 ++++++--------
+ .../007-cloud-validation-strategy.md          | 51 ++++++++++++++-----
+ .../009-static-image-rendering-model.md       | 19 ++++++-
+ 3 files changed, 73 insertions(+), 36 deletions(-)
+
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs b/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+index ac4f23a..136b691 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-render/src/renderer.rs
+@@ -30,7 +30,9 @@ pub struct StaticRenderInput {
+ /// 7. Returns the `RenderOutput`.
+ ///
+ /// Uses nearest-neighbor scaling (temporary; bilinear/Lanczos can be added later).
+-pub fn render_static_image_cpu(input: StaticRenderInput) -> Result<RenderOutput, StaticRenderError> {
++pub fn render_static_image_cpu(
++    input: StaticRenderInput,
++) -> Result<RenderOutput, StaticRenderError> {
+     // Validate viewport
+     if input.viewport.width == 0 || input.viewport.height == 0 {
+         return Err(StaticRenderError::InvalidViewport {
+@@ -40,8 +42,8 @@ pub fn render_static_image_cpu(input: StaticRenderInput) -> Result<RenderOutput,
+     }
+ 
+     // Parse background color
+-    let bg_color = RgbaColor::parse_hex(&input.background)
+-        .map_err(StaticRenderError::InvalidBackground)?;
++    let bg_color =
++        RgbaColor::parse_hex(&input.background).map_err(StaticRenderError::InvalidBackground)?;
+ 
+     // Open and decode image
+     let img = image::open(&input.image_path).map_err(|e| {
+@@ -278,7 +280,6 @@ mod tests {
+ 
+     #[test]
+     fn render_cover_creates_correct_output_dimensions() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(
+@@ -312,7 +313,6 @@ mod tests {
+ 
+     #[test]
+     fn render_contain_creates_correct_output_dimensions() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
+@@ -335,7 +335,6 @@ mod tests {
+ 
+     #[test]
+     fn render_stretch_creates_correct_output_dimensions() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
+@@ -358,7 +357,6 @@ mod tests {
+ 
+     #[test]
+     fn render_center_creates_correct_output_dimensions() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
+@@ -381,7 +379,6 @@ mod tests {
+ 
+     #[test]
+     fn render_tile_creates_correct_output_dimensions() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
+@@ -427,7 +424,6 @@ mod tests {
+ 
+     #[test]
+     fn invalid_background_fails() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
+@@ -455,7 +451,6 @@ mod tests {
+ 
+     #[test]
+     fn checksum_stable() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([128, 64, 32, 255]); 4]);
+@@ -491,7 +486,6 @@ mod tests {
+ 
+     #[test]
+     fn output_png_roundtrip() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([255, 0, 0, 255]); 4]);
+@@ -521,7 +515,6 @@ mod tests {
+ 
+     #[test]
+     fn stretch_2x2_into_4x4_pixels() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         // 2x2 image: red, green, blue, white
+@@ -530,9 +523,9 @@ mod tests {
+             2,
+             2,
+             &[
+-                image::Rgba([255, 0, 0, 255]),   // top-left: red
+-                image::Rgba([0, 255, 0, 255]),   // top-right: green
+-                image::Rgba([0, 0, 255, 255]),   // bottom-left: blue
++                image::Rgba([255, 0, 0, 255]),     // top-left: red
++                image::Rgba([0, 255, 0, 255]),     // top-right: green
++                image::Rgba([0, 0, 255, 255]),     // bottom-left: blue
+                 image::Rgba([255, 255, 255, 255]), // bottom-right: white
+             ],
+         );
+@@ -562,7 +555,6 @@ mod tests {
+ 
+     #[test]
+     fn center_2x2_into_4x4_pixels() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(
+@@ -603,7 +595,6 @@ mod tests {
+ 
+     #[test]
+     fn contain_with_background() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         // 2x2 square image into 4x2 viewport (wider than tall)
+@@ -636,7 +627,11 @@ mod tests {
+ 
+         // Pixel (0,0) should be green background (left padding)
+         let px = get_pixel(&output, 0, 0);
+-        assert_eq!(px, [0, 255, 0, 255], "pixel (0,0) should be green background");
++        assert_eq!(
++            px,
++            [0, 255, 0, 255],
++            "pixel (0,0) should be green background"
++        );
+ 
+         // Pixel (1,0) should be red (left edge of contained image)
+         let px = get_pixel(&output, 1, 0);
+@@ -645,7 +640,6 @@ mod tests {
+ 
+     #[test]
+     fn tile_into_5x5_pixels() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         // 2x2 image: each pixel a distinct color
+@@ -654,9 +648,9 @@ mod tests {
+             2,
+             2,
+             &[
+-                image::Rgba([255, 0, 0, 255]),   // (0,0) red
+-                image::Rgba([0, 255, 0, 255]),   // (1,0) green
+-                image::Rgba([0, 0, 255, 255]),   // (0,1) blue
++                image::Rgba([255, 0, 0, 255]),     // (0,0) red
++                image::Rgba([0, 255, 0, 255]),     // (1,0) green
++                image::Rgba([0, 0, 255, 255]),     // (0,1) blue
+                 image::Rgba([255, 255, 255, 255]), // (1,1) white
+             ],
+         );
+@@ -704,7 +698,6 @@ mod tests {
+ 
+     #[test]
+     fn render_output_metadata() {
+-        let dir = unique_test_dir();
+         let dir = unique_test_dir();
+         let img_path = dir.join("test.png");
+         create_test_png(&img_path, 2, 2, &[image::Rgba([0, 0, 0, 255]); 4]);
+diff --git a/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md b/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+index 094d86d..0df3867 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
++++ b/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+@@ -39,7 +39,12 @@ full IPC command/event lifecycle or the full renderer lifecycle via piped stdio.
+   Paused → Resume → Resumed → Shutdown → Exited)
+ - `--headless-heartbeat` renderer mode (legacy stdout text mode)
+ - `--headless-render-sim` renderer mode (full lifecycle + layout, no display server)
++- `--headless-render-sim --source --render-output --fit` mode (actual pixel rendering + PNG output)
+ - `render-sim-smoke` CLI command (renderer lifecycle + wallpaper apply + layout verification)
++- `render-output-smoke` CLI command (full render pipeline: test PNG → CPU render → verify output PNG)
++- CPU reference renderer producing actual RGBA pixel data for all fit modes
++- SHA-256 checksum stability tests
++- Pixel-level rendering tests (stretch, center, contain, tile)
+ 
+ ### Tier 3: Windows Compile-Check (CI)
+ 
+@@ -87,16 +92,19 @@ The GitHub Actions Windows runner provides a much simpler solution.
+ │  1. cargo fmt --all -- --check            │
+ │  2. cargo check --workspace               │
+ │  3. cargo clippy (strict)                 │
+-│  4. cargo test --workspace (67 tests)      │
++│  4. cargo test --workspace (164 tests)     │
+ └──────────────────────────────────────────┘
+ 
+ ┌──────────────────────────────────────────┐
+-│        Ubuntu Runner (IPC smoke)          │
++│     Ubuntu Runner (IPC + render smoke)    │
+ │                                           │
+ │  1. cargo build -p wallflow-renderer      │
+ │  2. cargo build -p wallflow-cli           │
+ │  3. ipc-supervisor-smoke (typed IPC)      │
+-│  4. legacy headless heartbeat smoke       │
++│  4. apply-static-smoke (wallpaper apply)  │
++│  5. render-sim-smoke (full lifecycle)     │
++│  6. render-output-smoke (pixel render)    │
++│  7. legacy headless heartbeat smoke       │
+ └──────────────────────────────────────────┘
+ 
+ ┌──────────────────────────────────────────┐
+@@ -216,23 +224,42 @@ cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 3 --width 1920 --he
+ 
+ ### CI Integration
+ 
+-The `render-sim-smoke` command should be added to the Ubuntu CI runner after
+-the existing IPC smoke tests:
++The `render-sim-smoke` and `render-output-smoke` commands run on the Ubuntu
++CI runner after the existing IPC smoke tests:
+ 
+ ```
+ ┌──────────────────────────────────────────┐
+-│        Ubuntu Runner (IPC + render sim)   │
++│   Ubuntu Runner (IPC + render smoke)      │
+ │                                           │
+ │  1. cargo build -p wallflow-renderer      │
+ │  2. cargo build -p wallflow-cli           │
+ │  3. ipc-supervisor-smoke (typed IPC)      │
+-│  4. legacy headless heartbeat smoke       │
++│  4. apply-static-smoke (wallpaper apply)  │
+ │  5. render-sim-smoke (full lifecycle)     │
++│  6. render-output-smoke (pixel render)    │
++│  7. legacy headless heartbeat smoke       │
+ └──────────────────────────────────────────┘
+ ```
+ 
+-This test runs in seconds and requires no special hardware, display server,
+-or GPU — making it ideal for every pull request and merge to main.
++These tests run in seconds and require no special hardware, display server,
++or GPU — making them ideal for every pull request and merge to main.
++
++## Render Output Smoke Test (render-output-smoke)
++
++The `render-output-smoke` CLI command validates the full CPU render pipeline
++end-to-end: it creates a 2×2 test PNG with distinct pixel colors, runs the
++renderer in `--headless-render-sim` mode with `--source` and `--render-output`,
++then verifies:
++
++1. The output PNG file exists on disk.
++2. The output PNG decodes successfully with the `image` crate.
++3. The output dimensions match the specified viewport (800×450).
++4. A SHA-256 checksum is present in the structured report.
++5. The renderer process exits with code 0.
++
++This test exercises the complete render path from image decode through layout
++calculation to pixel compositing and PNG serialization. It is the most
++comprehensive cloud-testable validation of the rendering pipeline.
+ 
+ ## Marking Convention
+ 
+@@ -252,6 +279,6 @@ This marker appears in:
+ 
+ ## Next Steps
+ 
+-- **Stage 008**: Add wgpu rendering pipeline to the windowed static renderer
+-- **Stage 009**: Connect desktop attach to winit window on Windows
+-- **Stage 010**: Real Windows validation with manual testing on Win10/11
++- **Stage 009**: Add wgpu rendering pipeline to the windowed static renderer
++- **Stage 010**: Connect desktop attach to winit window on Windows
++- **Stage 011**: Real Windows validation with manual testing on Win10/11
+diff --git a/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md b/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+index 8c75ed8..fc5bbd1 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
++++ b/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+@@ -169,12 +169,29 @@ In the current implementation, the renderer uses a synthetic viewport of
+ When real Windows desktop integration is implemented, the viewport will be
+ sourced from `MonitorInfo.size_px`.
+ 
++## Render Output (CPU Reference)
++
++The layout calculation described above determines *where* and *how large* the image should be drawn, but does not produce actual pixels. The render output layer in `wallflow-render` takes the layout result and composites real RGBA pixel data.
++
++For full details, see `docs/architecture/011-static-render-output.md`.
++
++The render pipeline is:
++
++1. **Image Decode** — `load_image_metadata()` reads dimensions (as above).
++2. **Full Pixel Decode** — `image::open()` loads the full pixel data and converts to RGBA8.
++3. **Layout Calculation** — `calculate_static_image_layout()` computes the destination rectangle (as above).
++4. **Pixel Compositing** — `render_static_image_cpu()` fills the viewport buffer with the background color, then draws the image according to the fit mode using nearest-neighbor scaling.
++5. **Output** — The resulting `RenderOutput` contains the RGBA pixel buffer, and can be saved as PNG or checksummed with SHA-256.
++
++The CPU reference renderer is fully cloud-testable. It validates that each fit mode produces the correct pixel output, including background fill, clipping, and tiling, without requiring a GPU or display server.
++
+ ## REQUIRES_REAL_WINDOWS_VALIDATION
+ 
+ The following items require validation on a real Windows environment:
+ 
+ - Layout with actual monitor dimensions (not synthetic 1920×1080)
+-- Visual correctness of each fit mode (cover cropping, contain letterboxing,
++- Visual correctness of each fit mode on a real display (cover cropping, contain letterboxing,
+   stretch distortion, center positioning, tile tiling)
+ - Background color rendering in contain/center modes
+ - Clip behavior when destination rect extends beyond viewport
++- GPU-rendered output matching the CPU reference output
+-- 
+2.47.3
+

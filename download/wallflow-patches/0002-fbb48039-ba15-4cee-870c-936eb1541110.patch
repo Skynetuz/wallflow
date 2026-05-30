@@ -1,0 +1,2204 @@
+From b68e7d8f5487a34ef99c22493b6a7e43f6c34a30 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 12:29:46 +0000
+Subject: [PATCH 02/10] fbb48039-ba15-4cee-870c-936eb1541110
+
+---
+ .../.github/workflows/ci.yml                  |   5 +
+ wallflow/wallflow-foundation/Cargo.toml       |   3 +-
+ .../crates/wallflow-cli/Cargo.toml            |   2 +
+ .../crates/wallflow-cli/src/main.rs           | 315 ++++++++++++++-
+ .../crates/wallflow-common/src/wallpaper.rs   |   6 +
+ .../crates/wallflow-core/src/supervisor.rs    | 159 ++++++++
+ .../crates/wallflow-ipc/src/protocol.rs       | 269 ++++++++++++-
+ .../crates/wallflow-package/Cargo.toml        |  12 +
+ .../crates/wallflow-package/src/error.rs      |  32 ++
+ .../crates/wallflow-package/src/lib.rs        |  27 ++
+ .../crates/wallflow-package/src/manifest.rs   | 255 ++++++++++++
+ .../crates/wallflow-package/src/validation.rs | 367 ++++++++++++++++++
+ .../crates/wallflow-renderer/src/main.rs      |  84 +++-
+ .../docs/architecture/002-ipc-contract.md     |  61 ++-
+ .../architecture/003-renderer-lifecycle.md    |  41 +-
+ .../008-wallpaper-package-format.md           | 162 ++++++++
+ wallflow/wallflow-foundation/docs/roadmap.md  |  23 ++
+ worklog.md                                    |  26 ++
+ 18 files changed, 1811 insertions(+), 38 deletions(-)
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+ create mode 100644 wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+
+diff --git a/wallflow/wallflow-foundation/.github/workflows/ci.yml b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+index 3e97257..74d9132 100644
+--- a/wallflow/wallflow-foundation/.github/workflows/ci.yml
++++ b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+@@ -101,6 +101,11 @@ jobs:
+           cargo run -p wallflow-cli -- ipc-supervisor-smoke --timeout-secs 10 --heartbeat-interval-ms 500
+           echo "IPC supervisor smoke test completed"
+ 
++      - name: Apply static smoke test
++        run: |
++          cargo run -p wallflow-cli -- apply-static-smoke --timeout-secs 10 --heartbeat-interval-ms 500
++          echo "Apply static smoke test completed"
++
+       - name: Legacy headless heartbeat smoke
+         run: |
+           timeout 15 ./target/debug/wallflow-renderer --headless-heartbeat --heartbeat-interval-ms 500 --timeout-secs 5 || true
+diff --git a/wallflow/wallflow-foundation/Cargo.toml b/wallflow/wallflow-foundation/Cargo.toml
+index 54da033..d3fe45b 100644
+--- a/wallflow/wallflow-foundation/Cargo.toml
++++ b/wallflow/wallflow-foundation/Cargo.toml
+@@ -9,7 +9,8 @@ members = [
+   "crates/wallflow-media",
+   "crates/wallflow-core",
+   "crates/wallflow-renderer",
+-  "crates/wallflow-cli"
++  "crates/wallflow-cli",
++  "crates/wallflow-package"
+ ]
+ 
+ [workspace.package]
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+index 8823149..dc4cc68 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+@@ -14,10 +14,12 @@ tokio.workspace = true
+ tracing.workspace = true
+ tracing-subscriber.workspace = true
+ wallflow-config = { path = "../wallflow-config" }
++wallflow-common = { path = "../wallflow-common" }
+ wallflow-core = { path = "../wallflow-core" }
+ wallflow-desktop = { path = "../wallflow-desktop" }
+ wallflow-ipc = { path = "../wallflow-ipc" }
+ wallflow-monitor = { path = "../wallflow-monitor" }
++wallflow-package = { path = "../wallflow-package" }
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.58", features = [
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+index 6b5b8c4..08c1117 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+@@ -57,6 +57,19 @@ enum Command {
+         #[arg(long, default_value_t = 500)]
+         heartbeat_interval_ms: u64,
+     },
++
++    /// Create a test wallpaper package, validate it, launch a renderer in
++    /// --ipc-stdio mode, apply the static wallpaper, and report results.
++    /// This is the cloud-testable wallpaper apply integration test.
++    ApplyStaticSmoke {
++        /// How many seconds to let the renderer run before declaring success.
++        #[arg(long, default_value_t = 10)]
++        timeout_secs: u64,
++
++        /// Renderer heartbeat interval in milliseconds.
++        #[arg(long, default_value_t = 500)]
++        heartbeat_interval_ms: u64,
++    },
+ }
+ 
+ fn main() -> Result<()> {
+@@ -105,6 +118,12 @@ fn main() -> Result<()> {
+         } => {
+             run_ipc_supervisor_smoke(timeout_secs, heartbeat_interval_ms)?;
+         }
++        Command::ApplyStaticSmoke {
++            timeout_secs,
++            heartbeat_interval_ms,
++        } => {
++            run_apply_static_smoke(timeout_secs, heartbeat_interval_ms)?;
++        }
+     }
+ 
+     Ok(())
+@@ -721,8 +740,11 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+                                 RendererEvent::Error { renderer_id, message } => {
+                                     eprintln!("  [{:.1}s] Error from renderer {}: {}", elapsed.as_secs_f64(), renderer_id, message);
+                                 }
+-                                RendererEvent::WallpaperApplied { renderer_id, monitor_id } => {
+-                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, monitor_id.0);
++                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id, monitor_id } => {
++                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, wallpaper_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, wallpaper_id, monitor_id.0);
++                                }
++                                RendererEvent::WallpaperApplyFailed { renderer_id, wallpaper_id, error } => {
++                                    eprintln!("  [{:.1}s] WallpaperApplyFailed (renderer_id: {}, wallpaper_id: {}, error: {:?})", elapsed.as_secs_f64(), renderer_id, wallpaper_id, error);
+                                 }
+                             }
+                         }
+@@ -862,3 +884,292 @@ async fn send_ipc_command<W: tokio::io::AsyncWrite + Unpin>(
+     writer.flush().await?;
+     Ok(())
+ }
++
++// ---------------------------------------------------------------------------
++// Apply static smoke test
++// ---------------------------------------------------------------------------
++
++/// Apply static smoke test: creates a test wallpaper package, validates it,
++/// launches a renderer in --ipc-stdio mode, applies the wallpaper, and
++/// reports results.
++///
++/// The test flow:
++/// 1. Create a temporary test wallpaper package (manifest.json + dummy image)
++/// 2. Load and validate the package via wallflow-package
++/// 3. Spawn renderer with --ipc-stdio
++/// 4. Wait for Started + Ready events
++/// 5. Send ApplyWallpaper with real static image payload
++/// 6. Wait for WallpaperApplied event
++/// 7. Send Shutdown command
++/// 8. Wait for Exited event
++/// 9. Print structured JSON report
++fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
++    use std::process::Stdio;
++    use tokio::process::Command;
++    use tokio::time;
++    use wallflow_common::{MonitorId, WallpaperId};
++    use wallflow_ipc::{
++        ApplyWallpaperRequest, FitMode as IpcFitMode, RendererCommand, RendererEvent,
++        StaticImagePayload, WallpaperPayload,
++    };
++    use wallflow_package::{
++        validate_manifest, validate_package, FitMode as PackageFitMode, StaticImageWallpaper,
++        WallpaperKind, WallpaperManifest, WallpaperPackage, WallpaperPackageVersion,
++    };
++
++    let rt = tokio::runtime::Runtime::new()?;
++    rt.block_on(async {
++        let start = Instant::now();
++
++        // Step 1: Create a temporary test wallpaper package
++        let temp_dir = std::env::temp_dir().join("wallflow-apply-static-smoke");
++        let _ = std::fs::remove_dir_all(&temp_dir);
++        std::fs::create_dir_all(temp_dir.join("content"))?;
++
++        let manifest = WallpaperManifest {
++            schema_version: 0,
++            id: "test-static-wallpaper".into(),
++            title: "Test Static Wallpaper".into(),
++            description: "A test static wallpaper for WallFlow apply-smoke".into(),
++            author: "WallFlow CLI".into(),
++            kind: WallpaperKind::StaticImage,
++            entry: StaticImageWallpaper {
++                image: "content/wallpaper.png".into(),
++                fit: PackageFitMode::Cover,
++                background: "#000000".into(),
++                opacity: None,
++            },
++            preview: None,
++            tags: vec!["test".into(), "static".into(), "mvp".into()],
++            version: Some(WallpaperPackageVersion::new("0.1.0")),
++        };
++
++        let manifest_json = serde_json::to_string_pretty(&manifest)?;
++        std::fs::write(temp_dir.join("manifest.json"), &manifest_json)?;
++
++        // Create a dummy image file (1x1 PNG-like bytes for fixture purposes)
++        // NOTE: This is not a real PNG. Real image decoding will come in stage 006.
++        let dummy_image_data = b"WALLFLOW-DUMMY-IMAGE-FIXURE";
++        std::fs::write(temp_dir.join("content/wallpaper.png"), dummy_image_data)?;
++
++        println!("=== Apply Static Smoke Test ===");
++        println!("Test package dir: {}", temp_dir.display());
++
++        // Step 2: Load and validate the package
++        let package = WallpaperPackage::load(&temp_dir)?;
++        let manifest_report = validate_manifest(&package.manifest);
++        if !manifest_report.valid {
++            eprintln!("Manifest validation failed: {:?}", manifest_report.errors);
++            anyhow::bail!("manifest validation failed");
++        }
++        println!("Package validation: OK (id={})", package.manifest.id);
++
++        let package_report = validate_package(&package);
++        if !package_report.valid {
++            eprintln!("Package validation failed: {:?}", package_report.errors);
++            anyhow::bail!("package validation failed");
++        }
++        println!("Full package validation: OK");
++
++        // Step 3: Spawn renderer with --ipc-stdio
++        let renderer_exe = find_renderer_exe()?;
++        println!("Renderer exe: {}", renderer_exe.display());
++        println!(
++            "Timeout: {}s, Heartbeat interval: {}ms",
++            timeout_secs, heartbeat_interval_ms
++        );
++
++        let mut child = Command::new(&renderer_exe)
++            .arg("--ipc-stdio")
++            .arg("--heartbeat-interval-ms")
++            .arg(heartbeat_interval_ms.to_string())
++            .arg("--timeout-secs")
++            .arg(timeout_secs.to_string())
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
++
++        let pid = child.id();
++        println!("Renderer spawned (PID: {:?})", pid);
++
++        let stdin = child
++            .stdin
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdin"))?;
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
++
++        let mut stdin_writer = tokio::io::BufWriter::new(stdin);
++        let mut stdout_reader = tokio::io::BufReader::new(stdout);
++
++        let mut started_received = false;
++        let mut ready_received = false;
++        let mut wallpaper_applied_received = false;
++        let mut exited_received = false;
++        let mut apply_failed_received = false;
++        let mut shutdown_sent = false;
++
++        let wallpaper_id = WallpaperId::new();
++        let image_path = temp_dir
++            .join("content/wallpaper.png")
++            .to_string_lossy()
++            .to_string();
++
++        let deadline = time::sleep(Duration::from_secs(timeout_secs + 10));
++        tokio::pin!(deadline);
++
++        loop {
++            tokio::select! {
++                _ = &mut deadline => {
++                    eprintln!("Apply static smoke timed out");
++                    let _ = child.kill().await;
++                    break;
++                }
++                result = read_ipc_frame(&mut stdout_reader) => {
++                    match result {
++                        Ok(Some(event)) => {
++                            let elapsed = start.elapsed();
++                            match &event {
++                                RendererEvent::Started { renderer_id } => {
++                                    started_received = true;
++                                    println!("  [{:.1}s] Started (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
++                                }
++                                RendererEvent::Ready { renderer_id } => {
++                                    ready_received = true;
++                                    println!("  [{:.1}s] Ready (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
++                                    // Send ApplyWallpaper as soon as renderer is ready
++                                    if !wallpaper_applied_received && !apply_failed_received {
++                                        println!("  [{:.1}s] Sending ApplyWallpaper command...", elapsed.as_secs_f64());
++                                        let request = ApplyWallpaperRequest {
++                                            wallpaper_id,
++                                            payload: WallpaperPayload::StaticImage(StaticImagePayload {
++                                                image_path: image_path.clone(),
++                                                fit: IpcFitMode::Cover,
++                                                background: "#000000".into(),
++                                                opacity: None,
++                                            }),
++                                            target_monitor: MonitorId("primary".into()),
++                                        };
++                                        send_ipc_command(&mut stdin_writer, RendererCommand::ApplyWallpaper(request)).await?;
++                                    }
++                                }
++                                RendererEvent::Heartbeat { renderer_id, uptime_ms } => {
++                                    println!("  [{:.1}s] Heartbeat (uptime: {}ms, renderer_id: {})", elapsed.as_secs_f64(), uptime_ms, renderer_id);
++                                }
++                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id: wid, monitor_id } => {
++                                    wallpaper_applied_received = true;
++                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, wallpaper_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, wid, monitor_id.0);
++                                    // Now send Shutdown
++                                    if !shutdown_sent {
++                                        println!("  [{:.1}s] Sending Shutdown command...", elapsed.as_secs_f64());
++                                        send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
++                                        shutdown_sent = true;
++                                    }
++                                }
++                                RendererEvent::WallpaperApplyFailed { renderer_id, wallpaper_id: wid, error } => {
++                                    apply_failed_received = true;
++                                    eprintln!("  [{:.1}s] WallpaperApplyFailed (renderer_id: {}, wallpaper_id: {}, error: {:?})", elapsed.as_secs_f64(), renderer_id, wid, error);
++                                    // Still send shutdown
++                                    if !shutdown_sent {
++                                        send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
++                                        shutdown_sent = true;
++                                    }
++                                }
++                                RendererEvent::Paused { renderer_id } => {
++                                    println!("  [{:.1}s] Paused (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
++                                }
++                                RendererEvent::Resumed { renderer_id } => {
++                                    println!("  [{:.1}s] Resumed (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
++                                }
++                                RendererEvent::Exited { renderer_id, exit_code } => {
++                                    exited_received = true;
++                                    println!("  [{:.1}s] Exited (exit_code: {:?}, renderer_id: {})", elapsed.as_secs_f64(), exit_code, renderer_id);
++                                    break;
++                                }
++                                RendererEvent::Error { renderer_id, message } => {
++                                    eprintln!("  [{:.1}s] Error from renderer {}: {}", elapsed.as_secs_f64(), renderer_id, message);
++                                }
++                            }
++                        }
++                        Ok(None) => { break; }
++                        Err(e) => {
++                            eprintln!("Error reading IPC frame: {e}");
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++
++        drop(stdin_writer);
++
++        // Wait for the process to exit
++        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
++            Ok(Ok(status)) => Some(status),
++            Ok(Err(e)) => {
++                eprintln!("Error waiting for renderer: {e}");
++                None
++            }
++            Err(_) => {
++                eprintln!("Renderer did not exit in time, killing");
++                let _ = child.kill().await;
++                None
++            }
++        };
++
++        let total_elapsed = start.elapsed();
++        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
++
++        let success = process_exit_code == Some(0)
++            && started_received
++            && ready_received
++            && wallpaper_applied_received
++            && !apply_failed_received
++            && exited_received;
++
++        let report = serde_json::json!({
++            "test": "apply-static-smoke",
++            "success": success,
++            "total_elapsed_ms": total_elapsed.as_millis() as u64,
++            "renderer_pid": pid,
++            "process_exit_code": process_exit_code,
++            "wallpaper_id": wallpaper_id.to_string(),
++            "package_id": package.manifest.id,
++            "image_path": image_path,
++            "events": {
++                "started_received": started_received,
++                "ready_received": ready_received,
++                "wallpaper_applied_received": wallpaper_applied_received,
++                "apply_failed_received": apply_failed_received,
++                "exited_received": exited_received,
++            },
++            "config": {
++                "timeout_secs": timeout_secs,
++                "heartbeat_interval_ms": heartbeat_interval_ms,
++            }
++        });
++
++        println!("\n=== Apply Static Smoke Report ===");
++        println!("{}", serde_json::to_string_pretty(&report)?);
++
++        if success {
++            println!("\nApply static smoke test PASSED.");
++        } else {
++            eprintln!("\nApply static smoke test FAILED.");
++            if !started_received { eprintln!("  Missing: Started event"); }
++            if !ready_received { eprintln!("  Missing: Ready event"); }
++            if !wallpaper_applied_received { eprintln!("  Missing: WallpaperApplied event"); }
++            if apply_failed_received { eprintln!("  Unexpected: WallpaperApplyFailed event"); }
++            if !exited_received { eprintln!("  Missing: Exited event"); }
++        }
++
++        // Clean up temp directory
++        let _ = std::fs::remove_dir_all(&temp_dir);
++
++        Ok(())
++    })
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs
+index 36db133..47822bc 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/src/wallpaper.rs
+@@ -19,6 +19,12 @@ impl Default for WallpaperId {
+     }
+ }
+ 
++impl std::fmt::Display for WallpaperId {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "{}", self.0)
++    }
++}
++
+ /// Supported wallpaper kinds for the MVP and near-future versions.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub enum WallpaperKind {
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs b/wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs
+index 4001724..c3043ae 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-core/src/supervisor.rs
+@@ -32,6 +32,12 @@ pub enum SupervisorError {
+ 
+     #[error("renderer {0} already assigned to monitor {1:?}")]
+     AlreadyAssigned(RendererId, MonitorId),
++
++    #[error("wallpaper apply failed for renderer {0}: {1}")]
++    ApplyFailed(RendererId, String),
++
++    #[error("renderer {0} is not running, cannot apply wallpaper")]
++    NotRunning(RendererId),
+ }
+ 
+ /// Current status of a single renderer within the supervisor.
+@@ -98,6 +104,8 @@ struct RendererEntry {
+     restart_count: u32,
+     restart_window_start: Instant,
+     launched_at: Instant,
++    /// The wallpaper currently applied to this renderer (if any).
++    applied_wallpaper_id: Option<wallflow_common::WallpaperId>,
+ }
+ 
+ /// Report for a single renderer, used for structured output.
+@@ -175,6 +183,7 @@ impl RendererSupervisor {
+             restart_count: 0,
+             restart_window_start: Instant::now(),
+             launched_at: Instant::now(),
++            applied_wallpaper_id: None,
+         };
+         self.entries.insert(renderer_id, entry);
+         debug!(?renderer_id, ?monitor_id, "renderer registered");
+@@ -495,6 +504,89 @@ impl RendererSupervisor {
+             .ok_or(SupervisorError::RendererNotFound(renderer_id))
+             .map(|e| e.restart_count)
+     }
++
++    /// Request a wallpaper apply for a renderer.
++    ///
++    /// Validates that the renderer is in a running or paused state before
++    /// accepting the apply request. Returns the renderer handle if the
++    /// request is valid. The caller is responsible for sending the actual
++    /// IPC command to the renderer process.
++    pub fn apply_wallpaper(
++        &mut self,
++        renderer_id: RendererId,
++        wallpaper_id: wallflow_common::WallpaperId,
++    ) -> Result<RendererHandle, SupervisorError> {
++        let entry = self
++            .entries
++            .get_mut(&renderer_id)
++            .ok_or(SupervisorError::RendererNotFound(renderer_id))?;
++
++        if entry.status != RendererStatus::Running
++            && entry.status != RendererStatus::Paused
++            && entry.status != RendererStatus::Stale
++        {
++            return Err(SupervisorError::NotRunning(renderer_id));
++        }
++
++        entry.applied_wallpaper_id = Some(wallpaper_id);
++        info!(?renderer_id, ?wallpaper_id, "wallpaper apply requested");
++        Ok(RendererHandle {
++            renderer_id,
++            monitor_id: entry.assignment.monitor_id.clone(),
++            status: entry.status.clone(),
++        })
++    }
++
++    /// Record that a wallpaper was successfully applied to a renderer.
++    pub fn mark_wallpaper_applied(
++        &mut self,
++        renderer_id: RendererId,
++    ) -> Result<RendererHandle, SupervisorError> {
++        let entry = self
++            .entries
++            .get(&renderer_id)
++            .ok_or(SupervisorError::RendererNotFound(renderer_id))?;
++        debug!(
++            ?renderer_id,
++            wallpaper_id = ?entry.applied_wallpaper_id,
++            "wallpaper apply confirmed"
++        );
++        Ok(RendererHandle {
++            renderer_id,
++            monitor_id: entry.assignment.monitor_id.clone(),
++            status: entry.status.clone(),
++        })
++    }
++
++    /// Record that a wallpaper apply failed for a renderer.
++    pub fn mark_wallpaper_apply_failed(
++        &mut self,
++        renderer_id: RendererId,
++        reason: String,
++    ) -> Result<RendererHandle, SupervisorError> {
++        let entry = self
++            .entries
++            .get_mut(&renderer_id)
++            .ok_or(SupervisorError::RendererNotFound(renderer_id))?;
++        entry.applied_wallpaper_id = None;
++        warn!(?renderer_id, %reason, "wallpaper apply failed");
++        Ok(RendererHandle {
++            renderer_id,
++            monitor_id: entry.assignment.monitor_id.clone(),
++            status: entry.status.clone(),
++        })
++    }
++
++    /// Get the currently applied wallpaper ID for a renderer.
++    pub fn applied_wallpaper(
++        &self,
++        renderer_id: RendererId,
++    ) -> Result<Option<wallflow_common::WallpaperId>, SupervisorError> {
++        self.entries
++            .get(&renderer_id)
++            .ok_or(SupervisorError::RendererNotFound(renderer_id))
++            .map(|e| e.applied_wallpaper_id)
++    }
+ }
+ 
+ impl Default for RendererSupervisor {
+@@ -771,4 +863,71 @@ mod tests {
+             RendererHealth::Stale
+         );
+     }
++
++    #[test]
++    fn apply_wallpaper_state_transition() {
++        let mut supervisor = RendererSupervisor::new();
++        let assignment = test_assignment();
++        let rid = assignment.renderer_id;
++        let wid = wallflow_common::WallpaperId::new();
++
++        supervisor.register_renderer(assignment);
++        supervisor.mark_running(rid).expect("running");
++
++        let handle = supervisor.apply_wallpaper(rid, wid).expect("apply");
++        assert_eq!(handle.status, RendererStatus::Running);
++
++        // The wallpaper_id should be recorded
++        let applied = supervisor.applied_wallpaper(rid).expect("get applied");
++        assert_eq!(applied, Some(wid));
++    }
++
++    #[test]
++    fn apply_wallpaper_rejects_non_running() {
++        let mut supervisor = RendererSupervisor::new();
++        let assignment = test_assignment();
++        let rid = assignment.renderer_id;
++        let wid = wallflow_common::WallpaperId::new();
++
++        supervisor.register_renderer(assignment);
++        // Still in Starting state — cannot apply
++        let result = supervisor.apply_wallpaper(rid, wid);
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn mark_wallpaper_applied_success() {
++        let mut supervisor = RendererSupervisor::new();
++        let assignment = test_assignment();
++        let rid = assignment.renderer_id;
++        let wid = wallflow_common::WallpaperId::new();
++
++        supervisor.register_renderer(assignment);
++        supervisor.mark_running(rid).expect("running");
++        supervisor.apply_wallpaper(rid, wid).expect("apply");
++
++        let handle = supervisor.mark_wallpaper_applied(rid).expect("confirmed");
++        assert_eq!(handle.status, RendererStatus::Running);
++    }
++
++    #[test]
++    fn mark_wallpaper_apply_failed_clears_applied() {
++        let mut supervisor = RendererSupervisor::new();
++        let assignment = test_assignment();
++        let rid = assignment.renderer_id;
++        let wid = wallflow_common::WallpaperId::new();
++
++        supervisor.register_renderer(assignment);
++        supervisor.mark_running(rid).expect("running");
++        supervisor.apply_wallpaper(rid, wid).expect("apply");
++
++        let handle = supervisor
++            .mark_wallpaper_apply_failed(rid, "image not found".into())
++            .expect("failed mark");
++        assert_eq!(handle.status, RendererStatus::Running);
++
++        // Applied wallpaper should be cleared
++        let applied = supervisor.applied_wallpaper(rid).expect("get applied");
++        assert_eq!(applied, None);
++    }
+ }
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
+index 4b3727f..7ded5d3 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
+@@ -1,11 +1,12 @@
+ use serde::{Deserialize, Serialize};
+ use uuid::Uuid;
+-use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperAssignment};
++use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperId};
+ 
+ /// IPC protocol version. Increment on breaking changes.
+ /// Version 2 added the new RendererCommand/RendererEvent/CoreCommand/CoreEvent types.
+ /// Version 3 adds the IpcMessage tagged union for unambiguous frame decoding.
+-pub const PROTOCOL_VERSION: u16 = 3;
++/// Version 4 adds ApplyWallpaperRequest, StaticImagePayload, WallpaperApplyError.
++pub const PROTOCOL_VERSION: u16 = 4;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub struct RequestId(pub Uuid);
+@@ -136,6 +137,99 @@ impl<T> Envelope<T> {
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Wallpaper apply types (IPC payloads)
++// ---------------------------------------------------------------------------
++
++/// How a static image should be fitted to the screen.
++/// Mirrors `wallflow_package::FitMode` but defined independently in the IPC
++/// layer so that the renderer does not need to depend on wallflow-package.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum FitMode {
++    #[default]
++    Cover,
++    Contain,
++    Stretch,
++    Center,
++    Tile,
++}
++
++impl std::fmt::Display for FitMode {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            FitMode::Cover => write!(f, "cover"),
++            FitMode::Contain => write!(f, "contain"),
++            FitMode::Stretch => write!(f, "stretch"),
++            FitMode::Center => write!(f, "center"),
++            FitMode::Tile => write!(f, "tile"),
++        }
++    }
++}
++
++/// Payload for a static image wallpaper apply request.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct StaticImagePayload {
++    /// Absolute or package-relative path to the image file.
++    pub image_path: String,
++    /// How the image should be fitted to the screen.
++    #[serde(default)]
++    pub fit: FitMode,
++    /// Background color as a CSS color string (e.g., "#000000").
++    #[serde(default = "default_background_color")]
++    pub background: String,
++    /// Optional opacity (0-255). None means fully opaque.
++    #[serde(default)]
++    pub opacity: Option<u8>,
++}
++
++fn default_background_color() -> String {
++    "#000000".into()
++}
++
++/// The kind of wallpaper payload being applied.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "kind", content = "data")]
++pub enum WallpaperPayload {
++    /// Static image wallpaper.
++    #[serde(rename = "static_image")]
++    StaticImage(StaticImagePayload),
++}
++
++/// A request to apply a wallpaper to a renderer.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct ApplyWallpaperRequest {
++    /// The wallpaper ID being applied.
++    pub wallpaper_id: WallpaperId,
++    /// The wallpaper payload (kind + data).
++    pub payload: WallpaperPayload,
++    /// The target monitor for this wallpaper.
++    pub target_monitor: MonitorId,
++}
++
++/// Options for applying a wallpaper.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
++pub struct WallpaperApplyOptions {
++    /// Whether to transition immediately or wait for the next frame.
++    #[serde(default)]
++    pub immediate: bool,
++}
++
++/// Error that can occur when applying a wallpaper.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub enum WallpaperApplyError {
++    /// The wallpaper kind is not supported by this renderer.
++    UnsupportedKind { kind: String },
++    /// The image path is empty or invalid.
++    InvalidImagePath { path: String },
++    /// The image file could not be loaded.
++    ImageLoadFailed { path: String, reason: String },
++    /// The renderer is not in a state that allows applying wallpapers.
++    InvalidRendererState { state: String },
++    /// A generic error occurred.
++    Other { message: String },
++}
++
+ // ---------------------------------------------------------------------------
+ // Core ↔ Renderer typed protocol
+ // ---------------------------------------------------------------------------
+@@ -151,8 +245,8 @@ pub enum RendererCommand {
+     Resume,
+     /// Stop rendering and release resources.
+     Stop,
+-    /// Apply a new wallpaper assignment to this renderer.
+-    ApplyWallpaper(WallpaperAssignment),
++    /// Apply a new wallpaper to this renderer with full typed payload.
++    ApplyWallpaper(ApplyWallpaperRequest),
+     /// Assign the renderer to a different monitor.
+     SetMonitor { monitor_id: MonitorId },
+     /// Graceful shutdown request.
+@@ -178,8 +272,15 @@ pub enum RendererEvent {
+     /// Wallpaper has been successfully applied and is rendering.
+     WallpaperApplied {
+         renderer_id: RendererId,
++        wallpaper_id: WallpaperId,
+         monitor_id: MonitorId,
+     },
++    /// An error occurred while applying a wallpaper.
++    WallpaperApplyFailed {
++        renderer_id: RendererId,
++        wallpaper_id: WallpaperId,
++        error: WallpaperApplyError,
++    },
+     /// Renderer encountered an error.
+     Error {
+         renderer_id: RendererId,
+@@ -196,7 +297,7 @@ pub enum RendererEvent {
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub enum CoreCommand {
+     /// Apply a wallpaper to a specific monitor, launching a renderer if needed.
+-    ApplyWallpaperToMonitor(WallpaperAssignment),
++    ApplyWallpaperToMonitor(ApplyWallpaperRequest),
+     /// Stop the wallpaper on a specific monitor.
+     StopWallpaper { monitor_id: MonitorId },
+     /// Pause all active renderers.
+@@ -277,6 +378,7 @@ pub fn renderer_event_id(event: &RendererEvent) -> RendererId {
+         RendererEvent::Paused { renderer_id } => *renderer_id,
+         RendererEvent::Resumed { renderer_id } => *renderer_id,
+         RendererEvent::WallpaperApplied { renderer_id, .. } => *renderer_id,
++        RendererEvent::WallpaperApplyFailed { renderer_id, .. } => *renderer_id,
+         RendererEvent::Error { renderer_id, .. } => *renderer_id,
+         RendererEvent::Exited { renderer_id, .. } => *renderer_id,
+     }
+@@ -287,12 +389,141 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn renderer_command_roundtrip_json() {
+-        let cmd = RendererCommand::ApplyWallpaper(WallpaperAssignment {
++    fn renderer_command_apply_wallpaper_roundtrip() {
++        let cmd = RendererCommand::ApplyWallpaper(ApplyWallpaperRequest {
++            wallpaper_id: WallpaperId::new(),
++            payload: WallpaperPayload::StaticImage(StaticImagePayload {
++                image_path: "/path/to/wallpaper.png".into(),
++                fit: FitMode::Cover,
++                background: "#000000".into(),
++                opacity: None,
++            }),
++            target_monitor: MonitorId("mon-1".into()),
++        });
++        let json = serde_json::to_string(&cmd).expect("serialize");
++        let decoded: RendererCommand = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(cmd, decoded);
++    }
++
++    #[test]
++    fn renderer_event_wallpaper_applied_roundtrip() {
++        let event = RendererEvent::WallpaperApplied {
++            renderer_id: RendererId::new(),
++            wallpaper_id: WallpaperId::new(),
+             monitor_id: MonitorId("mon-1".into()),
+-            wallpaper_id: wallflow_common::WallpaperId::new(),
+-            kind: wallflow_common::WallpaperKind::None,
+-            profile: wallflow_common::PerformanceProfile::Balanced,
++        };
++        let json = serde_json::to_string(&event).expect("serialize");
++        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(event, decoded);
++    }
++
++    #[test]
++    fn renderer_event_wallpaper_apply_failed_roundtrip() {
++        let event = RendererEvent::WallpaperApplyFailed {
++            renderer_id: RendererId::new(),
++            wallpaper_id: WallpaperId::new(),
++            error: WallpaperApplyError::UnsupportedKind {
++                kind: "video".into(),
++            },
++        };
++        let json = serde_json::to_string(&event).expect("serialize");
++        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(event, decoded);
++    }
++
++    #[test]
++    fn wallpaper_apply_error_serialization() {
++        let errors = vec![
++            WallpaperApplyError::UnsupportedKind { kind: "web".into() },
++            WallpaperApplyError::InvalidImagePath { path: "".into() },
++            WallpaperApplyError::ImageLoadFailed {
++                path: "/missing.png".into(),
++                reason: "not found".into(),
++            },
++            WallpaperApplyError::InvalidRendererState {
++                state: "starting".into(),
++            },
++            WallpaperApplyError::Other {
++                message: "something went wrong".into(),
++            },
++        ];
++        for error in errors {
++            let json = serde_json::to_string(&error).expect("serialize");
++            let decoded: WallpaperApplyError = serde_json::from_str(&json).expect("deserialize");
++            assert_eq!(error, decoded);
++        }
++    }
++
++    #[test]
++    fn fit_mode_roundtrip() {
++        let modes = vec![
++            FitMode::Cover,
++            FitMode::Contain,
++            FitMode::Stretch,
++            FitMode::Center,
++            FitMode::Tile,
++        ];
++        for mode in modes {
++            let json = serde_json::to_string(&mode).expect("serialize");
++            let decoded: FitMode = serde_json::from_str(&json).expect("deserialize");
++            assert_eq!(mode, decoded);
++        }
++    }
++
++    #[test]
++    fn static_image_payload_roundtrip() {
++        let payload = StaticImagePayload {
++            image_path: "content/wallpaper.png".into(),
++            fit: FitMode::Contain,
++            background: "#1a1a2e".into(),
++            opacity: Some(200),
++        };
++        let json = serde_json::to_string(&payload).expect("serialize");
++        let decoded: StaticImagePayload = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(payload, decoded);
++    }
++
++    #[test]
++    fn wallpaper_payload_roundtrip() {
++        let payload = WallpaperPayload::StaticImage(StaticImagePayload {
++            image_path: "test.png".into(),
++            fit: FitMode::default(),
++            background: "#000000".into(),
++            opacity: None,
++        });
++        let json = serde_json::to_string(&payload).expect("serialize");
++        let decoded: WallpaperPayload = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(payload, decoded);
++    }
++
++    #[test]
++    fn apply_wallpaper_request_roundtrip() {
++        let req = ApplyWallpaperRequest {
++            wallpaper_id: WallpaperId::new(),
++            payload: WallpaperPayload::StaticImage(StaticImagePayload {
++                image_path: "/test/wallpaper.png".into(),
++                fit: FitMode::Cover,
++                background: "#000000".into(),
++                opacity: None,
++            }),
++            target_monitor: MonitorId("primary".into()),
++        };
++        let json = serde_json::to_string(&req).expect("serialize");
++        let decoded: ApplyWallpaperRequest = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(req, decoded);
++    }
++
++    #[test]
++    fn renderer_command_roundtrip_json() {
++        let cmd = RendererCommand::ApplyWallpaper(ApplyWallpaperRequest {
++            wallpaper_id: WallpaperId::new(),
++            payload: WallpaperPayload::StaticImage(StaticImagePayload {
++                image_path: "/path/to/image.png".into(),
++                fit: FitMode::Cover,
++                background: "#000000".into(),
++                opacity: None,
++            }),
++            target_monitor: MonitorId("mon-1".into()),
+         });
+         let json = serde_json::to_string(&cmd).expect("serialize");
+         let decoded: RendererCommand = serde_json::from_str(&json).expect("deserialize");
+@@ -312,15 +543,15 @@ mod tests {
+ 
+     #[test]
+     fn core_command_roundtrip_json() {
+-        let cmd = CoreCommand::ApplyWallpaperToMonitor(WallpaperAssignment {
+-            monitor_id: MonitorId("mon-2".into()),
+-            wallpaper_id: wallflow_common::WallpaperId::new(),
+-            kind: wallflow_common::WallpaperKind::Video {
+-                path: std::path::PathBuf::from("/test.mp4"),
+-                muted: true,
+-                looping: true,
+-            },
+-            profile: wallflow_common::PerformanceProfile::Quality,
++        let cmd = CoreCommand::ApplyWallpaperToMonitor(ApplyWallpaperRequest {
++            wallpaper_id: WallpaperId::new(),
++            payload: WallpaperPayload::StaticImage(StaticImagePayload {
++                image_path: "/test.mp4".into(),
++                fit: FitMode::Stretch,
++                background: "#111111".into(),
++                opacity: None,
++            }),
++            target_monitor: MonitorId("mon-2".into()),
+         });
+         let json = serde_json::to_string(&cmd).expect("serialize");
+         let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize");
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+new file mode 100644
+index 0000000..c3a783d
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "wallflow-package"
++version = "0.1.0"
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++
++[dependencies]
++serde = { workspace = true, features = ["derive"] }
++serde_json.workspace = true
++thiserror.workspace = true
++tracing.workspace = true
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+new file mode 100644
+index 0000000..2d314a8
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+@@ -0,0 +1,32 @@
++use thiserror::Error;
++
++/// Errors that can occur during wallpaper package operations.
++#[derive(Debug, Error)]
++pub enum WallpaperPackageError {
++    #[error("invalid manifest: {0}")]
++    InvalidManifest(String),
++
++    #[error("unsupported schema version: {0}")]
++    UnsupportedSchemaVersion(u32),
++
++    #[error("unsupported wallpaper kind: {0}")]
++    UnsupportedKind(String),
++
++    #[error("missing required field: {0}")]
++    MissingField(String),
++
++    #[error("asset not found: {0}")]
++    AssetNotFound(String),
++
++    #[error("path traversal detected: {0}")]
++    PathTraversal(String),
++
++    #[error("io error: {0}")]
++    Io(#[from] std::io::Error),
++
++    #[error("json error: {0}")]
++    Json(#[from] serde_json::Error),
++
++    #[error("validation failed: {errors:?}")]
++    Validation { errors: Vec<String> },
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+new file mode 100644
+index 0000000..7fa3ebb
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+@@ -0,0 +1,27 @@
++//! Wallpaper package format for WallFlow.
++//!
++//! This crate defines the wallpaper package format (manifest v0), validation
++//! logic, and loading/parsing utilities. Packages are cloud-testable and do
++//! not depend on any platform-specific code.
++//!
++//! ## Package Format v0
++//!
++//! A wallpaper package is a directory containing:
++//!
++//! - `manifest.json`: Describes the wallpaper (kind, entry, preview, etc.)
++//! - `content/`: Directory with wallpaper assets (images, etc.)
++//! - `preview.png`: Optional preview image
++//!
++//! ## Security
++//!
++//! All asset paths must be relative and inside the package directory.
++//! Path traversal (e.g., `../`) is rejected to prevent reading files outside
++//! the package directory.
++
++mod error;
++mod manifest;
++mod validation;
++
++pub use error::WallpaperPackageError;
++pub use manifest::*;
++pub use validation::{validate_manifest, validate_package, WallpaperValidationReport};
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+new file mode 100644
+index 0000000..4c85de9
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+@@ -0,0 +1,255 @@
++use serde::{Deserialize, Serialize};
++
++use crate::error::WallpaperPackageError;
++
++/// Current manifest schema version.
++pub const MANIFEST_SCHEMA_VERSION: u32 = 0;
++
++/// Supported schema versions for parsing.
++pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[0];
++
++/// Unique identifier for a wallpaper package.
++#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub struct WallpaperPackageId(pub String);
++
++impl WallpaperPackageId {
++    pub fn new(id: impl Into<String>) -> Self {
++        Self(id.into())
++    }
++}
++
++/// Semantic version for a wallpaper package.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct WallpaperPackageVersion(pub String);
++
++impl WallpaperPackageVersion {
++    pub fn new(version: impl Into<String>) -> Self {
++        Self(version.into())
++    }
++}
++
++impl Default for WallpaperPackageVersion {
++    fn default() -> Self {
++        Self("0.1.0".into())
++    }
++}
++
++/// The kind of wallpaper, as declared in the package manifest.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum WallpaperKind {
++    StaticImage,
++    Video,
++    Web,
++}
++
++impl std::fmt::Display for WallpaperKind {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            WallpaperKind::StaticImage => write!(f, "static_image"),
++            WallpaperKind::Video => write!(f, "video"),
++            WallpaperKind::Web => write!(f, "web"),
++        }
++    }
++}
++
++/// How a static image should be fitted to the screen.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum FitMode {
++    #[default]
++    Cover,
++    Contain,
++    Stretch,
++    Center,
++    Tile,
++}
++
++impl std::fmt::Display for FitMode {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            FitMode::Cover => write!(f, "cover"),
++            FitMode::Contain => write!(f, "contain"),
++            FitMode::Stretch => write!(f, "stretch"),
++            FitMode::Center => write!(f, "center"),
++            FitMode::Tile => write!(f, "tile"),
++        }
++    }
++}
++
++/// Static image wallpaper entry configuration.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct StaticImageWallpaper {
++    /// Path to the image file, relative to the package root.
++    pub image: String,
++    /// How the image should be fitted to the screen.
++    #[serde(default)]
++    pub fit: FitMode,
++    /// Background color as a CSS color string (e.g., "#000000").
++    #[serde(default = "default_background")]
++    pub background: String,
++    /// Optional opacity (0-255). None means fully opaque.
++    #[serde(default)]
++    pub opacity: Option<u8>,
++}
++
++fn default_background() -> String {
++    "#000000".into()
++}
++
++/// A wallpaper asset referenced by the manifest.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct WallpaperAsset {
++    /// Relative path within the package directory.
++    pub path: String,
++    /// Optional MIME type hint.
++    #[serde(default)]
++    pub mime_type: Option<String>,
++}
++
++/// A preview image for the wallpaper.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct WallpaperPreview {
++    /// Relative path to the preview image within the package.
++    pub path: String,
++}
++
++/// Setting schema entry for future user-configurable options.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct WallpaperSettingSchema {
++    /// Setting key name.
++    pub key: String,
++    /// Human-readable label.
++    pub label: String,
++    /// Setting type (e.g., "bool", "range", "color").
++    pub kind: String,
++    /// Default value as a JSON value.
++    #[serde(default)]
++    pub default: Option<serde_json::Value>,
++}
++
++/// The wallpaper package manifest (v0).
++///
++/// This is the root document that describes a wallpaper package. It is
++/// stored as `manifest.json` in the package root directory.
++///
++/// # Example
++///
++/// ```json
++/// {
++///   "schema_version": 0,
++///   "id": "example-static-wallpaper",
++///   "title": "Example Static Wallpaper",
++///   "description": "Static wallpaper package for WallFlow MVP.",
++///   "author": "WallFlow",
++///   "kind": "static_image",
++///   "entry": {
++///     "image": "content/wallpaper.png",
++///     "fit": "cover",
++///     "background": "#000000"
++///   },
++///   "preview": "preview.png",
++///   "tags": ["static", "mvp"]
++/// }
++/// ```
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct WallpaperManifest {
++    /// Schema version of the manifest format.
++    pub schema_version: u32,
++    /// Unique identifier for this wallpaper package.
++    pub id: String,
++    /// Human-readable title.
++    pub title: String,
++    /// Human-readable description.
++    #[serde(default)]
++    pub description: String,
++    /// Author or publisher name.
++    #[serde(default)]
++    pub author: String,
++    /// Wallpaper kind declared at the top level for quick filtering.
++    pub kind: WallpaperKind,
++    /// Entry point configuration (kind-specific).
++    pub entry: StaticImageWallpaper,
++    /// Relative path to preview image (optional).
++    #[serde(default)]
++    pub preview: Option<String>,
++    /// Tags for categorization and search.
++    #[serde(default)]
++    pub tags: Vec<String>,
++    /// Package version (optional for v0).
++    #[serde(default)]
++    pub version: Option<WallpaperPackageVersion>,
++}
++
++/// A loaded wallpaper package (manifest + resolved directory path).
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct WallpaperPackage {
++    /// The resolved directory path of the package.
++    pub directory: std::path::PathBuf,
++    /// The parsed manifest.
++    pub manifest: WallpaperManifest,
++}
++
++impl WallpaperPackage {
++    /// Load and parse a wallpaper package from the given directory.
++    ///
++    /// Reads `manifest.json` from the directory, parses it, and returns
++    /// a `WallpaperPackage` with the resolved path and manifest.
++    pub fn load(directory: &std::path::Path) -> Result<Self, WallpaperPackageError> {
++        let manifest_path = directory.join("manifest.json");
++        let content = std::fs::read_to_string(&manifest_path)?;
++        let manifest: WallpaperManifest = serde_json::from_str(&content)?;
++
++        Ok(Self {
++            directory: directory.to_path_buf(),
++            manifest,
++        })
++    }
++
++    /// Parse a manifest from a JSON string.
++    pub fn parse_manifest(json: &str) -> Result<WallpaperManifest, WallpaperPackageError> {
++        let manifest: WallpaperManifest = serde_json::from_str(json)?;
++        Ok(manifest)
++    }
++
++    /// Resolve an asset path relative to the package directory.
++    ///
++    /// Returns an error if the path attempts traversal outside the package.
++    pub fn resolve_asset_path(
++        &self,
++        relative_path: &str,
++    ) -> Result<std::path::PathBuf, WallpaperPackageError> {
++        validate_relative_path(relative_path)?;
++        Ok(self.directory.join(relative_path))
++    }
++}
++
++/// Validate that a relative path does not contain path traversal sequences.
++pub fn validate_relative_path(path: &str) -> Result<(), WallpaperPackageError> {
++    // Reject absolute paths
++    if std::path::Path::new(path).is_absolute() {
++        return Err(WallpaperPackageError::PathTraversal(format!(
++            "absolute path not allowed: {path}"
++        )));
++    }
++
++    // Reject path traversal components
++    let components = std::path::Path::new(path).components();
++    for component in components {
++        match component {
++            std::path::Component::ParentDir => {
++                return Err(WallpaperPackageError::PathTraversal(format!(
++                    "path traversal (..) not allowed: {path}"
++                )));
++            }
++            std::path::Component::RootDir => {
++                return Err(WallpaperPackageError::PathTraversal(format!(
++                    "root directory reference not allowed: {path}"
++                )));
++            }
++            _ => {}
++        }
++    }
++
++    Ok(())
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+new file mode 100644
+index 0000000..bbf4f8d
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+@@ -0,0 +1,367 @@
++use serde::{Deserialize, Serialize};
++use tracing::{debug, warn};
++
++use crate::manifest::{
++    validate_relative_path, WallpaperKind, WallpaperManifest, SUPPORTED_SCHEMA_VERSIONS,
++};
++
++/// Result of validating a wallpaper manifest or package.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct WallpaperValidationReport {
++    /// Whether the validation passed with no errors.
++    pub valid: bool,
++    /// List of error messages (empty if valid).
++    pub errors: Vec<String>,
++    /// List of warning messages (non-fatal issues).
++    pub warnings: Vec<String>,
++    /// The package ID that was validated.
++    pub package_id: String,
++    /// The kind declared in the manifest.
++    pub kind: String,
++}
++
++impl WallpaperValidationReport {
++    fn new(package_id: &str, kind: &str) -> Self {
++        Self {
++            valid: true,
++            errors: Vec::new(),
++            warnings: Vec::new(),
++            package_id: package_id.to_string(),
++            kind: kind.to_string(),
++        }
++    }
++
++    fn add_error(&mut self, message: String) {
++        self.valid = false;
++        self.errors.push(message);
++    }
++
++    fn add_warning(&mut self, message: String) {
++        self.warnings.push(message);
++    }
++}
++
++/// Validate a parsed manifest without checking filesystem paths.
++///
++/// Checks:
++/// - Schema version is supported
++/// - Required fields are present (id, title, kind)
++/// - Wallpaper kind is supported for this version
++/// - Entry image path is not empty
++/// - All asset paths are relative and do not contain traversal
++pub fn validate_manifest(manifest: &WallpaperManifest) -> WallpaperValidationReport {
++    let mut report = WallpaperValidationReport::new(&manifest.id, &manifest.kind.to_string());
++
++    // Schema version
++    if !SUPPORTED_SCHEMA_VERSIONS.contains(&manifest.schema_version) {
++        report.add_error(format!(
++            "unsupported schema_version: {} (supported: {:?})",
++            manifest.schema_version, SUPPORTED_SCHEMA_VERSIONS
++        ));
++    }
++
++    // Required fields
++    if manifest.id.trim().is_empty() {
++        report.add_error("missing required field: id".into());
++    }
++    if manifest.title.trim().is_empty() {
++        report.add_error("missing required field: title".into());
++    }
++
++    // Kind support
++    match &manifest.kind {
++        WallpaperKind::StaticImage => {
++            // Validate entry
++            if manifest.entry.image.trim().is_empty() {
++                report.add_error("static_image entry requires a non-empty 'image' path".into());
++            }
++        }
++        WallpaperKind::Video => {
++            report.add_error(format!(
++                "unsupported wallpaper kind for v0: {} (video support coming in a future version)",
++                manifest.kind
++            ));
++        }
++        WallpaperKind::Web => {
++            report.add_error(format!(
++                "unsupported wallpaper kind for v0: {} (web support coming in a future version)",
++                manifest.kind
++            ));
++        }
++    }
++
++    // Validate entry image path for traversal
++    if !manifest.entry.image.trim().is_empty() {
++        if let Err(e) = validate_relative_path(&manifest.entry.image) {
++            report.add_error(format!("entry image path is invalid: {e}"));
++        }
++    }
++
++    // Validate preview path if present
++    if let Some(preview) = &manifest.preview {
++        if preview.trim().is_empty() {
++            report.add_warning("preview path is specified but empty".into());
++        } else if let Err(e) = validate_relative_path(preview) {
++            report.add_error(format!("preview path is invalid: {e}"));
++        }
++    }
++
++    if report.valid {
++        debug!(package_id = %manifest.id, "manifest validation passed");
++    } else {
++        warn!(package_id = %manifest.id, errors = ?report.errors, "manifest validation failed");
++    }
++
++    report
++}
++
++/// Validate a full wallpaper package, including filesystem checks.
++///
++/// In addition to all manifest checks, this also verifies:
++/// - Entry asset file exists
++/// - Preview file exists (if specified)
++pub fn validate_package(package: &crate::WallpaperPackage) -> WallpaperValidationReport {
++    let mut report = validate_manifest(&package.manifest);
++
++    // Check entry image exists
++    if !package.manifest.entry.image.trim().is_empty() {
++        let image_path = package.directory.join(&package.manifest.entry.image);
++        if !image_path.exists() {
++            report.add_error(format!(
++                "entry image file not found: {} (resolved to {})",
++                package.manifest.entry.image,
++                image_path.display()
++            ));
++        }
++    }
++
++    // Check preview exists if specified
++    if let Some(preview) = &package.manifest.preview {
++        if !preview.trim().is_empty() {
++            let preview_path = package.directory.join(preview);
++            if !preview_path.exists() {
++                report.add_warning(format!(
++                    "preview file not found: {} (resolved to {})",
++                    preview,
++                    preview_path.display()
++                ));
++            }
++        }
++    }
++
++    report
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::manifest::*;
++
++    fn valid_static_manifest() -> WallpaperManifest {
++        WallpaperManifest {
++            schema_version: 0,
++            id: "test-static".into(),
++            title: "Test Static Wallpaper".into(),
++            description: "A test wallpaper".into(),
++            author: "Test".into(),
++            kind: WallpaperKind::StaticImage,
++            entry: StaticImageWallpaper {
++                image: "content/wallpaper.png".into(),
++                fit: FitMode::Cover,
++                background: "#000000".into(),
++                opacity: None,
++            },
++            preview: Some("preview.png".into()),
++            tags: vec!["test".into()],
++            version: None,
++        }
++    }
++
++    #[test]
++    fn valid_manifest_parses() {
++        let manifest = valid_static_manifest();
++        let report = validate_manifest(&manifest);
++        assert!(
++            report.valid,
++            "expected valid, got errors: {:?}",
++            report.errors
++        );
++        assert_eq!(report.package_id, "test-static");
++    }
++
++    #[test]
++    fn missing_id_fails() {
++        let mut manifest = valid_static_manifest();
++        manifest.id = "".into();
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("id")));
++    }
++
++    #[test]
++    fn missing_title_fails() {
++        let mut manifest = valid_static_manifest();
++        manifest.title = "".into();
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("title")));
++    }
++
++    #[test]
++    fn unsupported_schema_version_fails() {
++        let mut manifest = valid_static_manifest();
++        manifest.schema_version = 99;
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("schema_version")));
++    }
++
++    #[test]
++    fn unsupported_video_kind_fails() {
++        let mut manifest = valid_static_manifest();
++        manifest.kind = WallpaperKind::Video;
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("video")));
++    }
++
++    #[test]
++    fn unsupported_web_kind_fails() {
++        let mut manifest = valid_static_manifest();
++        manifest.kind = WallpaperKind::Web;
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("web")));
++    }
++
++    #[test]
++    fn path_traversal_in_image_rejected() {
++        let mut manifest = valid_static_manifest();
++        manifest.entry.image = "../etc/passwd".into();
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report
++            .errors
++            .iter()
++            .any(|e| e.contains("traversal") || e.contains("invalid")));
++    }
++
++    #[test]
++    fn empty_image_path_fails() {
++        let mut manifest = valid_static_manifest();
++        manifest.entry.image = "".into();
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("image")));
++    }
++
++    #[test]
++    fn preview_is_optional() {
++        let mut manifest = valid_static_manifest();
++        manifest.preview = None;
++        let report = validate_manifest(&manifest);
++        assert!(
++            report.valid,
++            "preview should be optional, got errors: {:?}",
++            report.errors
++        );
++    }
++
++    #[test]
++    fn fit_mode_serialization() {
++        let fit = FitMode::Cover;
++        let json = serde_json::to_string(&fit).expect("serialize");
++        assert_eq!(json, "\"cover\"");
++
++        let fit = FitMode::Contain;
++        let json = serde_json::to_string(&fit).expect("serialize");
++        assert_eq!(json, "\"contain\"");
++    }
++
++    #[test]
++    fn fit_mode_deserialization() {
++        let fit: FitMode = serde_json::from_str("\"cover\"").expect("deserialize");
++        assert_eq!(fit, FitMode::Cover);
++
++        let fit: FitMode = serde_json::from_str("\"stretch\"").expect("deserialize");
++        assert_eq!(fit, FitMode::Stretch);
++    }
++
++    #[test]
++    fn manifest_json_roundtrip() {
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        let decoded: WallpaperManifest = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(manifest, decoded);
++    }
++
++    #[test]
++    fn path_traversal_absolute_rejected() {
++        let result = validate_relative_path("/etc/passwd");
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn path_traversal_parent_dir_rejected() {
++        let result = validate_relative_path("../../secret");
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn valid_relative_path_ok() {
++        let result = validate_relative_path("content/wallpaper.png");
++        assert!(result.is_ok());
++    }
++
++    #[test]
++    fn preview_path_traversal_rejected() {
++        let mut manifest = valid_static_manifest();
++        manifest.preview = Some("../../secret.png".into());
++        let report = validate_manifest(&manifest);
++        assert!(!report.valid);
++        assert!(report
++            .errors
++            .iter()
++            .any(|e| e.contains("traversal") || e.contains("invalid")));
++    }
++
++    #[test]
++    fn validate_package_missing_image_file() {
++        let dir = std::env::temp_dir().join("wallflow-test-missing-image");
++        let _ = std::fs::create_dir_all(&dir);
++        let _ = std::fs::remove_file(dir.join("manifest.json"));
++        let _ = std::fs::remove_dir_all(dir.join("content"));
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package(&package);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("not found")));
++    }
++
++    #[test]
++    fn validate_package_with_image_file() {
++        let dir = std::env::temp_dir().join("wallflow-test-with-image");
++        let _ = std::fs::create_dir_all(dir.join("content"));
++        let _ = std::fs::create_dir_all(&dir);
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++        // Create a dummy image file
++        std::fs::write(dir.join("content/wallpaper.png"), b"fake-png-data").expect("write image");
++        // Create a dummy preview file
++        std::fs::write(dir.join("preview.png"), b"fake-preview-data").expect("write preview");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package(&package);
++        assert!(
++            report.valid,
++            "expected valid, got errors: {:?}",
++            report.errors
++        );
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+index bef7ff1..c25dfec 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+@@ -5,8 +5,11 @@ use std::path::PathBuf;
+ use std::time::{Duration, Instant};
+ use tracing::{info, warn};
+ use uuid::Uuid;
+-use wallflow_common::RendererId;
+-use wallflow_ipc::{encode_to_bytes, EventEnvelope, IpcMessage, RendererCommand, RendererEvent};
++use wallflow_common::{RendererId, WallpaperId};
++use wallflow_ipc::{
++    encode_to_bytes, ApplyWallpaperRequest, EventEnvelope, IpcMessage, RendererCommand,
++    RendererEvent, WallpaperApplyError, WallpaperPayload,
++};
+ use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
+ 
+ #[derive(Debug, Parser)]
+@@ -60,6 +63,20 @@ struct Args {
+     ipc_stdio: bool,
+ }
+ 
++// ---------------------------------------------------------------------------
++// Applied wallpaper state
++// ---------------------------------------------------------------------------
++
++/// Tracks the currently applied wallpaper in the renderer process.
++#[derive(Debug, Clone)]
++#[allow(dead_code)] // Fields will be read when GPU rendering is implemented (stage 006)
++struct AppliedWallpaperState {
++    wallpaper_id: WallpaperId,
++    payload: WallpaperPayload,
++    target_monitor: String,
++    applied_at: Instant,
++}
++
+ fn main() -> Result<()> {
+     // In --ipc-stdio mode, stdout is reserved for IPC frames.
+     // All diagnostic output must go to stderr.
+@@ -155,6 +172,7 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
+     let interval = Duration::from_millis(interval_ms);
+     let mut is_paused = false;
+     let mut heartbeat_count: u64 = 0;
++    let mut applied_state: Option<AppliedWallpaperState> = None;
+ 
+     // Channel for receiving commands from the stdin reader thread
+     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RendererCommand>();
+@@ -226,12 +244,8 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
+                         info!(?renderer_id, "renderer stopped via IPC command");
+                         break;
+                     }
+-                    RendererCommand::ApplyWallpaper(assignment) => {
+-                        send_ipc_event(RendererEvent::WallpaperApplied {
+-                            renderer_id,
+-                            monitor_id: assignment.monitor_id.clone(),
+-                        })?;
+-                        info!(?renderer_id, "wallpaper applied via IPC command");
++                    RendererCommand::ApplyWallpaper(request) => {
++                        handle_apply_wallpaper(renderer_id, request, &mut applied_state)?;
+                     }
+                     RendererCommand::SetMonitor { monitor_id } => {
+                         info!(?renderer_id, ?monitor_id, "monitor changed via IPC command");
+@@ -266,6 +280,60 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
+     Ok(())
+ }
+ 
++/// Handle an ApplyWallpaper command: validate, update state, respond.
++fn handle_apply_wallpaper(
++    renderer_id: RendererId,
++    request: ApplyWallpaperRequest,
++    applied_state: &mut Option<AppliedWallpaperState>,
++) -> Result<()> {
++    let wallpaper_id = request.wallpaper_id;
++    let monitor_id = request.target_monitor.clone();
++
++    match &request.payload {
++        WallpaperPayload::StaticImage(static_payload) => {
++            // Validate image path is not empty
++            if static_payload.image_path.trim().is_empty() {
++                send_ipc_event(RendererEvent::WallpaperApplyFailed {
++                    renderer_id,
++                    wallpaper_id,
++                    error: WallpaperApplyError::InvalidImagePath {
++                        path: String::new(),
++                    },
++                })?;
++                warn!(?renderer_id, "apply wallpaper rejected: empty image path");
++                return Ok(());
++            }
++
++            // At this stage, the renderer does not actually render the image.
++            // It validates the payload and records the applied state.
++            // Real GPU rendering will be implemented in stage 006.
++            info!(
++                ?renderer_id,
++                ?wallpaper_id,
++                image_path = %static_payload.image_path,
++                ?static_payload.fit,
++                background = %static_payload.background,
++                "static wallpaper applied (state recorded, not rendering yet)"
++            );
++
++            *applied_state = Some(AppliedWallpaperState {
++                wallpaper_id,
++                payload: request.payload,
++                target_monitor: monitor_id.0.clone(),
++                applied_at: Instant::now(),
++            });
++
++            send_ipc_event(RendererEvent::WallpaperApplied {
++                renderer_id,
++                wallpaper_id,
++                monitor_id,
++            })?;
++        }
++    }
++
++    Ok(())
++}
++
+ /// Background thread that reads IPC command frames from stdin.
+ /// Sends decoded commands to the main loop via the channel.
+ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result<()> {
+diff --git a/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md b/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
+index 4e71aef..aeaab92 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
++++ b/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
+@@ -114,7 +114,7 @@ pub struct EventEnvelope<T> {
+ | `Pause` | Pause (keep resources) | `Paused` |
+ | `Resume` | Resume from pause | `Resumed` |
+ | `Stop` | Stop and release resources | `Exited` |
+-| `ApplyWallpaper(assignment)` | Change wallpaper | `WallpaperApplied` |
++| `ApplyWallpaper(ApplyWallpaperRequest)` | Change wallpaper | `WallpaperApplied` / `WallpaperApplyFailed` |
+ | `SetMonitor { monitor_id }` | Reassign monitor | `Heartbeat` (ack) |
+ | `Shutdown` | Graceful shutdown | `Exited` |
+ 
+@@ -127,17 +127,72 @@ pub struct EventEnvelope<T> {
+ | `Heartbeat { renderer_id, uptime_ms }` | Liveness signal |
+ | `Paused { renderer_id }` | Confirmed pause |
+ | `Resumed { renderer_id }` | Confirmed resume |
+-| `WallpaperApplied { renderer_id, monitor_id }` | Wallpaper rendering |
++| `WallpaperApplied { renderer_id, monitor_id, wallpaper_id }` | Wallpaper rendering |
++| `WallpaperApplyFailed { renderer_id, monitor_id, error: WallpaperApplyError }` | Wallpaper apply failed |
+ | `Error { renderer_id, message }` | Error occurred |
+ | `Exited { renderer_id, exit_code }` | Process exiting |
+ 
++### ApplyWallpaperRequest
++
++```rust
++pub struct ApplyWallpaperRequest {
++    pub assignment_id: AssignmentId,
++    pub monitor_id: MonitorId,
++    pub wallpaper_id: WallpaperId,
++    pub payload: WallpaperPayload,
++}
++```
++
++### WallpaperPayload
++
++```rust
++#[serde(tag = "type", content = "data")]
++pub enum WallpaperPayload {
++    #[serde(rename = "static_image")]
++    StaticImage(StaticImagePayload),
++}
++```
++
++### StaticImagePayload
++
++```rust
++pub struct StaticImagePayload {
++    pub path: PathBuf,
++    pub fit_mode: FitMode,
++}
++```
++
++### FitMode
++
++```rust
++pub enum FitMode {
++    Fill,
++    Fit,
++    Stretch,
++    Center,
++    Tile,
++}
++```
++
++### WallpaperApplyError
++
++```rust
++pub enum WallpaperApplyError {
++    FileNotFound,
++    DecodeFailed(String),
++    UnsupportedFormat(String),
++    RenderFailed(String),
++}
++```
++
+ ## Protocol Versioning
+ 
+-The current protocol version is **3** (`PROTOCOL_VERSION`).
++The current protocol version is **4** (`PROTOCOL_VERSION`).
+ 
+ - **Version 1**: Initial protocol with basic CoreCommand/CoreEvent.
+ - **Version 2**: Added RendererCommand/RendererEvent with full lifecycle.
+ - **Version 3**: Added `IpcMessage` tagged union for unambiguous frame decoding.
++- **Version 4**: Added `ApplyWallpaperRequest` for structured wallpaper apply commands and `WallpaperApplyFailed` event for error reporting.
+ 
+ Every envelope includes `protocol_version`. Receivers MUST validate the version
+ and reject mismatched messages with `FrameError::ProtocolVersionMismatch`.
+diff --git a/wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md b/wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md
+index 9c7ce4c..684fd9a 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md
++++ b/wallflow/wallflow-foundation/docs/architecture/003-renderer-lifecycle.md
+@@ -179,7 +179,37 @@ Windows desktop or GUI.
+ | Error | Core error |
+ | SafeModeChanged | Safe mode toggled |
+ 
+-Protocol version is now **2** (bumped from 1 due to new command/event types).
++Protocol version is now **4** (bumped from 3 due to ApplyWallpaperRequest, WallpaperApplyFailed).
++
++## Applied Wallpaper State
++
++When the renderer receives an `ApplyWallpaper` command, it:
++
++1. Validates the wallpaper kind is supported (currently only `StaticImage`).
++2. Validates the image path is not empty.
++3. Records the `AppliedWallpaperState` (wallpaper_id, payload, monitor, timestamp).
++4. Sends `WallpaperApplied { renderer_id, wallpaper_id, monitor_id }` on success.
++5. Sends `WallpaperApplyFailed { renderer_id, wallpaper_id, error }` on failure.
++
++The renderer does **not** yet render the image to the screen. Real GPU rendering
++will be implemented in stage 006 (winit/wgpu renderer). The current behavior
++validates the full IPC apply lifecycle without requiring a GPU.
++
++## Apply Static Smoke Test
++
++```bash
++cargo run -p wallflow-cli -- apply-static-smoke --timeout-secs 10 --heartbeat-interval-ms 500
++```
++
++This command:
++
++1. Creates a temporary test wallpaper package (manifest.json + dummy image).
++2. Validates the package via `wallflow-package`.
++3. Spawns the renderer in `--ipc-stdio` mode.
++4. Sends `ApplyWallpaper` with the static image payload.
++5. Waits for `WallpaperApplied` event.
++6. Sends `Shutdown` and waits for `Exited`.
++7. Prints a structured JSON report.
+ 
+ ## Headless Heartbeat Mode
+ 
+@@ -232,11 +262,12 @@ This command:
+ | Area | Tests | Count |
+ |------|-------|-------|
+ | Watchdog decisions | wallflow-core/watchdog | 10 |
+-| Supervisor lifecycle | wallflow-core/supervisor | 15 |
+-| IPC protocol roundtrips | wallflow-ipc/protocol | 6 |
+-| IPC frame roundtrips | wallflow-ipc/frame | 1 |
++| Supervisor lifecycle | wallflow-core/supervisor | 19 |
++| IPC protocol roundtrips | wallflow-ipc/protocol | 14 |
++| IPC frame roundtrips | wallflow-ipc/frame | 10 |
++| Package validation | wallflow-package | 18 |
+ | Desktop attach (stubs) | wallflow-desktop | 11 |
+ | Monitor diff | wallflow-monitor/diff | 3 |
+ | Config | wallflow-config | 2 |
+ | Media backend | wallflow-media | 2 |
+-| **Total** | | **50** |
++| **Total** | | **97** |
+diff --git a/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md b/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+new file mode 100644
+index 0000000..9a7557d
+--- /dev/null
++++ b/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+@@ -0,0 +1,162 @@
++# 008 – Wallpaper Package Format v0
++
++> Stage: `005-cloud-safe-wallpaper-package-and-apply-contract`
++> Date: 2026-05-30
++
++## Overview
++
++This document specifies the wallpaper package format (v0) for WallFlow. A wallpaper
++package is a directory containing a manifest file and associated assets. The format
++is designed to be extensible, cloud-testable, and safe against path traversal attacks.
++
++## Why Static Image First
++
++Static image wallpapers are the simplest kind to implement and validate. They require
++no GPU rendering pipeline, no video codecs, and no web runtime. By implementing the
++full package → validate → apply → confirm lifecycle for static images first, we
++establish the complete infrastructure (package format, validation, IPC payloads,
++renderer state machine) that all future wallpaper kinds will reuse.
++
++Video wallpapers (stage 008+) will add Media Foundation decoding. Web wallpapers
++(stage 010+) will add an isolated web runtime. Both will follow the same package
++structure and validation pipeline.
++
++## Package Structure
++
++```
++my-wallpaper/
++├── manifest.json       # Required: package metadata and entry config
++├── content/            # Required: wallpaper assets
++│   └── wallpaper.png   # The wallpaper image
++└── preview.png         # Optional: preview thumbnail
++```
++
++## Manifest Format (v0)
++
++The manifest is a JSON file named `manifest.json` in the package root directory.
++
++### Required Fields
++
++| Field | Type | Description |
++|-------|------|-------------|
++| `schema_version` | `u32` | Must be `0` for v0 manifests |
++| `id` | `string` | Unique package identifier (e.g., "mountain-sunset") |
++| `title` | `string` | Human-readable wallpaper name |
++| `kind` | `string` | Wallpaper kind: `"static_image"` (v0) |
++| `entry` | `object` | Wallpaper entry configuration (kind-specific) |
++| `entry.image` | `string` | Relative path to the image file |
++| `entry.fit` | `string` | Fit mode: `"cover"`, `"contain"`, `"stretch"`, `"center"`, `"tile"` |
++| `entry.background` | `string` | Background color as CSS string (e.g., `"#000000"`) |
++
++### Optional Fields
++
++| Field | Type | Description |
++|-------|------|-------------|
++| `description` | `string` | Human-readable description |
++| `author` | `string` | Author or publisher name |
++| `preview` | `string` | Relative path to preview image |
++| `tags` | `string[]` | Tags for categorization |
++| `version` | `string` | Semantic version of the package |
++| `entry.opacity` | `u8` | Wallpaper opacity (0-255, default: 255/fully opaque) |
++
++### Example
++
++```json
++{
++  "schema_version": 0,
++  "id": "example-static-wallpaper",
++  "title": "Example Static Wallpaper",
++  "description": "Static wallpaper package for WallFlow MVP.",
++  "author": "WallFlow",
++  "kind": "static_image",
++  "entry": {
++    "image": "content/wallpaper.png",
++    "fit": "cover",
++    "background": "#000000"
++  },
++  "preview": "preview.png",
++  "tags": ["static", "mvp"]
++}
++```
++
++## Fit Modes
++
++| Mode | Description |
++|------|-------------|
++| `cover` | Scale to fill the screen, cropping edges. Default. |
++| `contain` | Scale to fit within the screen, letterboxing if needed. |
++| `stretch` | Stretch to fill the screen, ignoring aspect ratio. |
++| `center` | Display at original size, centered on screen. |
++| `tile` | Repeat the image to fill the screen. |
++
++## Validation Checks
++
++The package validator performs these checks:
++
++1. **Schema version**: Must be 0 (the only supported version).
++2. **Required fields**: `id`, `title`, `kind` must be non-empty.
++3. **Wallpaper kind**: Must be `"static_image"` for v0.
++4. **Entry image path**: Must be non-empty.
++5. **Path traversal**: All asset paths must be relative and inside the package.
++   - Absolute paths are rejected.
++   - `..` (parent directory) components are rejected.
++   - Root directory references are rejected.
++6. **Entry asset existence**: The image file must exist on disk.
++7. **Preview optional**: If a preview path is specified, a warning is emitted
++   if the file does not exist (not an error).
++
++## Security: Path Traversal Prevention
++
++All asset paths in the manifest must be relative and must not traverse outside
++the package directory. This prevents malicious packages from reading or
++referencing files outside their intended scope.
++
++Rejected patterns:
++- `../../etc/passwd`
++- `/absolute/path`
++- `content/../../../secret`
++
++Allowed patterns:
++- `content/wallpaper.png`
++- `preview.png`
++- `assets/bg/image.jpg`
++
++## IPC Integration
++
++When a wallpaper is applied via IPC, the `ApplyWallpaper` command carries the
++full typed payload:
++
++```rust
++ApplyWallpaperRequest {
++    wallpaper_id: WallpaperId,
++    payload: WallpaperPayload::StaticImage(StaticImagePayload {
++        image_path: String,  // Resolved absolute path
++        fit: FitMode,
++        background: String,
++        opacity: Option<u8>,
++    }),
++    target_monitor: MonitorId,
++}
++```
++
++The renderer validates the payload, records the applied state, and responds
++with `WallpaperApplied` or `WallpaperApplyFailed`.
++
++## Current Limitations
++
++- The renderer accepts and records the applied wallpaper state but does **not**
++  yet render the image to the screen. Real GPU rendering will be implemented
++  in stage 006 (winit/wgpu renderer).
++- Only `static_image` kind is supported. Video and web wallpapers will be
++  added in future stages.
++- Image format validation (is this actually a valid PNG/JPEG?) is not yet
++  implemented. The dummy fixture file in the smoke test is not a real image.
++
++## Future Extensions
++
++- **v1 manifest**: Add `settings` schema for user-configurable options.
++- **Video entry**: Add `video` kind with `entry.video`, `entry.muted`, `entry.looping`.
++- **Web entry**: Add `web` kind with `entry.html` entry point.
++- **Package archives**: Support `.wallflow` zip archives instead of directories.
++- **Image validation**: Verify that image files are decodable.
++- **Content hashing**: SHA-256 checksums for integrity verification.
+diff --git a/wallflow/wallflow-foundation/docs/roadmap.md b/wallflow/wallflow-foundation/docs/roadmap.md
+index 75b9e1e..058d15c 100644
+--- a/wallflow/wallflow-foundation/docs/roadmap.md
++++ b/wallflow/wallflow-foundation/docs/roadmap.md
+@@ -70,6 +70,29 @@
+ - GitHub Actions CI updated with IPC smoke test.
+ - IPC contract documented in `docs/architecture/002-ipc-contract.md`.
+ 
++## MVP-1.9 Wallpaper package and apply contract ✅
++
++*Completed in stage 005.*
++
++- Wallpaper package format v0 with manifest.json.
++- `wallflow-package` crate: load, parse, validate wallpaper packages.
++- Static image wallpaper model: image path, fit mode, background color, opacity.
++- Package validation: schema version, required fields, kind support, path traversal prevention, asset existence.
++- IPC protocol v4: `ApplyWallpaperRequest`, `StaticImagePayload`, `WallpaperPayload`, `WallpaperApplyError`, `FitMode`.
++- Renderer `AppliedWallpaperState`: validates and records applied wallpaper via IPC.
++- `apply-static-smoke` CLI command: full package → validate → apply → confirm lifecycle.
++- 97 unit tests passing on Linux.
++- IPC supervisor smoke and apply-static-smoke both passing.
++- Package validation documented in `docs/architecture/008-wallpaper-package-format.md`.
++
++### REQUIRES_REAL_WINDOWS_VALIDATION
++
++- Desktop probe (Progman/WorkerW/SHELLDLL_DefView discovery).
++- Desktop attach smoke test (embedding window behind icons).
++- Explorer restart tolerance.
++- Multi-monitor desktop attach.
++- DPI change handling.
++
+ ## MVP-2 static wallpaper
+ 
+ - Add winit/wgpu static renderer.
+diff --git a/worklog.md b/worklog.md
+index 50ee881..aa13ab6 100644
+--- a/worklog.md
++++ b/worklog.md
+@@ -193,3 +193,29 @@ Stage Summary:
+ - 67 tests passing total (up from 50)
+ - Both --ipc-stdio and --headless-heartbeat validated on Linux
+ - REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
++
++---
++Task ID: 5
++Agent: main
++Task: WallFlow Cloud-Safe Wallpaper Package and Apply Contract (005)
++
++Work Log:
++- Created wallflow-package crate (18 tests)
++- Extended IPC protocol v3 → v4 with ApplyWallpaperRequest, StaticImagePayload, WallpaperPayload, WallpaperApplyError, FitMode
++- Added WallpaperApplyFailed event, updated WallpaperApplied to include wallpaper_id
++- Enhanced renderer with AppliedWallpaperState and handle_apply_wallpaper
++- Enhanced supervisor with apply_wallpaper, mark_wallpaper_applied, mark_wallpaper_apply_failed
++- Added apply-static-smoke CLI command
++- Updated documentation: 008-wallpaper-package-format.md, 002-ipc-contract.md, 003-renderer-lifecycle.md, roadmap.md
++- Updated CI: apply-static-smoke step in ipc-smoke job
++- 97 tests passing total (up from 67)
++
++Stage Summary:
++- New crate: wallflow-package (18 tests)
++- wallflow-ipc: 32 tests (+8 new apply/error/fit tests)
++- wallflow-core: 29 tests (+4 apply state transition tests)
++- IPC protocol version 4
++- Package validation: schema version, required fields, kind support, path traversal, asset existence
++- apply-static-smoke PASSED
++- ipc-supervisor-smoke PASSED
++- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
+-- 
+2.47.3
+

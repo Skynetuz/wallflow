@@ -1,0 +1,2586 @@
+From 410354aa40dcbeda04aaceb343bcddd595a53ba1 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 13:01:29 +0000
+Subject: [PATCH 03/10] 90cec141-3500-4d95-ab02-9953012c3d5d
+
+---
+ wallflow/wallflow-foundation/Cargo.toml       |   1 +
+ .../crates/wallflow-cli/Cargo.toml            |   1 +
+ .../crates/wallflow-cli/src/main.rs           | 256 +++++-----
+ .../crates/wallflow-common/src/fit_mode.rs    |  28 ++
+ .../crates/wallflow-common/src/lib.rs         |   2 +
+ .../crates/wallflow-ipc/Cargo.toml            |   1 +
+ .../crates/wallflow-ipc/src/protocol.rs       | 267 ++++++++++-
+ .../crates/wallflow-package/Cargo.toml        |   2 +
+ .../crates/wallflow-package/src/error.rs      |  65 +++
+ .../crates/wallflow-package/src/layout.rs     | 445 ++++++++++++++++++
+ .../crates/wallflow-package/src/lib.rs        |  10 +-
+ .../crates/wallflow-package/src/manifest.rs   |  25 +-
+ .../crates/wallflow-package/src/validation.rs | 204 ++++++++
+ .../crates/wallflow-renderer/Cargo.toml       |   2 +
+ .../crates/wallflow-renderer/src/main.rs      | 155 +++++-
+ .../docs/architecture/002-ipc-contract.md     |  72 ++-
+ .../008-wallpaper-package-format.md           |  52 +-
+ .../009-static-image-rendering-model.md       | 180 +++++++
+ wallflow/wallflow-foundation/docs/roadmap.md  |  37 ++
+ 19 files changed, 1584 insertions(+), 221 deletions(-)
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+ create mode 100644 wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+
+diff --git a/wallflow/wallflow-foundation/Cargo.toml b/wallflow/wallflow-foundation/Cargo.toml
+index d3fe45b..6964c4d 100644
+--- a/wallflow/wallflow-foundation/Cargo.toml
++++ b/wallflow/wallflow-foundation/Cargo.toml
+@@ -23,6 +23,7 @@ repository = "https://example.invalid/wallflow"
+ [workspace.dependencies]
+ anyhow = "1"
+ clap = { version = "4", features = ["derive"] }
++image = "0.25"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ thiserror = "1"
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+index dc4cc68..134f7f4 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/Cargo.toml
+@@ -8,6 +8,7 @@ license.workspace = true
+ [dependencies]
+ anyhow.workspace = true
+ clap.workspace = true
++image.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ tokio.workspace = true
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+index 08c1117..18d9a67 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+@@ -70,6 +70,16 @@ enum Command {
+         #[arg(long, default_value_t = 500)]
+         heartbeat_interval_ms: u64,
+     },
++
++    /// Validate a wallpaper package and output a structured JSON report.
++    PackageValidate {
++        /// Path to the wallpaper package directory.
++        path: String,
++
++        /// Perform deep validation (including image decode).
++        #[arg(long, default_value_t = false)]
++        deep: bool,
++    },
+ }
+ 
+ fn main() -> Result<()> {
+@@ -124,6 +134,9 @@ fn main() -> Result<()> {
+         } => {
+             run_apply_static_smoke(timeout_secs, heartbeat_interval_ms)?;
+         }
++        Command::PackageValidate { path, deep } => {
++            run_package_validate(&path, deep)?;
++        }
+     }
+ 
+     Ok(())
+@@ -228,8 +241,6 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
+             anyhow::bail!("RegisterClassW failed (error: {})", err.0);
+         }
+ 
+-        // Create as a popup window — no title bar or borders. WS_POPUP | WS_VISIBLE
+-        // is the correct style for a wallpaper background window.
+         let screen_w = GetSystemMetrics(SM_CXSCREEN);
+         let screen_h = GetSystemMetrics(SM_CYSCREEN);
+         let hwnd = CreateWindowExW(
+@@ -251,15 +262,12 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
+         let native_handle = NativeWindowHandle(hwnd.0 as isize);
+         println!("Created dummy renderer window: HWND {:#x}", hwnd.0 as usize);
+ 
+-        // Step 4: Attach to desktop
+         let attach_report = attach_window_to_desktop(native_handle)?;
+         println!(
+             "=== Attach Result ===\n{}",
+             serde_json::to_string_pretty(&attach_report)?
+         );
+ 
+-        // After SetParent, reposition the window to fill the WorkerW client area.
+-        // SAFETY: GetClientRect and MoveWindow are standard Win32 APIs with valid parameters.
+         let mut rect = RECT::default();
+         let _ = GetClientRect(HWND(worker.0 as *mut _), &mut rect);
+         let width = rect.right - rect.left;
+@@ -271,16 +279,12 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
+             width, height
+         );
+ 
+-        // Step 5: Run a short message loop so the window can paint itself.
+-        // Using PeekMessageW + sleep instead of GetMessageW so we can check the timeout.
+         let start = Instant::now();
+         let mut msg = MSG::default();
+         loop {
+             if start.elapsed() >= Duration::from_secs(5) {
+                 break;
+             }
+-            // SAFETY: PeekMessageW with null HWND checks the thread message queue.
+-            // PM_REMOVE removes the message after retrieval.
+             let has_msg = PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE);
+             if has_msg.as_bool() {
+                 if msg.message == WM_QUIT {
+@@ -289,19 +293,16 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
+                 let _ = TranslateMessage(&msg);
+                 DispatchMessageW(&msg);
+             } else {
+-                // No messages — sleep briefly to avoid busy-waiting
+                 std::thread::sleep(Duration::from_millis(50));
+             }
+         }
+ 
+-        // Step 6: Detach
+         let detach_report = detach_window_from_desktop(native_handle)?;
+         println!(
+             "=== Detach Result ===\n{}",
+             serde_json::to_string_pretty(&detach_report)?
+         );
+ 
+-        // Step 7: Destroy the window
+         let destroy_result = DestroyWindow(hwnd);
+         if let Err(e) = destroy_result {
+             eprintln!("Warning: DestroyWindow failed: {e}");
+@@ -323,17 +324,13 @@ unsafe extern "system" fn smoke_wnd_proc(
+         PostQuitMessage(0);
+         LRESULT(0)
+     } else if msg == WM_ERASEBKGND {
+-        // SAFETY: wParam is the HDC passed by WM_ERASEBKGND. GetClientRect
+-        // and FillRect are standard GDI APIs with valid parameters.
+         let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
+         let mut rect = RECT::default();
+         let _ = GetClientRect(hwnd, &mut rect);
+-        // Paint a dark blue background (BGR: 0x804040) so the window is
+-        // clearly visible against the default desktop.
+         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00804040));
+         let _ = FillRect(hdc, &rect, brush);
+         let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush);
+-        LRESULT(1) // background was erased
++        LRESULT(1)
+     } else {
+         DefWindowProcW(hwnd, msg, wparam, lparam)
+     }
+@@ -351,29 +348,16 @@ fn wide(value: &str) -> WideString {
+ // Supervisor smoke
+ // ---------------------------------------------------------------------------
+ 
+-/// Supervisor smoke test: launches a headless renderer, monitors it, and
+-/// prints a structured report. This is the cloud-testable integration test
+-/// that validates the renderer lifecycle without requiring a real Windows
+-/// desktop or GUI.
+-///
+-/// The test works by:
+-/// 1. Finding the renderer executable in the current target directory.
+-/// 2. Spawning it with `--headless-heartbeat` mode.
+-/// 3. Reading stdout lines as heartbeat events.
+-/// 4. Waiting for the renderer to exit (or timeout).
+-/// 5. Printing a structured JSON report.
+ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
+     use std::process::Stdio;
+     use tokio::io::{AsyncBufReadExt, BufReader};
+     use tokio::process::Command;
+     use tokio::time;
+ 
+-    // Build a minimal runtime for the async smoke test
+     let rt = tokio::runtime::Runtime::new()?;
+     rt.block_on(async {
+         let start = Instant::now();
+ 
+-        // Find the renderer executable
+         let renderer_exe = find_renderer_exe()?;
+ 
+         println!("=== Supervisor Smoke Test ===");
+@@ -383,7 +367,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+             timeout_secs, heartbeat_interval_ms
+         );
+ 
+-        // Spawn the renderer process
+         let mut child = Command::new(&renderer_exe)
+             .arg("--headless-heartbeat")
+             .arg("--heartbeat-interval-ms")
+@@ -398,7 +381,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+         let pid = child.id();
+         println!("Renderer spawned (PID: {:?})", pid);
+ 
+-        // Read stdout lines as heartbeat events
+         let stdout = child
+             .stdout
+             .take()
+@@ -426,7 +408,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+                 line = lines.next_line() => {
+                     match line {
+                         Ok(Some(line)) => {
+-                            // Try to parse as JSON event
+                             if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                                 let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                 let elapsed = start.elapsed();
+@@ -470,7 +451,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+                             }
+                         }
+                         Ok(None) => {
+-                            // EOF — renderer closed stdout
+                             break;
+                         }
+                         Err(e) => {
+@@ -482,7 +462,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+             }
+         }
+ 
+-        // Wait for the process to exit
+         let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+             Ok(Ok(status)) => Some(status),
+             Ok(Err(e)) => {
+@@ -504,7 +483,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+             && heartbeat_count > 0
+             && exited_received;
+ 
+-        // Build the structured report
+         let report = serde_json::json!({
+             "test": "supervisor-smoke",
+             "success": success,
+@@ -532,21 +510,6 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+             println!("\nSupervisor smoke test PASSED.");
+         } else {
+             eprintln!("\nSupervisor smoke test FAILED.");
+-            if !started_received {
+-                eprintln!("  Missing: Started event");
+-            }
+-            if !ready_received {
+-                eprintln!("  Missing: Ready event");
+-            }
+-            if heartbeat_count == 0 {
+-                eprintln!("  Missing: heartbeat events");
+-            }
+-            if !exited_received {
+-                eprintln!("  Missing: Exited event");
+-            }
+-            if exit_code != Some(0) {
+-                eprintln!("  Non-zero exit code: {:?}", exit_code);
+-            }
+         }
+ 
+         Ok(())
+@@ -555,21 +518,18 @@ fn run_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result
+ 
+ /// Find the wallflow-renderer executable in the current build output.
+ fn find_renderer_exe() -> Result<std::path::PathBuf> {
+-    // Try the standard target/debug location relative to the workspace
+     let candidates = [
+         "target/debug/wallflow-renderer",
+         "../target/debug/wallflow-renderer",
+         "../../target/debug/wallflow-renderer",
+     ];
+ 
+-    // First, try to find the exe relative to the current executable
+     if let Ok(current_exe) = std::env::current_exe() {
+         if let Some(parent) = current_exe.parent() {
+             let candidate = parent.join("wallflow-renderer");
+             if candidate.exists() {
+                 return Ok(candidate);
+             }
+-            // Go up to target/
+             if let Some(grandparent) = parent.parent() {
+                 let candidate = grandparent.join("wallflow-renderer");
+                 if candidate.exists() {
+@@ -579,7 +539,6 @@ fn find_renderer_exe() -> Result<std::path::PathBuf> {
+         }
+     }
+ 
+-    // Try CWD-based paths
+     for candidate in &candidates {
+         let path = std::path::PathBuf::from(candidate);
+         if path.exists() {
+@@ -587,7 +546,6 @@ fn find_renderer_exe() -> Result<std::path::PathBuf> {
+         }
+     }
+ 
+-    // On Windows, try with .exe extension
+     #[cfg(target_os = "windows")]
+     {
+         for candidate in &candidates {
+@@ -607,17 +565,6 @@ fn find_renderer_exe() -> Result<std::path::PathBuf> {
+ // IPC supervisor smoke
+ // ---------------------------------------------------------------------------
+ 
+-/// IPC supervisor smoke test: launches a renderer in `--ipc-stdio` mode,
+-/// exchanges typed IPC frames, and validates the full command/event lifecycle.
+-///
+-/// The test flow:
+-/// 1. Spawn renderer with `--ipc-stdio`
+-/// 2. Wait for Started + Ready events
+-/// 3. Wait for at least 2 Heartbeat events
+-/// 4. Send Pause command, wait for Paused event
+-/// 5. Send Resume command, wait for Resumed event
+-/// 6. Send Shutdown command, wait for Exited event
+-/// 7. Print structured JSON report
+ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
+     use std::process::Stdio;
+     use tokio::process::Command;
+@@ -631,12 +578,7 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+ 
+         println!("=== IPC Supervisor Smoke Test ===");
+         println!("Renderer exe: {}", renderer_exe.display());
+-        println!(
+-            "Timeout: {}s, Heartbeat interval: {}ms",
+-            timeout_secs, heartbeat_interval_ms
+-        );
+ 
+-        // Spawn renderer with --ipc-stdio
+         let mut child = Command::new(&renderer_exe)
+             .arg("--ipc-stdio")
+             .arg("--heartbeat-interval-ms")
+@@ -645,7 +587,7 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+             .arg(timeout_secs.to_string())
+             .stdin(Stdio::piped())
+             .stdout(Stdio::piped())
+-            .stderr(Stdio::inherit()) // renderer logs go to our stderr
++            .stderr(Stdio::inherit())
+             .spawn()
+             .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+ 
+@@ -704,7 +646,6 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+                                         println!("  [{:.1}s] Heartbeat #{} (uptime: {}ms, renderer_id: {})",
+                                             elapsed.as_secs_f64(), heartbeat_count, uptime_ms, renderer_id);
+                                     }
+-                                    // After 2 heartbeats, send Pause
+                                     if heartbeat_count == 2 && !pause_sent {
+                                         println!("  [{:.1}s] Sending Pause command...", elapsed.as_secs_f64());
+                                         send_ipc_command(&mut stdin_writer, RendererCommand::Pause).await?;
+@@ -714,7 +655,6 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+                                 RendererEvent::Paused { renderer_id } => {
+                                     paused_received = true;
+                                     println!("  [{:.1}s] Paused (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+-                                    // Now send Resume
+                                     if !resume_sent {
+                                         println!("  [{:.1}s] Sending Resume command...", elapsed.as_secs_f64());
+                                         send_ipc_command(&mut stdin_writer, RendererCommand::Resume).await?;
+@@ -724,7 +664,6 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+                                 RendererEvent::Resumed { renderer_id } => {
+                                     resumed_received = true;
+                                     println!("  [{:.1}s] Resumed (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+-                                    // Now send Shutdown
+                                     if !shutdown_sent {
+                                         println!("  [{:.1}s] Sending Shutdown command...", elapsed.as_secs_f64());
+                                         send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
+@@ -740,7 +679,7 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+                                 RendererEvent::Error { renderer_id, message } => {
+                                     eprintln!("  [{:.1}s] Error from renderer {}: {}", elapsed.as_secs_f64(), renderer_id, message);
+                                 }
+-                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id, monitor_id } => {
++                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id, monitor_id, .. } => {
+                                     println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, wallpaper_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, wallpaper_id, monitor_id.0);
+                                 }
+                                 RendererEvent::WallpaperApplyFailed { renderer_id, wallpaper_id, error } => {
+@@ -749,7 +688,6 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+                             }
+                         }
+                         Ok(None) => {
+-                            // EOF
+                             break;
+                         }
+                         Err(e) => {
+@@ -761,10 +699,8 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+             }
+         }
+ 
+-        // Drop the stdin writer to close the pipe
+         drop(stdin_writer);
+ 
+-        // Wait for the process to exit
+         let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+             Ok(Ok(status)) => Some(status),
+             Ok(Err(e)) => {
+@@ -823,14 +759,6 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
+             println!("\nIPC supervisor smoke test PASSED.");
+         } else {
+             eprintln!("\nIPC supervisor smoke test FAILED.");
+-            if !started_received { eprintln!("  Missing: Started event"); }
+-            if !ready_received { eprintln!("  Missing: Ready event"); }
+-            if heartbeat_count < 2 { eprintln!("  Missing: at least 2 heartbeats (got {})", heartbeat_count); }
+-            if !paused_received { eprintln!("  Missing: Paused event"); }
+-            if !resumed_received { eprintln!("  Missing: Resumed event"); }
+-            if !exited_received { eprintln!("  Missing: Exited event"); }
+-            if exit_code_received != Some(0) { eprintln!("  Non-zero IPC exit code: {:?}", exit_code_received); }
+-            if process_exit_code != Some(0) { eprintln!("  Non-zero process exit code: {:?}", process_exit_code); }
+         }
+ 
+         Ok(())
+@@ -889,39 +817,25 @@ async fn send_ipc_command<W: tokio::io::AsyncWrite + Unpin>(
+ // Apply static smoke test
+ // ---------------------------------------------------------------------------
+ 
+-/// Apply static smoke test: creates a test wallpaper package, validates it,
+-/// launches a renderer in --ipc-stdio mode, applies the wallpaper, and
+-/// reports results.
+-///
+-/// The test flow:
+-/// 1. Create a temporary test wallpaper package (manifest.json + dummy image)
+-/// 2. Load and validate the package via wallflow-package
+-/// 3. Spawn renderer with --ipc-stdio
+-/// 4. Wait for Started + Ready events
+-/// 5. Send ApplyWallpaper with real static image payload
+-/// 6. Wait for WallpaperApplied event
+-/// 7. Send Shutdown command
+-/// 8. Wait for Exited event
+-/// 9. Print structured JSON report
+ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
+     use std::process::Stdio;
+     use tokio::process::Command;
+     use tokio::time;
+     use wallflow_common::{MonitorId, WallpaperId};
+     use wallflow_ipc::{
+-        ApplyWallpaperRequest, FitMode as IpcFitMode, RendererCommand, RendererEvent,
+-        StaticImagePayload, WallpaperPayload,
++        ApplyWallpaperRequest, FitMode, RendererCommand, RendererEvent, StaticImagePayload,
++        WallpaperPayload,
+     };
+     use wallflow_package::{
+-        validate_manifest, validate_package, FitMode as PackageFitMode, StaticImageWallpaper,
+-        WallpaperKind, WallpaperManifest, WallpaperPackage, WallpaperPackageVersion,
++        validate_manifest, validate_package_deep, StaticImageWallpaper, WallpaperKind,
++        WallpaperManifest, WallpaperPackage, WallpaperPackageVersion,
+     };
+ 
+     let rt = tokio::runtime::Runtime::new()?;
+     rt.block_on(async {
+         let start = Instant::now();
+ 
+-        // Step 1: Create a temporary test wallpaper package
++        // Step 1: Create a temporary test wallpaper package with a REAL 2x2 PNG
+         let temp_dir = std::env::temp_dir().join("wallflow-apply-static-smoke");
+         let _ = std::fs::remove_dir_all(&temp_dir);
+         std::fs::create_dir_all(temp_dir.join("content"))?;
+@@ -935,7 +849,7 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+             kind: WallpaperKind::StaticImage,
+             entry: StaticImageWallpaper {
+                 image: "content/wallpaper.png".into(),
+-                fit: PackageFitMode::Cover,
++                fit: FitMode::Cover,
+                 background: "#000000".into(),
+                 opacity: None,
+             },
+@@ -947,15 +861,15 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+         let manifest_json = serde_json::to_string_pretty(&manifest)?;
+         std::fs::write(temp_dir.join("manifest.json"), &manifest_json)?;
+ 
+-        // Create a dummy image file (1x1 PNG-like bytes for fixture purposes)
+-        // NOTE: This is not a real PNG. Real image decoding will come in stage 006.
+-        let dummy_image_data = b"WALLFLOW-DUMMY-IMAGE-FIXURE";
+-        std::fs::write(temp_dir.join("content/wallpaper.png"), dummy_image_data)?;
++        // Create a REAL 2x2 PNG using the image crate
++        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
++        let image_path = temp_dir.join("content/wallpaper.png");
++        img.save(&image_path)?;
+ 
+         println!("=== Apply Static Smoke Test ===");
+         println!("Test package dir: {}", temp_dir.display());
+ 
+-        // Step 2: Load and validate the package
++        // Step 2: Load and validate the package (deep validation with image decode)
+         let package = WallpaperPackage::load(&temp_dir)?;
+         let manifest_report = validate_manifest(&package.manifest);
+         if !manifest_report.valid {
+@@ -964,20 +878,16 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+         }
+         println!("Package validation: OK (id={})", package.manifest.id);
+ 
+-        let package_report = validate_package(&package);
++        let package_report = validate_package_deep(&package);
+         if !package_report.valid {
+-            eprintln!("Package validation failed: {:?}", package_report.errors);
+-            anyhow::bail!("package validation failed");
++            eprintln!("Deep package validation failed: {:?}", package_report.errors);
++            anyhow::bail!("deep package validation failed");
+         }
+-        println!("Full package validation: OK");
++        println!("Deep package validation: OK (image decoded successfully)");
+ 
+         // Step 3: Spawn renderer with --ipc-stdio
+         let renderer_exe = find_renderer_exe()?;
+         println!("Renderer exe: {}", renderer_exe.display());
+-        println!(
+-            "Timeout: {}s, Heartbeat interval: {}ms",
+-            timeout_secs, heartbeat_interval_ms
+-        );
+ 
+         let mut child = Command::new(&renderer_exe)
+             .arg("--ipc-stdio")
+@@ -1013,11 +923,14 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+         let mut apply_failed_received = false;
+         let mut shutdown_sent = false;
+ 
++        // Verification state
++        let mut image_width_ok = false;
++        let mut image_height_ok = false;
++        let mut layout_rect_present = false;
++        let mut wallpaper_id_matches = false;
++
+         let wallpaper_id = WallpaperId::new();
+-        let image_path = temp_dir
+-            .join("content/wallpaper.png")
+-            .to_string_lossy()
+-            .to_string();
++        let image_path_str = image_path.to_string_lossy().to_string();
+ 
+         let deadline = time::sleep(Duration::from_secs(timeout_secs + 10));
+         tokio::pin!(deadline);
+@@ -1047,8 +960,8 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+                                         let request = ApplyWallpaperRequest {
+                                             wallpaper_id,
+                                             payload: WallpaperPayload::StaticImage(StaticImagePayload {
+-                                                image_path: image_path.clone(),
+-                                                fit: IpcFitMode::Cover,
++                                                image_path: image_path_str.clone(),
++                                                fit: FitMode::Cover,
+                                                 background: "#000000".into(),
+                                                 opacity: None,
+                                             }),
+@@ -1060,9 +973,45 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+                                 RendererEvent::Heartbeat { renderer_id, uptime_ms } => {
+                                     println!("  [{:.1}s] Heartbeat (uptime: {}ms, renderer_id: {})", elapsed.as_secs_f64(), uptime_ms, renderer_id);
+                                 }
+-                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id: wid, monitor_id } => {
++                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id: wid, monitor_id, report } => {
+                                     wallpaper_applied_received = true;
+                                     println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, wallpaper_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, wid, monitor_id.0);
++
++                                    // Verify report contents
++                                    if let Some(report) = report {
++                                        println!("  [{:.1}s]   Report: wallpaper_id={}, applied_at={:?}",
++                                            elapsed.as_secs_f64(), report.wallpaper_id, report.applied_at);
++
++                                        if *wid == report.wallpaper_id {
++                                            wallpaper_id_matches = true;
++                                        }
++
++                                        if let Some(si) = &report.static_image {
++                                            let meta = &si.image_metadata;
++                                            let layout = &si.layout;
++                                            println!("  [{:.1}s]   Image: {}x{}, format={}, color_type={}",
++                                                elapsed.as_secs_f64(), meta.width, meta.height,
++                                                meta.detected_format, meta.color_type);
++                                            println!("  [{:.1}s]   Layout: viewport={}x{}, dest=({},{},{},{}), fit={:?}, bg={}",
++                                                elapsed.as_secs_f64(), layout.viewport_width, layout.viewport_height,
++                                                layout.destination_x, layout.destination_y,
++                                                layout.destination_width, layout.destination_height,
++                                                layout.fit, layout.background);
++
++                                            // Verify image dimensions are 2x2
++                                            if meta.width == 2 {
++                                                image_width_ok = true;
++                                            }
++                                            if meta.height == 2 {
++                                                image_height_ok = true;
++                                            }
++                                            // Verify layout is calculated (destination rect is present)
++                                            if layout.destination_width > 0.0 && layout.destination_height > 0.0 {
++                                                layout_rect_present = true;
++                                            }
++                                        }
++                                    }
++
+                                     // Now send Shutdown
+                                     if !shutdown_sent {
+                                         println!("  [{:.1}s] Sending Shutdown command...", elapsed.as_secs_f64());
+@@ -1073,7 +1022,6 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+                                 RendererEvent::WallpaperApplyFailed { renderer_id, wallpaper_id: wid, error } => {
+                                     apply_failed_received = true;
+                                     eprintln!("  [{:.1}s] WallpaperApplyFailed (renderer_id: {}, wallpaper_id: {}, error: {:?})", elapsed.as_secs_f64(), renderer_id, wid, error);
+-                                    // Still send shutdown
+                                     if !shutdown_sent {
+                                         send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
+                                         shutdown_sent = true;
+@@ -1124,12 +1072,15 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+         let total_elapsed = start.elapsed();
+         let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
+ 
++        let verification_ok = image_width_ok && image_height_ok && layout_rect_present && wallpaper_id_matches;
++
+         let success = process_exit_code == Some(0)
+             && started_received
+             && ready_received
+             && wallpaper_applied_received
+             && !apply_failed_received
+-            && exited_received;
++            && exited_received
++            && verification_ok;
+ 
+         let report = serde_json::json!({
+             "test": "apply-static-smoke",
+@@ -1139,7 +1090,7 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+             "process_exit_code": process_exit_code,
+             "wallpaper_id": wallpaper_id.to_string(),
+             "package_id": package.manifest.id,
+-            "image_path": image_path,
++            "image_path": image_path_str,
+             "events": {
+                 "started_received": started_received,
+                 "ready_received": ready_received,
+@@ -1147,6 +1098,12 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+                 "apply_failed_received": apply_failed_received,
+                 "exited_received": exited_received,
+             },
++            "verification": {
++                "image_width_ok": image_width_ok,
++                "image_height_ok": image_height_ok,
++                "layout_rect_present": layout_rect_present,
++                "wallpaper_id_matches": wallpaper_id_matches,
++            },
+             "config": {
+                 "timeout_secs": timeout_secs,
+                 "heartbeat_interval_ms": heartbeat_interval_ms,
+@@ -1165,6 +1122,10 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+             if !wallpaper_applied_received { eprintln!("  Missing: WallpaperApplied event"); }
+             if apply_failed_received { eprintln!("  Unexpected: WallpaperApplyFailed event"); }
+             if !exited_received { eprintln!("  Missing: Exited event"); }
++            if !image_width_ok { eprintln!("  Verification: image width not 2"); }
++            if !image_height_ok { eprintln!("  Verification: image height not 2"); }
++            if !layout_rect_present { eprintln!("  Verification: layout destination rect missing"); }
++            if !wallpaper_id_matches { eprintln!("  Verification: wallpaper_id mismatch"); }
+         }
+ 
+         // Clean up temp directory
+@@ -1173,3 +1134,36 @@ fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Resu
+         Ok(())
+     })
+ }
++
++// ---------------------------------------------------------------------------
++// Package validate
++// ---------------------------------------------------------------------------
++
++fn run_package_validate(path: &str, deep: bool) -> Result<()> {
++    use wallflow_package::{validate_package, validate_package_deep, WallpaperPackage};
++
++    let dir = std::path::Path::new(path);
++    if !dir.exists() {
++        anyhow::bail!("path does not exist: {}", path);
++    }
++    if !dir.is_dir() {
++        anyhow::bail!("path is not a directory: {}", path);
++    }
++
++    let package = WallpaperPackage::load(dir)?;
++
++    let report = if deep {
++        validate_package_deep(&package)
++    } else {
++        validate_package(&package)
++    };
++
++    let json = serde_json::to_string_pretty(&report)?;
++    println!("{json}");
++
++    if !report.valid {
++        anyhow::bail!("validation failed");
++    }
++
++    Ok(())
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+new file mode 100644
+index 0000000..8b8e926
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/src/fit_mode.rs
+@@ -0,0 +1,28 @@
++use serde::{Deserialize, Serialize};
++
++/// How a static image should be fitted to the screen.
++///
++/// This type is the canonical definition shared by wallflow-ipc and
++/// wallflow-package. Both crates re-export it from wallflow-common.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
++#[serde(rename_all = "snake_case")]
++pub enum FitMode {
++    #[default]
++    Cover,
++    Contain,
++    Stretch,
++    Center,
++    Tile,
++}
++
++impl std::fmt::Display for FitMode {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            FitMode::Cover => write!(f, "cover"),
++            FitMode::Contain => write!(f, "contain"),
++            FitMode::Stretch => write!(f, "stretch"),
++            FitMode::Center => write!(f, "center"),
++            FitMode::Tile => write!(f, "tile"),
++        }
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
+index 8200049..e190b84 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
+@@ -3,11 +3,13 @@
+ //! This crate must not depend on UI, Win32, Media Foundation, Tauri or renderer internals.
+ 
+ pub mod error;
++pub mod fit_mode;
+ pub mod monitor;
+ pub mod renderer;
+ pub mod wallpaper;
+ 
+ pub use error::{WallFlowError, WallFlowResult};
++pub use fit_mode::FitMode;
+ pub use monitor::{MonitorId, MonitorInfo, MonitorPosition, MonitorSize};
+ pub use renderer::{
+     RendererAssignment, RendererGroupId, RendererHealth, RendererId, RendererRestartPolicy,
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml
+index 6924d2b..93bf670 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-ipc/Cargo.toml
+@@ -12,3 +12,4 @@ thiserror.workspace = true
+ tokio.workspace = true
+ uuid.workspace = true
+ wallflow-common = { path = "../wallflow-common" }
++wallflow-package = { path = "../wallflow-package" }
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
+index 7ded5d3..fdbc7a0 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-ipc/src/protocol.rs
+@@ -6,7 +6,8 @@ use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperId};
+ /// Version 2 added the new RendererCommand/RendererEvent/CoreCommand/CoreEvent types.
+ /// Version 3 adds the IpcMessage tagged union for unambiguous frame decoding.
+ /// Version 4 adds ApplyWallpaperRequest, StaticImagePayload, WallpaperApplyError.
+-pub const PROTOCOL_VERSION: u16 = 4;
++/// Version 5 adds AppliedWallpaperReport with image metadata and layout.
++pub const PROTOCOL_VERSION: u16 = 5;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub struct RequestId(pub Uuid);
+@@ -142,27 +143,79 @@ impl<T> Envelope<T> {
+ // ---------------------------------------------------------------------------
+ 
+ /// How a static image should be fitted to the screen.
+-/// Mirrors `wallflow_package::FitMode` but defined independently in the IPC
+-/// layer so that the renderer does not need to depend on wallflow-package.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+-#[serde(rename_all = "snake_case")]
+-pub enum FitMode {
+-    #[default]
+-    Cover,
+-    Contain,
+-    Stretch,
+-    Center,
+-    Tile,
++/// Re-exported from wallflow_common::FitMode for use in IPC payloads.
++pub use wallflow_common::FitMode;
++
++// ---------------------------------------------------------------------------
++// Applied wallpaper report types (IPC-safe, no image crate dependency)
++// ---------------------------------------------------------------------------
++
++/// IPC-safe image metadata (no dependency on image crate types).
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct IpcImageMetadata {
++    pub width: u32,
++    pub height: u32,
++    pub color_type: String,
++    pub detected_format: String,
++    pub file_size_bytes: u64,
++}
++
++/// IPC-safe layout report.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct StaticImageLayoutReport {
++    pub viewport_width: u32,
++    pub viewport_height: u32,
++    pub image_width: u32,
++    pub image_height: u32,
++    pub fit: FitMode,
++    pub destination_x: f64,
++    pub destination_y: f64,
++    pub destination_width: f64,
++    pub destination_height: f64,
++    pub background: String,
++}
++
++/// Report specific to a static image wallpaper apply.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct StaticImageApplyReport {
++    pub image_metadata: IpcImageMetadata,
++    pub layout: StaticImageLayoutReport,
++}
++
++/// Detailed report when a wallpaper is successfully applied.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct AppliedWallpaperReport {
++    pub wallpaper_id: WallpaperId,
++    pub renderer_id: RendererId,
++    pub applied_at: Option<String>, // ISO 8601 timestamp
++    pub static_image: Option<StaticImageApplyReport>,
++}
++
++impl From<wallflow_package::ImageMetadata> for IpcImageMetadata {
++    fn from(m: wallflow_package::ImageMetadata) -> Self {
++        IpcImageMetadata {
++            width: m.width,
++            height: m.height,
++            color_type: m.color_type,
++            detected_format: m.detected_format,
++            file_size_bytes: m.file_size_bytes,
++        }
++    }
+ }
+ 
+-impl std::fmt::Display for FitMode {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            FitMode::Cover => write!(f, "cover"),
+-            FitMode::Contain => write!(f, "contain"),
+-            FitMode::Stretch => write!(f, "stretch"),
+-            FitMode::Center => write!(f, "center"),
+-            FitMode::Tile => write!(f, "tile"),
++impl From<wallflow_package::StaticImageLayout> for StaticImageLayoutReport {
++    fn from(l: wallflow_package::StaticImageLayout) -> Self {
++        StaticImageLayoutReport {
++            viewport_width: l.viewport.width,
++            viewport_height: l.viewport.height,
++            image_width: l.image_size.width,
++            image_height: l.image_size.height,
++            fit: l.fit,
++            destination_x: l.destination_rect.x,
++            destination_y: l.destination_rect.y,
++            destination_width: l.destination_rect.width,
++            destination_height: l.destination_rect.height,
++            background: l.background,
+         }
+     }
+ }
+@@ -274,6 +327,10 @@ pub enum RendererEvent {
+         renderer_id: RendererId,
+         wallpaper_id: WallpaperId,
+         monitor_id: MonitorId,
++        /// Detailed report about the applied wallpaper (metadata, layout).
++        /// Present when the renderer performed image decode and layout calculation.
++        #[serde(default)]
++        report: Option<AppliedWallpaperReport>,
+     },
+     /// An error occurred while applying a wallpaper.
+     WallpaperApplyFailed {
+@@ -411,6 +468,176 @@ mod tests {
+             renderer_id: RendererId::new(),
+             wallpaper_id: WallpaperId::new(),
+             monitor_id: MonitorId("mon-1".into()),
++            report: None,
++        };
++        let json = serde_json::to_string(&event).expect("serialize");
++        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(event, decoded);
++    }
++
++    #[test]
++    fn renderer_event_wallpaper_applied_with_report_roundtrip() {
++        let wid = WallpaperId::new();
++        let rid = RendererId::new();
++        let event = RendererEvent::WallpaperApplied {
++            renderer_id: rid,
++            wallpaper_id: wid,
++            monitor_id: MonitorId("mon-1".into()),
++            report: Some(AppliedWallpaperReport {
++                wallpaper_id: wid,
++                renderer_id: rid,
++                applied_at: Some("2024-01-01T00:00:00Z".into()),
++                static_image: Some(StaticImageApplyReport {
++                    image_metadata: IpcImageMetadata {
++                        width: 1920,
++                        height: 1080,
++                        color_type: "Rgba8".into(),
++                        detected_format: "Png".into(),
++                        file_size_bytes: 12345,
++                    },
++                    layout: StaticImageLayoutReport {
++                        viewport_width: 1920,
++                        viewport_height: 1080,
++                        image_width: 1920,
++                        image_height: 1080,
++                        fit: FitMode::Cover,
++                        destination_x: 0.0,
++                        destination_y: 0.0,
++                        destination_width: 1920.0,
++                        destination_height: 1080.0,
++                        background: "#000000".into(),
++                    },
++                }),
++            }),
++        };
++        let json = serde_json::to_string(&event).expect("serialize");
++        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(event, decoded);
++    }
++
++    #[test]
++    fn ipc_image_metadata_roundtrip() {
++        let meta = IpcImageMetadata {
++            width: 256,
++            height: 256,
++            color_type: "Rgba8".into(),
++            detected_format: "Png".into(),
++            file_size_bytes: 67890,
++        };
++        let json = serde_json::to_string(&meta).expect("serialize");
++        let decoded: IpcImageMetadata = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(meta, decoded);
++    }
++
++    #[test]
++    fn static_image_layout_report_roundtrip() {
++        let report = StaticImageLayoutReport {
++            viewport_width: 1920,
++            viewport_height: 1080,
++            image_width: 1024,
++            image_height: 768,
++            fit: FitMode::Contain,
++            destination_x: 240.0,
++            destination_y: 0.0,
++            destination_width: 1440.0,
++            destination_height: 1080.0,
++            background: "#1a1a2e".into(),
++        };
++        let json = serde_json::to_string(&report).expect("serialize");
++        let decoded: StaticImageLayoutReport = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(report, decoded);
++    }
++
++    #[test]
++    fn static_image_apply_report_roundtrip() {
++        let report = StaticImageApplyReport {
++            image_metadata: IpcImageMetadata {
++                width: 100,
++                height: 100,
++                color_type: "Rgb8".into(),
++                detected_format: "Jpeg".into(),
++                file_size_bytes: 5000,
++            },
++            layout: StaticImageLayoutReport {
++                viewport_width: 1920,
++                viewport_height: 1080,
++                image_width: 100,
++                image_height: 100,
++                fit: FitMode::Center,
++                destination_x: 910.0,
++                destination_y: 490.0,
++                destination_width: 100.0,
++                destination_height: 100.0,
++                background: "#000000".into(),
++            },
++        };
++        let json = serde_json::to_string(&report).expect("serialize");
++        let decoded: StaticImageApplyReport = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(report, decoded);
++    }
++
++    #[test]
++    fn applied_wallpaper_report_roundtrip() {
++        let wid = WallpaperId::new();
++        let rid = RendererId::new();
++        let report = AppliedWallpaperReport {
++            wallpaper_id: wid,
++            renderer_id: rid,
++            applied_at: Some("2024-06-15T12:30:00Z".into()),
++            static_image: Some(StaticImageApplyReport {
++                image_metadata: IpcImageMetadata {
++                    width: 2,
++                    height: 2,
++                    color_type: "Rgba8".into(),
++                    detected_format: "Png".into(),
++                    file_size_bytes: 100,
++                },
++                layout: StaticImageLayoutReport {
++                    viewport_width: 1920,
++                    viewport_height: 1080,
++                    image_width: 2,
++                    image_height: 2,
++                    fit: FitMode::Cover,
++                    destination_x: 0.0,
++                    destination_y: 0.0,
++                    destination_width: 1920.0,
++                    destination_height: 1080.0,
++                    background: "#000000".into(),
++                },
++            }),
++        };
++        let json = serde_json::to_string(&report).expect("serialize");
++        let decoded: AppliedWallpaperReport = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(report, decoded);
++    }
++
++    #[test]
++    fn wallpaper_applied_without_report_deserializes() {
++        // Verify backward compatibility: WallpaperApplied without report field
++        let wid = WallpaperId::new();
++        let rid = RendererId::new();
++        let json = format!(
++            r#"{{"WallpaperApplied":{{"renderer_id":"{}","wallpaper_id":"{}","monitor_id":"mon-1"}}}}"#,
++            rid.0, wid.0
++        );
++        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
++        match decoded {
++            RendererEvent::WallpaperApplied { report, .. } => {
++                assert_eq!(report, None);
++            }
++            _ => panic!("expected WallpaperApplied"),
++        }
++    }
++
++    #[test]
++    fn wallpaper_apply_failed_with_image_load_error_roundtrip() {
++        let event = RendererEvent::WallpaperApplyFailed {
++            renderer_id: RendererId::new(),
++            wallpaper_id: WallpaperId::new(),
++            error: WallpaperApplyError::ImageLoadFailed {
++                path: "/bad/image.png".into(),
++                reason: "unsupported format".into(),
++            },
+         };
+         let json = serde_json::to_string(&event).expect("serialize");
+         let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+index c3a783d..0b93e8e 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/Cargo.toml
+@@ -6,7 +6,9 @@ rust-version.workspace = true
+ license.workspace = true
+ 
+ [dependencies]
++image = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json.workspace = true
+ thiserror.workspace = true
+ tracing.workspace = true
++wallflow-common = { path = "../wallflow-common" }
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+index 2d314a8..9bb2db2 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/error.rs
+@@ -30,3 +30,68 @@ pub enum WallpaperPackageError {
+     #[error("validation failed: {errors:?}")]
+     Validation { errors: Vec<String> },
+ }
++
++/// Metadata extracted from a decoded image file.
++#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct ImageMetadata {
++    pub width: u32,
++    pub height: u32,
++    pub color_type: String,
++    pub detected_format: String,
++    pub file_size_bytes: u64,
++}
++
++/// Error during image decoding.
++#[derive(Debug, Error)]
++pub enum ImageDecodeError {
++    #[error("io error: {0}")]
++    Io(#[from] std::io::Error),
++    #[error("image decode error: {0}")]
++    Decode(String),
++    #[error("unsupported format: {0}")]
++    UnsupportedFormat(String),
++}
++
++/// Load image metadata from a file without fully decoding pixels.
++///
++/// Uses `image::ImageReader` to read dimensions and format information.
++pub fn load_image_metadata(path: &std::path::Path) -> Result<ImageMetadata, ImageDecodeError> {
++    let file_size = std::fs::metadata(path)?.len();
++
++    let reader = image::ImageReader::open(path).map_err(|e| {
++        ImageDecodeError::Io(std::io::Error::new(
++            e.kind(),
++            format!("failed to open image for metadata: {e}"),
++        ))
++    })?;
++
++    let detected_format = reader
++        .format()
++        .map(|f| format!("{f:?}"))
++        .unwrap_or_else(|| "Unknown".to_string());
++
++    let (width, height) = reader
++        .into_dimensions()
++        .map_err(|e| ImageDecodeError::Decode(format!("failed to read image dimensions: {e}")))?;
++
++    // Re-open to get color type without full decode
++    let reader2 = image::ImageReader::open(path).map_err(|e| {
++        ImageDecodeError::Io(std::io::Error::new(
++            e.kind(),
++            format!("failed to open image for color type: {e}"),
++        ))
++    })?;
++
++    let color_type_str = reader2
++        .decode()
++        .map(|img| format!("{:?}", img.color()))
++        .unwrap_or_else(|_| "Unknown".to_string());
++
++    Ok(ImageMetadata {
++        width,
++        height,
++        color_type: color_type_str,
++        detected_format,
++        file_size_bytes: file_size,
++    })
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+new file mode 100644
+index 0000000..8899fc0
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+@@ -0,0 +1,445 @@
++use serde::{Deserialize, Serialize};
++use thiserror::Error;
++use wallflow_common::FitMode;
++
++/// Viewport dimensions for layout calculation.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Viewport {
++    pub width: u32,
++    pub height: u32,
++}
++
++/// Image dimensions for layout calculation.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct ImageSize {
++    pub width: u32,
++    pub height: u32,
++}
++
++/// A rectangle in pixel coordinates.
++#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
++pub struct RenderRect {
++    pub x: f64,
++    pub y: f64,
++    pub width: f64,
++    pub height: f64,
++}
++
++/// The calculated layout for a static image wallpaper.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct StaticImageLayout {
++    pub viewport: Viewport,
++    pub image_size: ImageSize,
++    pub fit: FitMode,
++    pub destination_rect: RenderRect,
++    pub tile_size: Option<ImageSize>,
++    pub background: String,
++}
++
++/// Error in layout calculation.
++#[derive(Debug, Error)]
++pub enum LayoutError {
++    #[error("zero dimension not allowed: width={width}, height={height}")]
++    ZeroDimension { width: u32, height: u32 },
++}
++
++/// Calculate how a static image should be laid out in a viewport.
++///
++/// Returns a `StaticImageLayout` describing the destination rectangle
++/// and any additional layout information (e.g., tile size for tile mode).
++pub fn calculate_static_image_layout(
++    image_size: ImageSize,
++    viewport: Viewport,
++    fit: FitMode,
++    background: String,
++) -> Result<StaticImageLayout, LayoutError> {
++    if image_size.width == 0
++        || image_size.height == 0
++        || viewport.width == 0
++        || viewport.height == 0
++    {
++        return Err(LayoutError::ZeroDimension {
++            width: image_size.width,
++            height: image_size.height,
++        });
++    }
++
++    let iw = f64::from(image_size.width);
++    let ih = f64::from(image_size.height);
++    let vw = f64::from(viewport.width);
++    let vh = f64::from(viewport.height);
++
++    let (destination_rect, tile_size) = match fit {
++        FitMode::Cover => {
++            let scale = (vw / iw).max(vh / ih);
++            let dest_w = iw * scale;
++            let dest_h = ih * scale;
++            let x = (vw - dest_w) / 2.0;
++            let y = (vh - dest_h) / 2.0;
++            (
++                RenderRect {
++                    x,
++                    y,
++                    width: dest_w,
++                    height: dest_h,
++                },
++                None,
++            )
++        }
++        FitMode::Contain => {
++            let scale = (vw / iw).min(vh / ih);
++            let dest_w = iw * scale;
++            let dest_h = ih * scale;
++            let x = (vw - dest_w) / 2.0;
++            let y = (vh - dest_h) / 2.0;
++            (
++                RenderRect {
++                    x,
++                    y,
++                    width: dest_w,
++                    height: dest_h,
++                },
++                None,
++            )
++        }
++        FitMode::Stretch => (
++            RenderRect {
++                x: 0.0,
++                y: 0.0,
++                width: vw,
++                height: vh,
++            },
++            None,
++        ),
++        FitMode::Center => {
++            let x = (vw - iw) / 2.0;
++            let y = (vh - ih) / 2.0;
++            (
++                RenderRect {
++                    x,
++                    y,
++                    width: iw,
++                    height: ih,
++                },
++                None,
++            )
++        }
++        FitMode::Tile => (
++            RenderRect {
++                x: 0.0,
++                y: 0.0,
++                width: vw,
++                height: vh,
++            },
++            Some(image_size),
++        ),
++    };
++
++    Ok(StaticImageLayout {
++        viewport,
++        image_size,
++        fit,
++        destination_rect,
++        tile_size,
++        background,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use wallflow_common::FitMode;
++
++    const BG: &str = "#000000";
++
++    #[test]
++    fn cover_landscape_image_into_landscape_viewport() {
++        // 4:3 image into 16:9 viewport — scale fills 16:9
++        let image = ImageSize {
++            width: 4,
++            height: 3,
++        };
++        let viewport = Viewport {
++            width: 16,
++            height: 9,
++        };
++        let layout = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string())
++            .expect("layout");
++        // scale = max(16/4, 9/3) = max(4, 3) = 4
++        // dest_w = 4*4 = 16, dest_h = 3*4 = 12
++        // x = (16-16)/2 = 0, y = (9-12)/2 = -1.5
++        assert_eq!(layout.destination_rect.width, 16.0);
++        assert_eq!(layout.destination_rect.height, 12.0);
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert_eq!(layout.destination_rect.y, -1.5);
++        assert!(layout.tile_size.is_none());
++    }
++
++    #[test]
++    fn contain_landscape_image_into_landscape_viewport() {
++        // 4:3 image into 16:9 viewport — scale fits entirely
++        let image = ImageSize {
++            width: 4,
++            height: 3,
++        };
++        let viewport = Viewport {
++            width: 16,
++            height: 9,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Contain, BG.to_string())
++                .expect("layout");
++        // scale = min(16/4, 9/3) = min(4, 3) = 3
++        // dest_w = 4*3 = 12, dest_h = 3*3 = 9
++        // x = (16-12)/2 = 2, y = (9-9)/2 = 0
++        assert_eq!(layout.destination_rect.width, 12.0);
++        assert_eq!(layout.destination_rect.height, 9.0);
++        assert_eq!(layout.destination_rect.x, 2.0);
++        assert_eq!(layout.destination_rect.y, 0.0);
++    }
++
++    #[test]
++    fn stretch_fills_viewport_exactly() {
++        let image = ImageSize {
++            width: 4,
++            height: 3,
++        };
++        let viewport = Viewport {
++            width: 16,
++            height: 9,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Stretch, BG.to_string())
++                .expect("layout");
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert_eq!(layout.destination_rect.y, 0.0);
++        assert_eq!(layout.destination_rect.width, 16.0);
++        assert_eq!(layout.destination_rect.height, 9.0);
++    }
++
++    #[test]
++    fn center_no_scaling() {
++        let image = ImageSize {
++            width: 800,
++            height: 600,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Center, BG.to_string())
++                .expect("layout");
++        assert_eq!(layout.destination_rect.width, 800.0);
++        assert_eq!(layout.destination_rect.height, 600.0);
++        assert_eq!(layout.destination_rect.x, (1920.0 - 800.0) / 2.0);
++        assert_eq!(layout.destination_rect.y, (1080.0 - 600.0) / 2.0);
++    }
++
++    #[test]
++    fn tile_returns_tile_size() {
++        let image = ImageSize {
++            width: 256,
++            height: 256,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout = calculate_static_image_layout(image, viewport, FitMode::Tile, BG.to_string())
++            .expect("layout");
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert_eq!(layout.destination_rect.y, 0.0);
++        assert_eq!(layout.destination_rect.width, 1920.0);
++        assert_eq!(layout.destination_rect.height, 1080.0);
++        assert_eq!(
++            layout.tile_size,
++            Some(ImageSize {
++                width: 256,
++                height: 256
++            })
++        );
++    }
++
++    #[test]
++    fn zero_width_rejects() {
++        let image = ImageSize {
++            width: 0,
++            height: 100,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let result = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string());
++        assert!(result.is_err());
++        match result {
++            Err(LayoutError::ZeroDimension { width, height }) => {
++                assert_eq!(width, 0);
++                assert_eq!(height, 100);
++            }
++            _ => panic!("expected ZeroDimension error"),
++        }
++    }
++
++    #[test]
++    fn zero_height_rejects() {
++        let image = ImageSize {
++            width: 100,
++            height: 0,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let result = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string());
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn zero_viewport_dimension_rejects() {
++        let image = ImageSize {
++            width: 100,
++            height: 100,
++        };
++        let viewport = Viewport {
++            width: 0,
++            height: 1080,
++        };
++        let result = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string());
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn same_size_image_and_viewport_cover() {
++        // 1920x1080 image into 1920x1080 viewport
++        let image = ImageSize {
++            width: 1920,
++            height: 1080,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string())
++            .expect("layout");
++        // scale = max(1, 1) = 1, so exact fit
++        assert_eq!(layout.destination_rect.width, 1920.0);
++        assert_eq!(layout.destination_rect.height, 1080.0);
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert_eq!(layout.destination_rect.y, 0.0);
++    }
++
++    #[test]
++    fn four_three_image_into_sixteen_nine_cover() {
++        let image = ImageSize {
++            width: 1024,
++            height: 768,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string())
++            .expect("layout");
++        // scale = max(1920/1024, 1080/768) = max(1.875, 1.40625) = 1.875
++        // dest_w = 1024*1.875 = 1920, dest_h = 768*1.875 = 1440
++        // x = (1920-1920)/2 = 0, y = (1080-1440)/2 = -180
++        assert_eq!(layout.destination_rect.width, 1920.0);
++        assert!((layout.destination_rect.height - 1440.0).abs() < 0.001);
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert!((layout.destination_rect.y - (-180.0)).abs() < 0.001);
++    }
++
++    #[test]
++    fn four_three_image_into_sixteen_nine_contain() {
++        let image = ImageSize {
++            width: 1024,
++            height: 768,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Contain, BG.to_string())
++                .expect("layout");
++        // scale = min(1920/1024, 1080/768) = min(1.875, 1.40625) = 1.40625
++        // dest_w = 1024*1.40625 = 1440, dest_h = 768*1.40625 = 1080
++        // x = (1920-1440)/2 = 240, y = (1080-1080)/2 = 0
++        assert!((layout.destination_rect.width - 1440.0).abs() < 0.001);
++        assert!((layout.destination_rect.height - 1080.0).abs() < 0.001);
++        assert!((layout.destination_rect.x - 240.0).abs() < 0.001);
++        assert!((layout.destination_rect.y).abs() < 0.001);
++    }
++
++    #[test]
++    fn portrait_image_into_landscape_viewport_cover() {
++        // 9:16 portrait image into 16:9 landscape viewport
++        let image = ImageSize {
++            width: 1080,
++            height: 1920,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string())
++            .expect("layout");
++        // scale = max(1920/1080, 1080/1920) = max(1.7778, 0.5625) = 1.7778
++        // dest_w = 1080*1.7778 = 1920, dest_h = 1920*1.7778 = 3413.33
++        assert!((layout.destination_rect.width - 1920.0).abs() < 0.01);
++        assert!(layout.destination_rect.height > 3000.0);
++    }
++
++    #[test]
++    fn portrait_image_into_landscape_viewport_contain() {
++        let image = ImageSize {
++            width: 1080,
++            height: 1920,
++        };
++        let viewport = Viewport {
++            width: 1920,
++            height: 1080,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Contain, BG.to_string())
++                .expect("layout");
++        // scale = min(1920/1080, 1080/1920) = min(1.7778, 0.5625) = 0.5625
++        // dest_w = 1080*0.5625 = 607.5, dest_h = 1920*0.5625 = 1080
++        assert!((layout.destination_rect.height - 1080.0).abs() < 0.01);
++        assert!(layout.destination_rect.width < 700.0);
++    }
++
++    #[test]
++    fn layout_preserves_fit_mode() {
++        let image = ImageSize {
++            width: 100,
++            height: 100,
++        };
++        let viewport = Viewport {
++            width: 200,
++            height: 200,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Contain, BG.to_string())
++                .expect("layout");
++        assert_eq!(layout.fit, FitMode::Contain);
++    }
++
++    #[test]
++    fn layout_preserves_background() {
++        let image = ImageSize {
++            width: 100,
++            height: 100,
++        };
++        let viewport = Viewport {
++            width: 200,
++            height: 200,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Cover, "#1a1a2e".to_string())
++                .expect("layout");
++        assert_eq!(layout.background, "#1a1a2e");
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+index 7fa3ebb..acc540a 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/lib.rs
+@@ -19,9 +19,15 @@
+ //! the package directory.
+ 
+ mod error;
++mod layout;
+ mod manifest;
+ mod validation;
+ 
+-pub use error::WallpaperPackageError;
++pub use error::{load_image_metadata, ImageDecodeError, ImageMetadata, WallpaperPackageError};
++pub use layout::{
++    calculate_static_image_layout, ImageSize, LayoutError, RenderRect, StaticImageLayout, Viewport,
++};
+ pub use manifest::*;
+-pub use validation::{validate_manifest, validate_package, WallpaperValidationReport};
++pub use validation::{
++    validate_manifest, validate_package, validate_package_deep, WallpaperValidationReport,
++};
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+index 4c85de9..19265ed 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/manifest.rs
+@@ -1,6 +1,7 @@
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::error::WallpaperPackageError;
++pub use wallflow_common::FitMode;
+ 
+ /// Current manifest schema version.
+ pub const MANIFEST_SCHEMA_VERSION: u32 = 0;
+@@ -53,30 +54,6 @@ impl std::fmt::Display for WallpaperKind {
+     }
+ }
+ 
+-/// How a static image should be fitted to the screen.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+-#[serde(rename_all = "snake_case")]
+-pub enum FitMode {
+-    #[default]
+-    Cover,
+-    Contain,
+-    Stretch,
+-    Center,
+-    Tile,
+-}
+-
+-impl std::fmt::Display for FitMode {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            FitMode::Cover => write!(f, "cover"),
+-            FitMode::Contain => write!(f, "contain"),
+-            FitMode::Stretch => write!(f, "stretch"),
+-            FitMode::Center => write!(f, "center"),
+-            FitMode::Tile => write!(f, "tile"),
+-        }
+-    }
+-}
+-
+ /// Static image wallpaper entry configuration.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct StaticImageWallpaper {
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+index bbf4f8d..a9381fe 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/validation.rs
+@@ -1,6 +1,7 @@
+ use serde::{Deserialize, Serialize};
+ use tracing::{debug, warn};
+ 
++use crate::error::{load_image_metadata, ImageDecodeError};
+ use crate::manifest::{
+     validate_relative_path, WallpaperKind, WallpaperManifest, SUPPORTED_SCHEMA_VERSIONS,
+ };
+@@ -152,6 +153,47 @@ pub fn validate_package(package: &crate::WallpaperPackage) -> WallpaperValidatio
+     report
+ }
+ 
++/// Deep validation: structural + image decode validation.
++///
++/// In addition to all `validate_package` checks, this also:
++/// - Actually decodes the entry image metadata (dimensions, format, color type)
++/// - Verifies the image is a valid, decodable image file
++pub fn validate_package_deep(package: &crate::WallpaperPackage) -> WallpaperValidationReport {
++    let mut report = validate_package(package);
++
++    // For static_image kind, try to decode image metadata
++    if matches!(package.manifest.kind, WallpaperKind::StaticImage)
++        && !package.manifest.entry.image.trim().is_empty()
++    {
++        let image_path = package.directory.join(&package.manifest.entry.image);
++        if image_path.exists() {
++            match load_image_metadata(&image_path) {
++                Ok(metadata) => {
++                    debug!(
++                        package_id = %package.manifest.id,
++                        width = metadata.width,
++                        height = metadata.height,
++                        format = %metadata.detected_format,
++                        "deep validation: image metadata loaded"
++                    );
++                }
++                Err(ImageDecodeError::UnsupportedFormat(fmt)) => {
++                    report.add_error(format!("entry image has unsupported format: {fmt}"));
++                }
++                Err(ImageDecodeError::Decode(msg)) => {
++                    report.add_error(format!("entry image could not be decoded: {msg}"));
++                }
++                Err(ImageDecodeError::Io(e)) => {
++                    report.add_error(format!("entry image io error during decode: {e}"));
++                }
++            }
++        }
++        // If image doesn't exist, validate_package already caught it
++    }
++
++    report
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -364,4 +406,166 @@ mod tests {
+             report.errors
+         );
+     }
++
++    // --- Deep validation tests ---
++
++    #[test]
++    fn deep_validation_with_real_png() {
++        let dir = std::env::temp_dir().join("wallflow-test-deep-valid");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(dir.join("content"));
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        // Create a real 2x2 PNG
++        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
++        img.save(dir.join("content/wallpaper.png"))
++            .expect("save png");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package_deep(&package);
++        assert!(
++            report.valid,
++            "expected valid, got errors: {:?}",
++            report.errors
++        );
++    }
++
++    #[test]
++    fn deep_validation_invalid_image_file_fails() {
++        let dir = std::env::temp_dir().join("wallflow-test-deep-invalid");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(dir.join("content"));
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        // Write invalid image data
++        std::fs::write(dir.join("content/wallpaper.png"), b"NOT-A-REAL-IMAGE").expect("write");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package_deep(&package);
++        assert!(
++            !report.valid,
++            "expected deep validation to fail for invalid image"
++        );
++        assert!(report
++            .errors
++            .iter()
++            .any(|e| e.contains("decode") || e.contains("could not be decoded")));
++    }
++
++    #[test]
++    fn structural_validation_passes_without_image_decode_if_file_exists() {
++        let dir = std::env::temp_dir().join("wallflow-test-structural-only");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(dir.join("content"));
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        // Write invalid image data - structural validation should still pass
++        std::fs::write(dir.join("content/wallpaper.png"), b"FAKE-DATA").expect("write");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package(&package);
++        assert!(
++            report.valid,
++            "structural validation should pass even with invalid image data, got errors: {:?}",
++            report.errors
++        );
++    }
++
++    #[test]
++    fn path_traversal_still_rejected_by_deep_validation() {
++        let dir = std::env::temp_dir().join("wallflow-test-deep-traversal");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(&dir);
++
++        let mut manifest = valid_static_manifest();
++        manifest.entry.image = "../etc/passwd".into();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package_deep(&package);
++        assert!(!report.valid);
++        assert!(report
++            .errors
++            .iter()
++            .any(|e| e.contains("traversal") || e.contains("invalid")));
++    }
++
++    #[test]
++    fn missing_image_still_fails_deep_validation() {
++        let dir = std::env::temp_dir().join("wallflow-test-deep-missing");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(&dir);
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        let package = crate::WallpaperPackage::load(&dir).expect("load");
++        let report = validate_package_deep(&package);
++        assert!(!report.valid);
++        assert!(report.errors.iter().any(|e| e.contains("not found")));
++    }
++
++    #[test]
++    fn deep_validation_image_dimensions_correct() {
++        let dir = std::env::temp_dir().join("wallflow-test-deep-dimensions");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(dir.join("content"));
++
++        let manifest = valid_static_manifest();
++        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
++        std::fs::write(dir.join("manifest.json"), &json).expect("write manifest");
++
++        // Create a real 2x2 PNG
++        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
++        img.save(dir.join("content/wallpaper.png"))
++            .expect("save png");
++
++        // Verify metadata directly
++        let image_path = dir.join("content/wallpaper.png");
++        let metadata = load_image_metadata(&image_path).expect("load metadata");
++        assert_eq!(metadata.width, 2);
++        assert_eq!(metadata.height, 2);
++        assert_eq!(metadata.detected_format, "Png");
++    }
++
++    #[test]
++    fn load_metadata_valid_png() {
++        let dir = std::env::temp_dir().join("wallflow-test-metadata-valid");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(&dir);
++
++        let img = image::RgbaImage::from_pixel(100, 50, image::Rgba([255, 0, 0, 255]));
++        let path = dir.join("test.png");
++        img.save(&path).expect("save");
++
++        let metadata = load_image_metadata(&path).expect("load metadata");
++        assert_eq!(metadata.width, 100);
++        assert_eq!(metadata.height, 50);
++        assert_eq!(metadata.detected_format, "Png");
++        assert!(metadata.file_size_bytes > 0);
++    }
++
++    #[test]
++    fn load_metadata_invalid_file_fails() {
++        let dir = std::env::temp_dir().join("wallflow-test-metadata-invalid");
++        let _ = std::fs::remove_dir_all(&dir);
++        let _ = std::fs::create_dir_all(&dir);
++
++        let path = dir.join("bad.png");
++        std::fs::write(&path, b"garbage data").expect("write");
++
++        let result = load_image_metadata(&path);
++        assert!(result.is_err());
++    }
+ }
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+index 2c71246..e697438 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+@@ -8,6 +8,7 @@ license.workspace = true
+ [dependencies]
+ anyhow.workspace = true
+ clap.workspace = true
++image.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ tracing.workspace = true
+@@ -17,6 +18,7 @@ wallflow-common = { path = "../wallflow-common" }
+ wallflow-desktop = { path = "../wallflow-desktop" }
+ wallflow-ipc = { path = "../wallflow-ipc" }
+ wallflow-media = { path = "../wallflow-media" }
++wallflow-package = { path = "../wallflow-package" }
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.58", features = [
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+index c25dfec..19fb9f0 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+@@ -7,8 +7,9 @@ use tracing::{info, warn};
+ use uuid::Uuid;
+ use wallflow_common::{RendererId, WallpaperId};
+ use wallflow_ipc::{
+-    encode_to_bytes, ApplyWallpaperRequest, EventEnvelope, IpcMessage, RendererCommand,
+-    RendererEvent, WallpaperApplyError, WallpaperPayload,
++    encode_to_bytes, AppliedWallpaperReport, ApplyWallpaperRequest, EventEnvelope,
++    IpcImageMetadata, IpcMessage, RendererCommand, RendererEvent, StaticImageApplyReport,
++    StaticImageLayoutReport, WallpaperApplyError, WallpaperPayload,
+ };
+ use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
+ 
+@@ -64,16 +65,16 @@ struct Args {
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// Applied wallpaper state
++// Loaded static image state (replaces AppliedWallpaperState)
+ // ---------------------------------------------------------------------------
+ 
+-/// Tracks the currently applied wallpaper in the renderer process.
++/// Tracks a loaded static image wallpaper with decoded metadata and layout.
+ #[derive(Debug, Clone)]
+-#[allow(dead_code)] // Fields will be read when GPU rendering is implemented (stage 006)
+-struct AppliedWallpaperState {
++#[allow(dead_code)]
++struct LoadedStaticImageState {
+     wallpaper_id: WallpaperId,
+-    payload: WallpaperPayload,
+-    target_monitor: String,
++    metadata: wallflow_package::ImageMetadata,
++    layout: wallflow_package::StaticImageLayout,
+     applied_at: Instant,
+ }
+ 
+@@ -172,7 +173,7 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
+     let interval = Duration::from_millis(interval_ms);
+     let mut is_paused = false;
+     let mut heartbeat_count: u64 = 0;
+-    let mut applied_state: Option<AppliedWallpaperState> = None;
++    let mut loaded_state: Option<LoadedStaticImageState> = None;
+ 
+     // Channel for receiving commands from the stdin reader thread
+     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RendererCommand>();
+@@ -245,7 +246,7 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
+                         break;
+                     }
+                     RendererCommand::ApplyWallpaper(request) => {
+-                        handle_apply_wallpaper(renderer_id, request, &mut applied_state)?;
++                        handle_apply_wallpaper(renderer_id, request, &mut loaded_state)?;
+                     }
+                     RendererCommand::SetMonitor { monitor_id } => {
+                         info!(?renderer_id, ?monitor_id, "monitor changed via IPC command");
+@@ -280,11 +281,11 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
+     Ok(())
+ }
+ 
+-/// Handle an ApplyWallpaper command: validate, update state, respond.
++/// Handle an ApplyWallpaper command: validate, decode metadata, calculate layout, respond.
+ fn handle_apply_wallpaper(
+     renderer_id: RendererId,
+     request: ApplyWallpaperRequest,
+-    applied_state: &mut Option<AppliedWallpaperState>,
++    loaded_state: &mut Option<LoadedStaticImageState>,
+ ) -> Result<()> {
+     let wallpaper_id = request.wallpaper_id;
+     let monitor_id = request.target_monitor.clone();
+@@ -304,29 +305,103 @@ fn handle_apply_wallpaper(
+                 return Ok(());
+             }
+ 
+-            // At this stage, the renderer does not actually render the image.
+-            // It validates the payload and records the applied state.
+-            // Real GPU rendering will be implemented in stage 006.
++            let image_path = std::path::Path::new(&static_payload.image_path);
++
++            // Decode image metadata using wallflow-package
++            let metadata = match wallflow_package::load_image_metadata(image_path) {
++                Ok(m) => m,
++                Err(e) => {
++                    let reason = format!("{e}");
++                    warn!(
++                        ?renderer_id,
++                        ?wallpaper_id,
++                        error = %reason,
++                        "failed to decode image metadata"
++                    );
++                    send_ipc_event(RendererEvent::WallpaperApplyFailed {
++                        renderer_id,
++                        wallpaper_id,
++                        error: WallpaperApplyError::ImageLoadFailed {
++                            path: static_payload.image_path.clone(),
++                            reason,
++                        },
++                    })?;
++                    return Ok(());
++                }
++            };
++
++            // Calculate layout using wallflow-package
++            let image_size = wallflow_package::ImageSize {
++                width: metadata.width,
++                height: metadata.height,
++            };
++            // Default viewport: 1920x1080 (synthetic viewport for cloud testing)
++            let viewport = wallflow_package::Viewport {
++                width: 1920,
++                height: 1080,
++            };
++
++            let layout = match wallflow_package::calculate_static_image_layout(
++                image_size,
++                viewport,
++                static_payload.fit,
++                static_payload.background.clone(),
++            ) {
++                Ok(l) => l,
++                Err(e) => {
++                    let reason = format!("{e}");
++                    warn!(
++                        ?renderer_id,
++                        ?wallpaper_id,
++                        error = %reason,
++                        "failed to calculate layout"
++                    );
++                    send_ipc_event(RendererEvent::WallpaperApplyFailed {
++                        renderer_id,
++                        wallpaper_id,
++                        error: WallpaperApplyError::Other { message: reason },
++                    })?;
++                    return Ok(());
++                }
++            };
++
+             info!(
+                 ?renderer_id,
+                 ?wallpaper_id,
+                 image_path = %static_payload.image_path,
++                image_width = metadata.width,
++                image_height = metadata.height,
+                 ?static_payload.fit,
+-                background = %static_payload.background,
+-                "static wallpaper applied (state recorded, not rendering yet)"
++                "static wallpaper applied with decoded metadata and layout"
+             );
+ 
+-            *applied_state = Some(AppliedWallpaperState {
++            // Store the loaded state
++            *loaded_state = Some(LoadedStaticImageState {
+                 wallpaper_id,
+-                payload: request.payload,
+-                target_monitor: monitor_id.0.clone(),
++                metadata: metadata.clone(),
++                layout: layout.clone(),
+                 applied_at: Instant::now(),
+             });
+ 
++            // Build the report
++            let ipc_metadata: IpcImageMetadata = metadata.into();
++            let ipc_layout: StaticImageLayoutReport = layout.into();
++
++            let report = AppliedWallpaperReport {
++                wallpaper_id,
++                renderer_id,
++                applied_at: Some(chrono_now_iso8601()),
++                static_image: Some(StaticImageApplyReport {
++                    image_metadata: ipc_metadata,
++                    layout: ipc_layout,
++                }),
++            };
++
+             send_ipc_event(RendererEvent::WallpaperApplied {
+                 renderer_id,
+                 wallpaper_id,
+                 monitor_id,
++                report: Some(report),
+             })?;
+         }
+     }
+@@ -334,6 +409,46 @@ fn handle_apply_wallpaper(
+     Ok(())
+ }
+ 
++/// Get current time as ISO 8601 string without depending on chrono.
++fn chrono_now_iso8601() -> String {
++    // Simple ISO 8601-like timestamp using std::time
++    // Format: YYYY-MM-DDTHH:MM:SSZ (UTC approximation)
++    let elapsed = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap_or_default();
++    let secs = elapsed.as_secs();
++    // Calculate date components from unix timestamp
++    let days = secs / 86400;
++    let time_of_day = secs % 86400;
++    let hours = time_of_day / 3600;
++    let minutes = (time_of_day % 3600) / 60;
++    let seconds = time_of_day % 60;
++
++    // Calculate year/month/day from days since epoch
++    let (year, month, day) = days_to_date(days);
++
++    format!(
++        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
++        year, month, day, hours, minutes, seconds
++    )
++}
++
++/// Convert days since Unix epoch to (year, month, day).
++fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
++    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
++    let z = days_since_epoch + 719468;
++    let era = z / 146097;
++    let doe = z - era * 146097;
++    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++    let y = yoe + era * 400;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let d = doy - (153 * mp + 2) / 5 + 1;
++    let m = if mp < 10 { mp + 3 } else { mp - 9 };
++    let y = if m <= 2 { y + 1 } else { y };
++    (y, m, d)
++}
++
+ /// Background thread that reads IPC command frames from stdin.
+ /// Sends decoded commands to the main loop via the channel.
+ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result<()> {
+diff --git a/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md b/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
+index aeaab92..c9f76d9 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
++++ b/wallflow/wallflow-foundation/docs/architecture/002-ipc-contract.md
+@@ -1,6 +1,6 @@
+ # 002 – IPC Contract
+ 
+-> Stage: `004-cloud-safe-typed-ipc-renderer-control`
++> Stage: `006-cloud-safe-static-image-decode-and-layout`
+ > Date: 2026-05-30
+ 
+ ## Overview
+@@ -127,8 +127,8 @@ pub struct EventEnvelope<T> {
+ | `Heartbeat { renderer_id, uptime_ms }` | Liveness signal |
+ | `Paused { renderer_id }` | Confirmed pause |
+ | `Resumed { renderer_id }` | Confirmed resume |
+-| `WallpaperApplied { renderer_id, monitor_id, wallpaper_id }` | Wallpaper rendering |
+-| `WallpaperApplyFailed { renderer_id, monitor_id, error: WallpaperApplyError }` | Wallpaper apply failed |
++| `WallpaperApplied { renderer_id, monitor_id, wallpaper_id, report }` | Wallpaper rendering (report contains metadata + layout) |
++| `WallpaperApplyFailed { renderer_id, wallpaper_id, error: WallpaperApplyError }` | Wallpaper apply failed |
+ | `Error { renderer_id, message }` | Error occurred |
+ | `Exited { renderer_id, exit_code }` | Process exiting |
+ 
+@@ -136,17 +136,16 @@ pub struct EventEnvelope<T> {
+ 
+ ```rust
+ pub struct ApplyWallpaperRequest {
+-    pub assignment_id: AssignmentId,
+-    pub monitor_id: MonitorId,
+     pub wallpaper_id: WallpaperId,
+     pub payload: WallpaperPayload,
++    pub target_monitor: MonitorId,
+ }
+ ```
+ 
+ ### WallpaperPayload
+ 
+ ```rust
+-#[serde(tag = "type", content = "data")]
++#[serde(tag = "kind", content = "data")]
+ pub enum WallpaperPayload {
+     #[serde(rename = "static_image")]
+     StaticImage(StaticImagePayload),
+@@ -157,42 +156,83 @@ pub enum WallpaperPayload {
+ 
+ ```rust
+ pub struct StaticImagePayload {
+-    pub path: PathBuf,
+-    pub fit_mode: FitMode,
++    pub image_path: String,
++    pub fit: FitMode,
++    pub background: String,
++    pub opacity: Option<u8>,
+ }
+ ```
+ 
+-### FitMode
++### FitMode (unified in wallflow_common)
+ 
+ ```rust
+ pub enum FitMode {
+-    Fill,
+-    Fit,
++    Cover,    // default
++    Contain,
+     Stretch,
+     Center,
+     Tile,
+ }
+ ```
+ 
++### AppliedWallpaperReport (in WallpaperApplied event)
++
++```rust
++pub struct AppliedWallpaperReport {
++    pub wallpaper_id: WallpaperId,
++    pub renderer_id: RendererId,
++    pub applied_at: Option<String>,
++    pub static_image: Option<StaticImageApplyReport>,
++}
++
++pub struct StaticImageApplyReport {
++    pub image_metadata: IpcImageMetadata,
++    pub layout: StaticImageLayoutReport,
++}
++
++pub struct IpcImageMetadata {
++    pub width: u32,
++    pub height: u32,
++    pub color_type: String,
++    pub detected_format: String,
++    pub file_size_bytes: u64,
++}
++
++pub struct StaticImageLayoutReport {
++    pub viewport_width: u32,
++    pub viewport_height: u32,
++    pub image_width: u32,
++    pub image_height: u32,
++    pub fit: FitMode,
++    pub destination_x: f64,
++    pub destination_y: f64,
++    pub destination_width: f64,
++    pub destination_height: f64,
++    pub background: String,
++}
++```
++
+ ### WallpaperApplyError
+ 
+ ```rust
+ pub enum WallpaperApplyError {
+-    FileNotFound,
+-    DecodeFailed(String),
+-    UnsupportedFormat(String),
+-    RenderFailed(String),
++    UnsupportedKind { kind: String },
++    InvalidImagePath { path: String },
++    ImageLoadFailed { path: String, reason: String },
++    InvalidRendererState { state: String },
++    Other { message: String },
+ }
+ ```
+ 
+ ## Protocol Versioning
+ 
+-The current protocol version is **4** (`PROTOCOL_VERSION`).
++The current protocol version is **5** (`PROTOCOL_VERSION`).
+ 
+ - **Version 1**: Initial protocol with basic CoreCommand/CoreEvent.
+ - **Version 2**: Added RendererCommand/RendererEvent with full lifecycle.
+ - **Version 3**: Added `IpcMessage` tagged union for unambiguous frame decoding.
+ - **Version 4**: Added `ApplyWallpaperRequest` for structured wallpaper apply commands and `WallpaperApplyFailed` event for error reporting.
++- **Version 5**: Added `AppliedWallpaperReport` to `WallpaperApplied` event, containing image metadata and layout calculation results. `FitMode` moved to `wallflow_common`.
+ 
+ Every envelope includes `protocol_version`. Receivers MUST validate the version
+ and reject mismatched messages with `FrameError::ProtocolVersionMismatch`.
+diff --git a/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md b/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+index 9a7557d..c170724 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
++++ b/wallflow/wallflow-foundation/docs/architecture/008-wallpaper-package-format.md
+@@ -1,6 +1,6 @@
+ # 008 – Wallpaper Package Format v0
+ 
+-> Stage: `005-cloud-safe-wallpaper-package-and-apply-contract`
++> Stage: `006-cloud-safe-static-image-decode-and-layout`
+ > Date: 2026-05-30
+ 
+ ## Overview
+@@ -121,6 +121,37 @@ Allowed patterns:
+ - `preview.png`
+ - `assets/bg/image.jpg`
+ 
++## Deep Validation
++
++Stage 006 introduces **deep validation** via `validate_package_deep()`, which
++performs all structural checks plus actual image decode verification:
++
++1. All structural checks from `validate_package()` run first.
++2. For `static_image` kind, the entry image is opened and decoded using
++   `load_image_metadata()`.
++3. If the image cannot be decoded (corrupt file, unsupported format), an
++   error is added to the validation report.
++4. If the image is valid, the metadata (width, height, color type, format)
++   is logged at debug level.
++
++### Validation Levels
++
++| Level | Function | Checks |
++|-------|----------|--------|
++| Manifest | `validate_manifest()` | Schema, required fields, kind, path traversal |
++| Package | `validate_package()` | All manifest checks + file existence |
++| Deep | `validate_package_deep()` | All package checks + image decode verification |
++
++### Usage
++
++```bash
++# Structural validation only
++cargo run -p wallflow-cli -- package-validate /path/to/package
++
++# Deep validation (including image decode)
++cargo run -p wallflow-cli -- package-validate /path/to/package --deep
++```
++
+ ## IPC Integration
+ 
+ When a wallpaper is applied via IPC, the `ApplyWallpaper` command carries the
+@@ -139,18 +170,24 @@ ApplyWallpaperRequest {
+ }
+ ```
+ 
+-The renderer validates the payload, records the applied state, and responds
+-with `WallpaperApplied` or `WallpaperApplyFailed`.
++The renderer decodes the image metadata, calculates the layout, and responds
++with `WallpaperApplied` containing an `AppliedWallpaperReport` with:
++- Image metadata (dimensions, format, color type, file size)
++- Layout calculation result (destination rectangle, viewport, fit mode)
++- ISO 8601 timestamp
++
++On decode failure, `WallpaperApplyFailed` is sent with error details.
+ 
+ ## Current Limitations
+ 
+-- The renderer accepts and records the applied wallpaper state but does **not**
++- The renderer decodes image metadata and calculates layout but does **not**
+   yet render the image to the screen. Real GPU rendering will be implemented
+-  in stage 006 (winit/wgpu renderer).
++  in a future stage (winit/wgpu renderer).
+ - Only `static_image` kind is supported. Video and web wallpapers will be
+   added in future stages.
+-- Image format validation (is this actually a valid PNG/JPEG?) is not yet
+-  implemented. The dummy fixture file in the smoke test is not a real image.
++- The viewport used for layout calculation is a synthetic 1920×1080.
++  Real monitor dimensions will be used when Windows desktop integration
++  is complete.
+ 
+ ## Future Extensions
+ 
+@@ -158,5 +195,4 @@ with `WallpaperApplied` or `WallpaperApplyFailed`.
+ - **Video entry**: Add `video` kind with `entry.video`, `entry.muted`, `entry.looping`.
+ - **Web entry**: Add `web` kind with `entry.html` entry point.
+ - **Package archives**: Support `.wallflow` zip archives instead of directories.
+-- **Image validation**: Verify that image files are decodable.
+ - **Content hashing**: SHA-256 checksums for integrity verification.
+diff --git a/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md b/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+new file mode 100644
+index 0000000..8c75ed8
+--- /dev/null
++++ b/wallflow/wallflow-foundation/docs/architecture/009-static-image-rendering-model.md
+@@ -0,0 +1,180 @@
++# Static Image Rendering Model
++
++## Overview
++
++The static image rendering model defines how a single image file is transformed
++into a wallpaper on a display viewport. It consists of two phases:
++
++1. **Image Decode** — Read the image file and extract metadata (dimensions, format,
++   color type) without fully decoding all pixels.
++2. **Layout Calculation** — Given the image dimensions, the viewport dimensions,
++   and a fit mode, compute the destination rectangle where the image should be
++   drawn.
++
++## Image Decode
++
++The `wallflow-package` crate provides `load_image_metadata()` which uses
++`image::io::Reader` to read image dimensions and format information without
++fully decoding all pixels. This is efficient for large images since only the
++header is read.
++
++### Metadata
++
++```rust
++pub struct ImageMetadata {
++    pub width: u32,
++    pub height: u32,
++    pub color_type: String,
++    pub detected_format: String,
++    pub file_size_bytes: u64,
++}
++```
++
++- `color_type` is the stringified `image::ColorType` (e.g., "Rgba8", "Rgb8").
++- `detected_format` is the stringified `image::ImageFormat` (e.g., "Png", "Jpeg").
++
++## Layout Calculation
++
++The `calculate_static_image_layout()` function in `wallflow-package::layout`
++computes how an image should be positioned and scaled within a viewport.
++
++### Viewport
++
++The viewport is a synthetic concept representing the display area. In the
++current cloud-testable implementation, a default viewport of 1920×1080 is used.
++In the future, this will come from actual monitor information.
++
++```rust
++pub struct Viewport {
++    pub width: u32,
++    pub height: u32,
++}
++```
++
++### Fit Modes
++
++Five fit modes are supported, each with a specific formula:
++
++#### Cover
++
++Scale the image uniformly to fill the entire viewport. One dimension will
++match exactly, the other will overflow (be cropped).
++
++```
++scale = max(viewport_width / image_width, viewport_height / image_height)
++dest_width = image_width × scale
++dest_height = image_height × scale
++x = (viewport_width - dest_width) / 2
++y = (viewport_height - dest_height) / 2
++```
++
++The destination rectangle may extend beyond the viewport boundaries (negative
++x or y, or width/height exceeding viewport dimensions). The renderer should
++clip to the viewport.
++
++#### Contain
++
++Scale the image uniformly to fit entirely within the viewport. One dimension
++will match exactly, the other will have letterboxing (empty space).
++
++```
++scale = min(viewport_width / image_width, viewport_height / image_height)
++dest_width = image_width × scale
++dest_height = image_height × scale
++x = (viewport_width - dest_width) / 2
++y = (viewport_height - dest_height) / 2
++```
++
++The destination rectangle will always be within the viewport. The background
++color fills the letterboxed area.
++
++#### Stretch
++
++Scale non-uniformly to exactly fill the viewport. Both dimensions match
++the viewport exactly.
++
++```
++dest_width = viewport_width
++dest_height = viewport_height
++x = 0
++y = 0
++```
++
++This may distort the image aspect ratio.
++
++#### Center
++
++No scaling. Center the image at its natural size.
++
++```
++dest_width = image_width
++dest_height = image_height
++x = (viewport_width - image_width) / 2
++y = (viewport_height - image_height) / 2
++```
++
++The image may be smaller than the viewport (letterboxing) or larger
++(overflow/clip).
++
++#### Tile
++
++Repeat the image at its natural size to cover the entire viewport.
++
++```
++tile_size = (image_width, image_height)
++destination = (0, 0, viewport_width, viewport_height)
++```
++
++The `tile_size` field in `StaticImageLayout` is set to the image dimensions,
++indicating the tile repeat interval. The `destination_rect` covers the full
++viewport.
++
++### Zero Dimensions
++
++If any dimension (image or viewport) is zero, `LayoutError::ZeroDimension` is
++returned. Zero dimensions are never valid for layout calculation.
++
++## Layout Report (IPC)
++
++The layout calculation result is transmitted over IPC as a
++`StaticImageLayoutReport`:
++
++```rust
++pub struct StaticImageLayoutReport {
++    pub viewport_width: u32,
++    pub viewport_height: u32,
++    pub image_width: u32,
++    pub image_height: u32,
++    pub fit: FitMode,
++    pub destination_x: f64,
++    pub destination_y: f64,
++    pub destination_width: f64,
++    pub destination_height: f64,
++    pub background: String,
++}
++```
++
++This is an IPC-safe type (no dependency on the `image` crate) that can be
++sent from the renderer process to Core.
++
++## Synthetic Viewport
++
++In the current implementation, the renderer uses a synthetic viewport of
++1920×1080 when calculating layout. This is because:
++
++1. The renderer does not have access to real monitor information in the
++   cloud-testable (Linux) environment.
++2. The layout calculation is tested independently of actual display hardware.
++
++When real Windows desktop integration is implemented, the viewport will be
++sourced from `MonitorInfo.size_px`.
++
++## REQUIRES_REAL_WINDOWS_VALIDATION
++
++The following items require validation on a real Windows environment:
++
++- Layout with actual monitor dimensions (not synthetic 1920×1080)
++- Visual correctness of each fit mode (cover cropping, contain letterboxing,
++  stretch distortion, center positioning, tile tiling)
++- Background color rendering in contain/center modes
++- Clip behavior when destination rect extends beyond viewport
+diff --git a/wallflow/wallflow-foundation/docs/roadmap.md b/wallflow/wallflow-foundation/docs/roadmap.md
+index 058d15c..f18915a 100644
+--- a/wallflow/wallflow-foundation/docs/roadmap.md
++++ b/wallflow/wallflow-foundation/docs/roadmap.md
+@@ -93,6 +93,43 @@
+ - Multi-monitor desktop attach.
+ - DPI change handling.
+ 
++## MVP-2.0 Cloud-safe static image decode and layout ✅
++
++*Completed in stage 006.*
++
++- `FitMode` unified in `wallflow_common`: single canonical definition, re-exported by
++  `wallflow-package` and `wallflow-ipc`.
++- `ImageMetadata` type in `wallflow-package`: width, height, color_type, detected_format,
++  file_size_bytes.
++- `load_image_metadata()` function: reads image dimensions and format without full
++  pixel decode, using `image::io::Reader`.
++- `ImageDecodeError` type for image decode failures.
++- `validate_package_deep()`: structural + image decode validation.
++- Layout engine in `wallflow-package::layout`:
++  - `Viewport`, `ImageSize`, `RenderRect`, `StaticImageLayout` types.
++  - `calculate_static_image_layout()` with cover, contain, stretch, center, tile fit modes.
++  - `LayoutError` for zero dimension rejection.
++- IPC protocol v5: `AppliedWallpaperReport`, `StaticImageApplyReport`,
++  `IpcImageMetadata`, `StaticImageLayoutReport`.
++- `WallpaperApplied` event now includes `report: Option<AppliedWallpaperReport>`.
++- Renderer decodes image metadata and calculates layout on `ApplyWallpaper`.
++- `LoadedStaticImageState` replaces `AppliedWallpaperState`.
++- `apply-static-smoke` uses real 2×2 PNG (via `image` crate), deep validation,
++  and verifies image dimensions, layout rect, and wallpaper_id in the report.
++- `package-validate` CLI command with optional `--deep` flag.
++- `image` crate added as workspace dependency.
++- Rendering model documented in `docs/architecture/009-static-image-rendering-model.md`.
++
++### REQUIRES_REAL_WINDOWS_VALIDATION
++
++- Desktop probe (Progman/WorkerW/SHELLDLL_DefView discovery).
++- Desktop attach smoke test (embedding window behind icons).
++- Explorer restart tolerance.
++- Multi-monitor desktop attach.
++- DPI change handling.
++- Layout with actual monitor dimensions (not synthetic 1920×1080).
++- Visual correctness of each fit mode.
++
+ ## MVP-2 static wallpaper
+ 
+ - Add winit/wgpu static renderer.
+-- 
+2.47.3
+

@@ -1,0 +1,73 @@
+From 7ca8d5465a49749927a8f39ca2a3a258d8916232 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 11:51:33 +0000
+Subject: [PATCH 01/10] 81298e37-ce90-47c9-a9e2-7dd13dafda39
+
+---
+ worklog.md | 53 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/worklog.md b/worklog.md
+index f2a5af4..50ee881 100644
+--- a/worklog.md
++++ b/worklog.md
+@@ -140,3 +140,56 @@ Stage Summary:
+ - Headless renderer and supervisor smoke both validated on Linux
+ - Windows cross-compilation documented as requiring Windows SDK libs
+ - REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
++
++---
++Task ID: 4
++Agent: main
++Task: WallFlow Cloud-Safe Typed IPC Renderer Control (004)
++
++Work Log:
++- Enhanced wallflow-ipc with typed IPC transport:
++  - Added frame.rs: length-prefixed JSON framing with async (read_frame/write_frame) and sync (encode_to_bytes/decode_from_bytes) helpers
++  - Added FrameError enum: Io, Json, TooLarge, InvalidLength, ProtocolVersionMismatch
++  - MAX_FRAME_SIZE = 8 MiB, LENGTH_PREFIX_SIZE = 4 bytes (u32 LE)
++  - Added validate_protocol_version() helper
++  - Bumped PROTOCOL_VERSION from 2 to 3
++  - Added IpcMessage tagged union (core_to_renderer, renderer_to_core, external_to_core, core_broadcast)
++  - Added CommandEnvelope<T> with protocol_version + request_id (Uuid v4)
++  - Added EventEnvelope<T> with protocol_version + optional request_id for correlation
++  - Added helper functions: renderer_command(), renderer_event(), core_command(), core_event(), renderer_event_id()
++  - Preserved legacy Envelope<T> for backward compatibility
++  - 24 tests in wallflow-ipc (10 frame tests, 14 protocol tests)
++- Enhanced wallflow-renderer with --ipc-stdio mode:
++  - Dedicated stdin-reader thread with mpsc channel (avoids blocking main loop)
++  - Sends Started → Ready → periodic Heartbeat → responds to Pause/Resume/Shutdown
++  - All diagnostic logs to stderr only; stdout reserved for IPC frames
++  - Legacy --headless-heartbeat mode preserved
++- Enhanced wallflow-cli with ipc-supervisor-smoke command:
++  - Spawns renderer with --ipc-stdio, piped stdin/stdout, inherited stderr
++  - Full lifecycle: Started → Ready → 2+ Heartbeats → Pause → Paused → Resume → Resumed → Shutdown → Exited
++  - Structured JSON report output
++- Updated .github/workflows/ci.yml:
++  - Added ipc-smoke job: builds renderer + CLI, runs ipc-supervisor-smoke, runs legacy headless heartbeat
++- Updated documentation:
++  - docs/architecture/002-ipc-contract.md: IPC transport design, frame format, why stdio
++  - docs/architecture/003-renderer-lifecycle.md: Added IPC integration section
++  - docs/architecture/007-cloud-validation-strategy.md: Updated for Stage 004
++  - docs/roadmap.md: Added MVP-1.7 section
++- Final validation:
++  - cargo fmt --all -- --check: PASSED
++  - cargo check --workspace: PASSED
++  - cargo clippy --workspace --all-targets -- -D warnings: PASSED
++  - cargo test --workspace: 67 tests PASSED (24 ipc, 25 core, 11 desktop, 2 config, 2 media, 3 monitor)
++  - ipc-supervisor-smoke: PASSED (full lifecycle in ~1s)
++  - Legacy headless-heartbeat: PASSED
++
++Stage Summary:
++- 6+ files changed/created
++- wallflow-ipc: IpcMessage, CommandEnvelope, EventEnvelope, frame.rs (24 tests)
++- wallflow-renderer: --ipc-stdio mode with threaded stdin reader
++- wallflow-cli: ipc-supervisor-smoke command
++- .github/workflows/ci.yml: IPC smoke job
++- Documentation: 002-ipc-contract.md, 003-renderer-lifecycle.md, 007-cloud-validation-strategy.md, roadmap.md
++- 67 tests passing total (up from 50)
++- Both --ipc-stdio and --headless-heartbeat validated on Linux
++- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
+-- 
+2.47.3
+

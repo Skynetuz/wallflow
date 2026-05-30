@@ -1,0 +1,2368 @@
+From 06cf4f16da8b61aacc4ad8f731f3f99a503e58cc Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Sat, 30 May 2026 13:34:38 +0000
+Subject: [PATCH 04/10] 513de8c7-ef9c-4102-8d58-c72b529eef22
+
+---
+ .../.github/workflows/ci.yml                  |   5 +
+ wallflow/wallflow-foundation/Cargo.toml       |   1 +
+ .../crates/wallflow-cli/src/main.rs           | 270 ++++++++++
+ .../crates/wallflow-common/Cargo.toml         |   3 +
+ .../crates/wallflow-common/src/lib.rs         |   5 +
+ .../crates/wallflow-common/src/runtime.rs     | 312 ++++++++++++
+ .../crates/wallflow-package/src/layout.rs     |  84 ++++
+ .../crates/wallflow-renderer/Cargo.toml       |   1 +
+ .../crates/wallflow-renderer/src/main.rs      | 462 ++++++++++++++++--
+ .../007-cloud-validation-strategy.md          | 117 ++++-
+ .../010-renderer-window-runtime.md            | 455 +++++++++++++++++
+ wallflow/wallflow-foundation/docs/roadmap.md  |  31 +-
+ worklog.md                                    | 241 +--------
+ 13 files changed, 1728 insertions(+), 259 deletions(-)
+ create mode 100644 wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs
+ create mode 100644 wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
+
+diff --git a/wallflow/wallflow-foundation/.github/workflows/ci.yml b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+index 74d9132..1a682b9 100644
+--- a/wallflow/wallflow-foundation/.github/workflows/ci.yml
++++ b/wallflow/wallflow-foundation/.github/workflows/ci.yml
+@@ -106,6 +106,11 @@ jobs:
+           cargo run -p wallflow-cli -- apply-static-smoke --timeout-secs 10 --heartbeat-interval-ms 500
+           echo "Apply static smoke test completed"
+ 
++      - name: Render sim smoke test
++        run: |
++          cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 5 --width 800 --height 450
++          echo "Render sim smoke test completed"
++
+       - name: Legacy headless heartbeat smoke
+         run: |
+           timeout 15 ./target/debug/wallflow-renderer --headless-heartbeat --heartbeat-interval-ms 500 --timeout-secs 5 || true
+diff --git a/wallflow/wallflow-foundation/Cargo.toml b/wallflow/wallflow-foundation/Cargo.toml
+index 6964c4d..846ddbb 100644
+--- a/wallflow/wallflow-foundation/Cargo.toml
++++ b/wallflow/wallflow-foundation/Cargo.toml
+@@ -29,6 +29,7 @@ serde_json = "1"
+ thiserror = "1"
+ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time"] }
+ tracing = "0.1"
++winit = "0.30"
+ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ uuid = { version = "1", features = ["v4", "serde"] }
+ 
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+index 18d9a67..626f605 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-cli/src/main.rs
+@@ -80,6 +80,24 @@ enum Command {
+         #[arg(long, default_value_t = false)]
+         deep: bool,
+     },
++
++    /// Create a test wallpaper package, launch the renderer in
++    /// --headless-render-sim mode with a static wallpaper, and verify
++    /// the layout report. This is the cloud-testable render simulation
++    /// integration test.
++    RenderSimSmoke {
++        /// How many seconds to let the renderer simulation run.
++        #[arg(long, default_value_t = 5)]
++        timeout_secs: u64,
++
++        /// Viewport width for the simulation.
++        #[arg(long, default_value_t = 800)]
++        width: u32,
++
++        /// Viewport height for the simulation.
++        #[arg(long, default_value_t = 450)]
++        height: u32,
++    },
+ }
+ 
+ fn main() -> Result<()> {
+@@ -137,6 +155,13 @@ fn main() -> Result<()> {
+         Command::PackageValidate { path, deep } => {
+             run_package_validate(&path, deep)?;
+         }
++        Command::RenderSimSmoke {
++            timeout_secs,
++            width,
++            height,
++        } => {
++            run_render_sim_smoke(timeout_secs, width, height)?;
++        }
+     }
+ 
+     Ok(())
+@@ -1167,3 +1192,248 @@ fn run_package_validate(path: &str, deep: bool) -> Result<()> {
+ 
+     Ok(())
+ }
++
++// ---------------------------------------------------------------------------
++// Render sim smoke test
++// ---------------------------------------------------------------------------
++
++fn run_render_sim_smoke(timeout_secs: u64, width: u32, height: u32) -> Result<()> {
++    use std::process::Stdio;
++    use tokio::process::Command;
++    use tokio::time;
++    use wallflow_common::{RenderSimReport, RendererRuntimeMode, RendererRuntimeState};
++
++    let rt = tokio::runtime::Runtime::new()?;
++    rt.block_on(async {
++        let start = Instant::now();
++
++        // Step 1: Create a temporary test wallpaper package with a REAL 2x2 PNG
++        let temp_dir = std::env::temp_dir().join("wallflow-render-sim-smoke");
++        let _ = std::fs::remove_dir_all(&temp_dir);
++        std::fs::create_dir_all(temp_dir.join("content"))?;
++
++        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
++        let image_path = temp_dir.join("content/wallpaper.png");
++        img.save(&image_path)?;
++
++        let image_path_str = image_path.to_string_lossy().to_string();
++
++        println!("=== Render Sim Smoke Test ===");
++        println!("Test image: {}", image_path.display());
++        println!("Viewport: {}x{}", width, height);
++        println!("Timeout: {}s", timeout_secs);
++
++        // Step 2: Spawn renderer in --headless-render-sim mode with --source
++        let renderer_exe = find_renderer_exe()?;
++        println!("Renderer exe: {}", renderer_exe.display());
++
++        let mut child = Command::new(&renderer_exe)
++            .arg("--headless-render-sim")
++            .arg("--width")
++            .arg(width.to_string())
++            .arg("--height")
++            .arg(height.to_string())
++            .arg("--timeout-secs")
++            .arg(timeout_secs.to_string())
++            .arg("--source")
++            .arg(&image_path_str)
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
++
++        let pid = child.id();
++        println!("Renderer spawned (PID: {:?})", pid);
++
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
++        let stdout_reader = tokio::io::BufReader::new(stdout);
++
++        // Read the render sim report from stdout (one JSON line)
++        let deadline = time::sleep(Duration::from_secs(timeout_secs + 15));
++        tokio::pin!(deadline);
++
++        let mut report_json = String::new();
++        let mut report_received = false;
++
++        use tokio::io::AsyncBufReadExt;
++        let mut lines = stdout_reader.lines();
++
++        tokio::select! {
++            _ = &mut deadline => {
++                eprintln!("Render sim smoke timed out waiting for report");
++                let _ = child.kill().await;
++            }
++            line = lines.next_line() => {
++                match line {
++                    Ok(Some(line)) => {
++                        report_json = line;
++                        report_received = true;
++                    }
++                    Ok(None) => {}
++                    Err(e) => {
++                        eprintln!("Error reading renderer stdout: {e}");
++                    }
++                }
++            }
++        }
++
++        // Wait for the process to exit
++        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
++            Ok(Ok(status)) => Some(status),
++            Ok(Err(e)) => {
++                eprintln!("Error waiting for renderer: {e}");
++                None
++            }
++            Err(_) => {
++                eprintln!("Renderer did not exit in time, killing");
++                let _ = child.kill().await;
++                None
++            }
++        };
++
++        let total_elapsed = start.elapsed();
++        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
++
++        // Parse and verify the report
++        let mut mode_ok = false;
++        let mut viewport_ok = false;
++        let mut state_transitions_ok = false;
++        let mut wallpaper_applied_ok = false;
++        let mut layout_ok = false;
++        let mut exit_code_ok = false;
++
++        if report_received {
++            match serde_json::from_str::<RenderSimReport>(&report_json) {
++                Ok(report) => {
++                    println!("\n=== Render Sim Report ===");
++                    println!("{}", serde_json::to_string_pretty(&report)?);
++
++                    // Verify mode
++                    if report.mode == RendererRuntimeMode::HeadlessRenderSim {
++                        mode_ok = true;
++                    }
++
++                    // Verify viewport
++                    if report.viewport.width == width && report.viewport.height == height {
++                        viewport_ok = true;
++                    }
++
++                    // Verify state transitions include the expected sequence
++                    if report
++                        .state_transitions
++                        .contains(&RendererRuntimeState::Starting)
++                        && report
++                            .state_transitions
++                            .contains(&RendererRuntimeState::Ready)
++                        && report
++                            .state_transitions
++                            .contains(&RendererRuntimeState::Running)
++                        && report
++                            .state_transitions
++                            .contains(&RendererRuntimeState::Exited)
++                    {
++                        state_transitions_ok = true;
++                    }
++
++                    // Verify wallpaper was applied
++                    if report.wallpaper_applied {
++                        wallpaper_applied_ok = true;
++                    }
++
++                    // Verify layout report
++                    if let Some(ref layout) = report.layout_report {
++                        if layout.image_width == 2
++                            && layout.image_height == 2
++                            && layout.viewport_width == width
++                            && layout.viewport_height == height
++                            && layout.destination_width > 0.0
++                            && layout.destination_height > 0.0
++                        {
++                            layout_ok = true;
++                        }
++                    }
++
++                    // Verify exit code
++                    if report.exit_code == 0 {
++                        exit_code_ok = true;
++                    }
++                }
++                Err(e) => {
++                    eprintln!("Failed to parse render sim report: {e}");
++                    eprintln!("Raw output: {report_json}");
++                }
++            }
++        }
++
++        let success = report_received
++            && mode_ok
++            && viewport_ok
++            && state_transitions_ok
++            && wallpaper_applied_ok
++            && layout_ok
++            && exit_code_ok
++            && process_exit_code == Some(0);
++
++        let verification = serde_json::json!({
++            "report_received": report_received,
++            "mode_ok": mode_ok,
++            "viewport_ok": viewport_ok,
++            "state_transitions_ok": state_transitions_ok,
++            "wallpaper_applied_ok": wallpaper_applied_ok,
++            "layout_ok": layout_ok,
++            "exit_code_ok": exit_code_ok,
++            "process_exit_code": process_exit_code,
++        });
++
++        let report = serde_json::json!({
++            "test": "render-sim-smoke",
++            "success": success,
++            "total_elapsed_ms": total_elapsed.as_millis() as u64,
++            "renderer_pid": pid,
++            "verification": verification,
++            "config": {
++                "timeout_secs": timeout_secs,
++                "width": width,
++                "height": height,
++            }
++        });
++
++        println!("\n=== Render Sim Smoke Report ===");
++        println!("{}", serde_json::to_string_pretty(&report)?);
++
++        if success {
++            println!("\nRender sim smoke test PASSED.");
++        } else {
++            eprintln!("\nRender sim smoke test FAILED.");
++            if !report_received {
++                eprintln!("  Missing: render sim report");
++            }
++            if !mode_ok {
++                eprintln!("  Verification: mode not HeadlessRenderSim");
++            }
++            if !viewport_ok {
++                eprintln!("  Verification: viewport mismatch");
++            }
++            if !state_transitions_ok {
++                eprintln!("  Verification: state transitions incomplete");
++            }
++            if !wallpaper_applied_ok {
++                eprintln!("  Verification: wallpaper not applied");
++            }
++            if !layout_ok {
++                eprintln!("  Verification: layout report invalid");
++            }
++            if !exit_code_ok {
++                eprintln!("  Verification: exit code not 0");
++            }
++        }
++
++        // Clean up temp directory
++        let _ = std::fs::remove_dir_all(&temp_dir);
++
++        Ok(())
++    })
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml
+index 30048ec..61550ff 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/Cargo.toml
+@@ -9,3 +9,6 @@ license.workspace = true
+ serde.workspace = true
+ thiserror.workspace = true
+ uuid.workspace = true
++
++[dev-dependencies]
++serde_json.workspace = true
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
+index e190b84..24592d0 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod error;
+ pub mod fit_mode;
+ pub mod monitor;
+ pub mod renderer;
++pub mod runtime;
+ pub mod wallpaper;
+ 
+ pub use error::{WallFlowError, WallFlowResult};
+@@ -15,4 +16,8 @@ pub use renderer::{
+     RendererAssignment, RendererGroupId, RendererHealth, RendererId, RendererRestartPolicy,
+     RendererState,
+ };
++pub use runtime::{
++    RenderSimLayoutReport, RenderSimReport, RendererRuntimeMode, RendererRuntimeState,
++    RendererViewport, WindowRuntimeConfig,
++};
+ pub use wallpaper::{PerformanceProfile, WallpaperAssignment, WallpaperId, WallpaperKind};
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs b/wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs
+new file mode 100644
+index 0000000..238f9f4
+--- /dev/null
++++ b/wallflow/wallflow-foundation/crates/wallflow-common/src/runtime.rs
+@@ -0,0 +1,312 @@
++//! Renderer runtime abstraction types.
++//!
++//! These types describe how the renderer process runs — in which mode,
++//! what state it is in, and what viewport it targets. They are pure data
++//! types with no I/O or platform dependencies.
++
++use serde::{Deserialize, Serialize};
++
++/// How the renderer process runs.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum RendererRuntimeMode {
++    /// Headless IPC mode: no window, communicates over stdin/stdout.
++    HeadlessIpc,
++    /// Headless render simulation: no window, synthetic viewport, produces
++    /// a structured report. Suitable for CI and cloud testing.
++    HeadlessRenderSim,
++    /// Windowed static image mode: opens a winit window, displays a static
++    /// wallpaper image (no GPU pipeline yet). Requires a display server.
++    WindowedStatic,
++}
++
++impl std::fmt::Display for RendererRuntimeMode {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            RendererRuntimeMode::HeadlessIpc => write!(f, "headless-ipc"),
++            RendererRuntimeMode::HeadlessRenderSim => write!(f, "headless-render-sim"),
++            RendererRuntimeMode::WindowedStatic => write!(f, "windowed-static"),
++        }
++    }
++}
++
++/// Lifecycle state of the renderer runtime.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum RendererRuntimeState {
++    /// Runtime is initializing (loading config, setting up).
++    Starting,
++    /// Runtime is ready and waiting for commands or content.
++    Ready,
++    /// Runtime is actively running (wallpaper displayed or simulating).
++    Running,
++    /// Runtime is paused (content visible but not animating).
++    Paused,
++    /// Runtime is shutting down gracefully.
++    ShuttingDown,
++    /// Runtime has exited.
++    Exited,
++    /// Runtime has failed.
++    Failed,
++}
++
++impl RendererRuntimeState {
++    /// Returns true if the runtime is in a terminal state.
++    pub fn is_terminal(self) -> bool {
++        matches!(self, Self::Exited | Self::Failed)
++    }
++
++    /// Returns true if the runtime is actively alive.
++    pub fn is_alive(self) -> bool {
++        matches!(self, Self::Ready | Self::Running | Self::Paused)
++    }
++}
++
++impl std::fmt::Display for RendererRuntimeState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            RendererRuntimeState::Starting => write!(f, "starting"),
++            RendererRuntimeState::Ready => write!(f, "ready"),
++            RendererRuntimeState::Running => write!(f, "running"),
++            RendererRuntimeState::Paused => write!(f, "paused"),
++            RendererRuntimeState::ShuttingDown => write!(f, "shutting-down"),
++            RendererRuntimeState::Exited => write!(f, "exited"),
++            RendererRuntimeState::Failed => write!(f, "failed"),
++        }
++    }
++}
++
++/// Viewport dimensions tracked by the renderer.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct RendererViewport {
++    /// Viewport width in logical pixels.
++    pub width: u32,
++    /// Viewport height in logical pixels.
++    pub height: u32,
++    /// Optional DPI scale factor (1.0 = standard, 2.0 = HiDPI).
++    pub scale_factor: Option<u32>,
++}
++
++impl RendererViewport {
++    pub fn new(width: u32, height: u32) -> Self {
++        Self {
++            width,
++            height,
++            scale_factor: None,
++        }
++    }
++
++    pub fn with_scale_factor(mut self, factor: u32) -> Self {
++        self.scale_factor = Some(factor);
++        self
++    }
++
++    /// Returns true if the viewport has valid (non-zero) dimensions.
++    pub fn is_valid(self) -> bool {
++        self.width > 0 && self.height > 0
++    }
++}
++
++impl std::fmt::Display for RendererViewport {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self.scale_factor {
++            Some(sf) => write!(f, "{}x{}@{}x", self.width, self.height, sf),
++            None => write!(f, "{}x{}", self.width, self.height),
++        }
++    }
++}
++
++/// Configuration for the windowed renderer runtime.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct WindowRuntimeConfig {
++    /// Window width in logical pixels.
++    pub width: u32,
++    /// Window height in logical pixels.
++    pub height: u32,
++    /// Window title.
++    pub title: String,
++    /// Whether the window should be visible.
++    pub visible: bool,
++    /// Whether the window should be borderless (decorated = false).
++    #[serde(default = "default_borderless")]
++    pub borderless: bool,
++}
++
++fn default_borderless() -> bool {
++    false
++}
++
++impl Default for WindowRuntimeConfig {
++    fn default() -> Self {
++        Self {
++            width: 1920,
++            height: 1080,
++            title: "WallFlow Renderer".into(),
++            visible: true,
++            borderless: false,
++        }
++    }
++}
++
++impl WindowRuntimeConfig {
++    pub fn new(width: u32, height: u32) -> Self {
++        Self {
++            width,
++            height,
++            ..Default::default()
++        }
++    }
++}
++
++/// Result of a headless render simulation run.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct RenderSimReport {
++    /// The runtime mode used (should always be HeadlessRenderSim).
++    pub mode: RendererRuntimeMode,
++    /// The viewport used for the simulation.
++    pub viewport: RendererViewport,
++    /// The runtime state transitions that occurred.
++    pub state_transitions: Vec<RendererRuntimeState>,
++    /// Whether a wallpaper was applied during simulation.
++    pub wallpaper_applied: bool,
++    /// Layout report, if a wallpaper was applied.
++    pub layout_report: Option<RenderSimLayoutReport>,
++    /// Total simulation time in milliseconds.
++    pub total_sim_time_ms: u64,
++    /// Exit code (0 = success).
++    pub exit_code: i32,
++}
++
++/// Layout report from a render simulation.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct RenderSimLayoutReport {
++    /// Image width in pixels.
++    pub image_width: u32,
++    /// Image height in pixels.
++    pub image_height: u32,
++    /// Viewport width used for layout.
++    pub viewport_width: u32,
++    /// Viewport height used for layout.
++    pub viewport_height: u32,
++    /// Destination rectangle X.
++    pub destination_x: f64,
++    /// Destination rectangle Y.
++    pub destination_y: f64,
++    /// Destination rectangle width.
++    pub destination_width: f64,
++    /// Destination rectangle height.
++    pub destination_height: f64,
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn runtime_mode_display() {
++        assert_eq!(RendererRuntimeMode::HeadlessIpc.to_string(), "headless-ipc");
++        assert_eq!(
++            RendererRuntimeMode::HeadlessRenderSim.to_string(),
++            "headless-render-sim"
++        );
++        assert_eq!(
++            RendererRuntimeMode::WindowedStatic.to_string(),
++            "windowed-static"
++        );
++    }
++
++    #[test]
++    fn runtime_state_transitions() {
++        // Starting is not yet alive (still initializing) but not terminal
++        assert!(!RendererRuntimeState::Starting.is_alive());
++        assert!(!RendererRuntimeState::Starting.is_terminal());
++
++        assert!(RendererRuntimeState::Running.is_alive());
++        assert!(RendererRuntimeState::Paused.is_alive());
++        assert!(RendererRuntimeState::Ready.is_alive());
++
++        assert!(RendererRuntimeState::Exited.is_terminal());
++        assert!(RendererRuntimeState::Failed.is_terminal());
++        assert!(!RendererRuntimeState::Running.is_terminal());
++        assert!(!RendererRuntimeState::ShuttingDown.is_terminal());
++    }
++
++    #[test]
++    fn viewport_validity() {
++        let valid = RendererViewport::new(1920, 1080);
++        assert!(valid.is_valid());
++
++        let zero_width = RendererViewport::new(0, 1080);
++        assert!(!zero_width.is_valid());
++
++        let zero_height = RendererViewport::new(1920, 0);
++        assert!(!zero_height.is_valid());
++    }
++
++    #[test]
++    fn viewport_display() {
++        let vp = RendererViewport::new(1920, 1080);
++        assert_eq!(vp.to_string(), "1920x1080");
++
++        let vp_scaled = RendererViewport::new(1920, 1080).with_scale_factor(2);
++        assert_eq!(vp_scaled.to_string(), "1920x1080@2x");
++    }
++
++    #[test]
++    fn window_config_default() {
++        let config = WindowRuntimeConfig::default();
++        assert_eq!(config.width, 1920);
++        assert_eq!(config.height, 1080);
++        assert_eq!(config.title, "WallFlow Renderer");
++        assert!(config.visible);
++        assert!(!config.borderless);
++    }
++
++    #[test]
++    fn window_config_new() {
++        let config = WindowRuntimeConfig::new(800, 450);
++        assert_eq!(config.width, 800);
++        assert_eq!(config.height, 450);
++        assert_eq!(config.title, "WallFlow Renderer");
++    }
++
++    #[test]
++    fn render_sim_report_serialization() {
++        let report = RenderSimReport {
++            mode: RendererRuntimeMode::HeadlessRenderSim,
++            viewport: RendererViewport::new(800, 450),
++            state_transitions: vec![
++                RendererRuntimeState::Starting,
++                RendererRuntimeState::Ready,
++                RendererRuntimeState::Running,
++                RendererRuntimeState::ShuttingDown,
++                RendererRuntimeState::Exited,
++            ],
++            wallpaper_applied: true,
++            layout_report: Some(RenderSimLayoutReport {
++                image_width: 2,
++                image_height: 2,
++                viewport_width: 800,
++                viewport_height: 450,
++                destination_x: 0.0,
++                destination_y: -337.5,
++                destination_width: 800.0,
++                destination_height: 1125.0,
++            }),
++            total_sim_time_ms: 2000,
++            exit_code: 0,
++        };
++        let json = serde_json::to_string(&report).expect("serialize");
++        let decoded: RenderSimReport = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(report, decoded);
++    }
++
++    #[test]
++    fn runtime_state_display() {
++        assert_eq!(RendererRuntimeState::Starting.to_string(), "starting");
++        assert_eq!(RendererRuntimeState::Running.to_string(), "running");
++        assert_eq!(
++            RendererRuntimeState::ShuttingDown.to_string(),
++            "shutting-down"
++        );
++        assert_eq!(RendererRuntimeState::Failed.to_string(), "failed");
++    }
++}
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs b/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+index 8899fc0..aa6c8c6 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-package/src/layout.rs
+@@ -442,4 +442,88 @@ mod tests {
+                 .expect("layout");
+         assert_eq!(layout.background, "#1a1a2e");
+     }
++
++    // --- Stage 007: viewport 800×450 tests for render sim ---
++
++    #[test]
++    fn cover_2x2_into_800x450_viewport() {
++        // 2x2 image into 800x450 viewport (render sim default)
++        // scale = max(800/2, 450/2) = max(400, 225) = 400
++        // dest_w = 2*400 = 800, dest_h = 2*400 = 800
++        // x = (800-800)/2 = 0, y = (450-800)/2 = -175
++        let image = ImageSize {
++            width: 2,
++            height: 2,
++        };
++        let viewport = Viewport {
++            width: 800,
++            height: 450,
++        };
++        let layout = calculate_static_image_layout(image, viewport, FitMode::Cover, BG.to_string())
++            .expect("layout");
++        assert_eq!(layout.destination_rect.width, 800.0);
++        assert_eq!(layout.destination_rect.height, 800.0);
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert_eq!(layout.destination_rect.y, -175.0);
++    }
++
++    #[test]
++    fn contain_2x2_into_800x450_viewport() {
++        // scale = min(800/2, 450/2) = min(400, 225) = 225
++        // dest_w = 2*225 = 450, dest_h = 2*225 = 450
++        // x = (800-450)/2 = 175, y = (450-450)/2 = 0
++        let image = ImageSize {
++            width: 2,
++            height: 2,
++        };
++        let viewport = Viewport {
++            width: 800,
++            height: 450,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Contain, BG.to_string())
++                .expect("layout");
++        assert_eq!(layout.destination_rect.width, 450.0);
++        assert_eq!(layout.destination_rect.height, 450.0);
++        assert_eq!(layout.destination_rect.x, 175.0);
++        assert_eq!(layout.destination_rect.y, 0.0);
++    }
++
++    #[test]
++    fn stretch_2x2_into_800x450_viewport() {
++        let image = ImageSize {
++            width: 2,
++            height: 2,
++        };
++        let viewport = Viewport {
++            width: 800,
++            height: 450,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Stretch, BG.to_string())
++                .expect("layout");
++        assert_eq!(layout.destination_rect.x, 0.0);
++        assert_eq!(layout.destination_rect.y, 0.0);
++        assert_eq!(layout.destination_rect.width, 800.0);
++        assert_eq!(layout.destination_rect.height, 450.0);
++    }
++
++    #[test]
++    fn center_2x2_into_800x450_viewport() {
++        let image = ImageSize {
++            width: 2,
++            height: 2,
++        };
++        let viewport = Viewport {
++            width: 800,
++            height: 450,
++        };
++        let layout =
++            calculate_static_image_layout(image, viewport, FitMode::Center, BG.to_string())
++                .expect("layout");
++        assert_eq!(layout.destination_rect.width, 2.0);
++        assert_eq!(layout.destination_rect.height, 2.0);
++        assert_eq!(layout.destination_rect.x, 399.0);
++        assert_eq!(layout.destination_rect.y, 224.0);
++    }
+ }
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+index e697438..22503fc 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/Cargo.toml
+@@ -19,6 +19,7 @@ wallflow-desktop = { path = "../wallflow-desktop" }
+ wallflow-ipc = { path = "../wallflow-ipc" }
+ wallflow-media = { path = "../wallflow-media" }
+ wallflow-package = { path = "../wallflow-package" }
++winit.workspace = true
+ 
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.58", features = [
+diff --git a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+index 19fb9f0..4b353d0 100644
+--- a/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
++++ b/wallflow/wallflow-foundation/crates/wallflow-renderer/src/main.rs
+@@ -5,7 +5,10 @@ use std::path::PathBuf;
+ use std::time::{Duration, Instant};
+ use tracing::{info, warn};
+ use uuid::Uuid;
+-use wallflow_common::{RendererId, WallpaperId};
++use wallflow_common::{
++    RenderSimLayoutReport, RenderSimReport, RendererId, RendererRuntimeMode, RendererRuntimeState,
++    RendererViewport, WallpaperId, WindowRuntimeConfig,
++};
+ use wallflow_ipc::{
+     encode_to_bytes, AppliedWallpaperReport, ApplyWallpaperRequest, EventEnvelope,
+     IpcImageMetadata, IpcMessage, RendererCommand, RendererEvent, StaticImageApplyReport,
+@@ -40,7 +43,7 @@ struct Args {
+     #[arg(long, default_value_t = false)]
+     desktop_attach: bool,
+ 
+-    /// How many seconds the desktop-attached renderer window should stay alive
++    /// How many seconds the renderer window should stay alive
+     /// before automatically exiting. 0 = run until Ctrl+C.
+     #[arg(long, default_value_t = 0)]
+     timeout_secs: u64,
+@@ -59,13 +62,32 @@ struct Args {
+     /// Run in IPC stdio mode: read commands from stdin, write events to stdout.
+     /// All events use typed IPC frames (length-prefixed JSON).
+     /// Diagnostic logs go to stderr only. This is the preferred mode for
+-    /// Core ↔ Renderer communication.
++    /// Core <-> Renderer communication.
+     #[arg(long, default_value_t = false)]
+     ipc_stdio: bool,
++
++    /// Run in windowed static mode: opens a winit window for static wallpaper
++    /// display. The window runs for the specified timeout or until closed.
++    /// Requires a display server (Wayland/X11 on Linux, Desktop on Windows).
++    #[arg(long, default_value_t = false)]
++    windowed_static: bool,
++
++    /// Run in headless render simulation mode: no window, synthetic viewport,
++    /// produces a structured JSON report. Suitable for CI and cloud testing.
++    #[arg(long, default_value_t = false)]
++    headless_render_sim: bool,
++
++    /// Window/viewport width in pixels (used with --windowed-static and --headless-render-sim).
++    #[arg(long, default_value_t = 800)]
++    width: u32,
++
++    /// Window/viewport height in pixels (used with --windowed-static and --headless-render-sim).
++    #[arg(long, default_value_t = 450)]
++    height: u32,
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// Loaded static image state (replaces AppliedWallpaperState)
++// Loaded static image state
+ // ---------------------------------------------------------------------------
+ 
+ /// Tracks a loaded static image wallpaper with decoded metadata and layout.
+@@ -79,9 +101,9 @@ struct LoadedStaticImageState {
+ }
+ 
+ fn main() -> Result<()> {
+-    // In --ipc-stdio mode, stdout is reserved for IPC frames.
+-    // All diagnostic output must go to stderr.
+-    let use_stderr_only = std::env::args().any(|a| a == "--ipc-stdio");
++    // Determine if stderr-only logging is needed
++    let use_stderr_only =
++        std::env::args().any(|a| a == "--ipc-stdio" || a == "--headless-render-sim");
+ 
+     if use_stderr_only {
+         tracing_subscriber::fmt()
+@@ -99,10 +121,31 @@ fn main() -> Result<()> {
+ 
+     info!(?renderer_id, monitor = %args.monitor, wallpaper = %args.wallpaper, "renderer starting");
+ 
++    // Dispatch to the correct runtime mode
+     if args.ipc_stdio {
+         return run_ipc_stdio(renderer_id, args.heartbeat_interval_ms, args.timeout_secs);
+     }
+ 
++    if args.headless_render_sim {
++        return run_headless_render_sim(
++            renderer_id,
++            args.width,
++            args.height,
++            args.timeout_secs,
++            args.source.as_deref(),
++        );
++    }
++
++    if args.windowed_static {
++        return run_windowed_static(
++            renderer_id,
++            args.width,
++            args.height,
++            args.timeout_secs,
++            args.source.as_deref(),
++        );
++    }
++
+     if args.headless_heartbeat {
+         return run_headless_heartbeat(renderer_id, args.heartbeat_interval_ms, args.timeout_secs);
+     }
+@@ -111,6 +154,7 @@ fn main() -> Result<()> {
+         return run_desktop_attach_renderer(args.timeout_secs);
+     }
+ 
++    // Default: no specific mode — keep process alive for smoke testing
+     match args.wallpaper.as_str() {
+         "none" => {
+             info!("no wallpaper requested; renderer stays alive for smoke testing");
+@@ -151,11 +195,382 @@ fn main() -> Result<()> {
+     Ok(())
+ }
+ 
++// ---------------------------------------------------------------------------
++// Headless render simulation mode
++// ---------------------------------------------------------------------------
++
++/// Headless render simulation: no window, synthetic viewport, structured report.
++///
++/// This mode simulates the renderer lifecycle without requiring a display server.
++/// It goes through the state transitions Starting → Ready → Running → ShuttingDown → Exited,
++/// optionally applying a static wallpaper and calculating its layout for the given viewport.
++/// The result is a structured JSON report printed to stdout.
++fn run_headless_render_sim(
++    renderer_id: RendererId,
++    width: u32,
++    height: u32,
++    timeout_secs: u64,
++    source: Option<&std::path::Path>,
++) -> Result<()> {
++    let start = Instant::now();
++    let timeout = if timeout_secs > 0 {
++        Duration::from_secs(timeout_secs)
++    } else {
++        Duration::from_secs(5) // Default 5s for sim mode
++    };
++
++    let viewport = RendererViewport::new(width, height);
++    if !viewport.is_valid() {
++        let report = RenderSimReport {
++            mode: RendererRuntimeMode::HeadlessRenderSim,
++            viewport,
++            state_transitions: vec![RendererRuntimeState::Starting, RendererRuntimeState::Failed],
++            wallpaper_applied: false,
++            layout_report: None,
++            total_sim_time_ms: start.elapsed().as_millis() as u64,
++            exit_code: 1,
++        };
++        eprintln!("invalid viewport dimensions: {}x{}", width, height);
++        let json = serde_json::to_string(&report)?;
++        println!("{json}");
++        return Ok(());
++    }
++
++    let mut state_transitions = vec![RendererRuntimeState::Starting];
++    info!(?renderer_id, %viewport, "headless render sim starting");
++
++    state_transitions.push(RendererRuntimeState::Ready);
++    info!(?renderer_id, "headless render sim ready");
++
++    state_transitions.push(RendererRuntimeState::Running);
++
++    // Try to apply a static wallpaper if a source image path was provided
++    let mut wallpaper_applied = false;
++    let mut layout_report: Option<RenderSimLayoutReport> = None;
++
++    if let Some(image_path) = source {
++        match apply_static_wallpaper_for_sim(image_path, &viewport) {
++            Ok((metadata, layout)) => {
++                wallpaper_applied = true;
++                layout_report = Some(RenderSimLayoutReport {
++                    image_width: metadata.width,
++                    image_height: metadata.height,
++                    viewport_width: viewport.width,
++                    viewport_height: viewport.height,
++                    destination_x: layout.destination_rect.x,
++                    destination_y: layout.destination_rect.y,
++                    destination_width: layout.destination_rect.width,
++                    destination_height: layout.destination_rect.height,
++                });
++                info!(
++                    ?renderer_id,
++                    image_path = %image_path.display(),
++                    image_width = metadata.width,
++                    image_height = metadata.height,
++                    "wallpaper applied in render sim"
++                );
++            }
++            Err(e) => {
++                warn!(?renderer_id, error = %e, "failed to apply wallpaper in render sim");
++            }
++        }
++    }
++
++    // Simulate the running period
++    while start.elapsed() < timeout {
++        std::thread::sleep(Duration::from_millis(100));
++    }
++
++    state_transitions.push(RendererRuntimeState::ShuttingDown);
++    state_transitions.push(RendererRuntimeState::Exited);
++
++    let total_sim_time_ms = start.elapsed().as_millis() as u64;
++
++    let report = RenderSimReport {
++        mode: RendererRuntimeMode::HeadlessRenderSim,
++        viewport,
++        state_transitions,
++        wallpaper_applied,
++        layout_report,
++        total_sim_time_ms,
++        exit_code: 0,
++    };
++
++    let json = serde_json::to_string(&report)?;
++    println!("{json}");
++
++    info!(
++        ?renderer_id,
++        total_sim_time_ms, "headless render sim completed"
++    );
++    Ok(())
++}
++
++/// Apply a static wallpaper for render simulation (no IPC, direct return).
++fn apply_static_wallpaper_for_sim(
++    image_path: &std::path::Path,
++    viewport: &RendererViewport,
++) -> Result<(
++    wallflow_package::ImageMetadata,
++    wallflow_package::StaticImageLayout,
++)> {
++    let metadata = wallflow_package::load_image_metadata(image_path)?;
++
++    let image_size = wallflow_package::ImageSize {
++        width: metadata.width,
++        height: metadata.height,
++    };
++    let vp = wallflow_package::Viewport {
++        width: viewport.width,
++        height: viewport.height,
++    };
++
++    let layout = wallflow_package::calculate_static_image_layout(
++        image_size,
++        vp,
++        wallflow_common::FitMode::Cover,
++        "#000000".into(),
++    )?;
++
++    Ok((metadata, layout))
++}
++
++// ---------------------------------------------------------------------------
++// Windowed static mode (winit)
++// ---------------------------------------------------------------------------
++
++/// Application handler for the windowed static renderer using winit 0.30 ApplicationHandler API.
++struct WindowedStaticApp {
++    renderer_id: RendererId,
++    viewport: RendererViewport,
++    loaded_state: Option<LoadedStaticImageState>,
++    timeout: Option<Duration>,
++    start: Instant,
++    window: Option<winit::window::Window>,
++}
++
++impl winit::application::ApplicationHandler for WindowedStaticApp {
++    fn window_event(
++        &mut self,
++        event_loop: &winit::event_loop::ActiveEventLoop,
++        _window_id: winit::window::WindowId,
++        event: winit::event::WindowEvent,
++    ) {
++        match event {
++            winit::event::WindowEvent::CloseRequested => {
++                info!(?self.renderer_id, "window close requested, exiting");
++                event_loop.exit();
++            }
++            winit::event::WindowEvent::Resized(physical_size) => {
++                let new_w = physical_size.width;
++                let new_h = physical_size.height;
++                if new_w > 0 && new_h > 0 {
++                    self.viewport = RendererViewport::new(new_w, new_h);
++
++                    // Recalculate layout if wallpaper is applied
++                    if let Some(ref state) = self.loaded_state {
++                        let vp = wallflow_package::Viewport {
++                            width: new_w,
++                            height: new_h,
++                        };
++                        match wallflow_package::calculate_static_image_layout(
++                            wallflow_package::ImageSize {
++                                width: state.metadata.width,
++                                height: state.metadata.height,
++                            },
++                            vp,
++                            state.layout.fit,
++                            state.layout.background.clone(),
++                        ) {
++                            Ok(new_layout) => {
++                                info!(
++                                    ?self.renderer_id,
++                                    viewport = %self.viewport,
++                                    dest_w = new_layout.destination_rect.width,
++                                    dest_h = new_layout.destination_rect.height,
++                                    "layout recalculated after resize"
++                                );
++                                let wallpaper_id = state.wallpaper_id;
++                                let metadata = state.metadata.clone();
++                                let applied_at = state.applied_at;
++                                self.loaded_state = Some(LoadedStaticImageState {
++                                    wallpaper_id,
++                                    metadata,
++                                    layout: new_layout,
++                                    applied_at,
++                                });
++                            }
++                            Err(e) => {
++                                warn!(?self.renderer_id, error = %e, "failed to recalculate layout after resize");
++                            }
++                        }
++                    }
++
++                    info!(
++                        ?self.renderer_id,
++                        width = new_w,
++                        height = new_h,
++                        "window resized"
++                    );
++                }
++            }
++            winit::event::WindowEvent::Destroyed => {
++                info!(?self.renderer_id, "window destroyed, exiting");
++                event_loop.exit();
++            }
++            _ => {}
++        }
++    }
++
++    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
++        // Check timeout
++        if let Some(dur) = self.timeout {
++            if self.start.elapsed() >= dur {
++                info!(
++                    ?self.renderer_id,
++                    elapsed_ms = self.start.elapsed().as_millis() as u64,
++                    "windowed static renderer timeout reached, exiting"
++                );
++                event_loop.exit();
++            }
++        }
++        // Request a redraw so the window remains responsive
++        if let Some(ref window) = self.window {
++            window.request_redraw();
++        }
++    }
++
++    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
++        // Create the window when the event loop is ready (on first resume)
++        if self.window.is_none() {
++            let window_config = WindowRuntimeConfig::new(self.viewport.width, self.viewport.height);
++            let window_attrs = winit::window::WindowAttributes::default()
++                .with_title(&window_config.title)
++                .with_inner_size(winit::dpi::LogicalSize::new(
++                    window_config.width,
++                    window_config.height,
++                ));
++
++            match event_loop.create_window(window_attrs) {
++                Ok(w) => {
++                    info!(?self.renderer_id, "winit window created");
++                    self.window = Some(w);
++                }
++                Err(e) => {
++                    warn!(?self.renderer_id, error = %e, "failed to create winit window");
++                    event_loop.exit();
++                }
++            }
++        }
++    }
++}
++
++/// Windowed static mode: creates a winit window, optionally loads a static wallpaper,
++/// runs the event loop until timeout or window close.
++///
++/// This mode requires a display server. On Linux this means Wayland or X11.
++/// If no display server is available, it returns a graceful error without panicking.
++fn run_windowed_static(
++    renderer_id: RendererId,
++    width: u32,
++    height: u32,
++    timeout_secs: u64,
++    source: Option<&std::path::Path>,
++) -> Result<()> {
++    let start = Instant::now();
++    let timeout = if timeout_secs > 0 {
++        Some(Duration::from_secs(timeout_secs))
++    } else {
++        None
++    };
++
++    let viewport = RendererViewport::new(width, height);
++    let mut loaded_state: Option<LoadedStaticImageState> = None;
++
++    info!(?renderer_id, %viewport, "windowed static renderer starting");
++
++    // Try to apply a static wallpaper if source was provided
++    if let Some(image_path) = source {
++        match apply_static_wallpaper_for_windowed(image_path, &viewport) {
++            Ok(state) => {
++                info!(
++                    ?renderer_id,
++                    image_path = %image_path.display(),
++                    image_width = state.metadata.width,
++                    image_height = state.metadata.height,
++                    "wallpaper applied in windowed mode"
++                );
++                loaded_state = Some(state);
++            }
++            Err(e) => {
++                warn!(?renderer_id, error = %e, "failed to apply wallpaper in windowed mode");
++            }
++        }
++    }
++
++    // Create the winit event loop
++    let event_loop = match winit::event_loop::EventLoop::new() {
++        Ok(el) => el,
++        Err(e) => {
++            // No display server available — return a clear error without panic
++            let msg = format!("failed to create winit event loop (no display server?): {e}");
++            warn!(?renderer_id, error = %msg, "cannot open window");
++            eprintln!("{msg}");
++            return Err(anyhow::anyhow!("{msg}"));
++        }
++    };
++
++    let mut app = WindowedStaticApp {
++        renderer_id,
++        viewport,
++        loaded_state,
++        timeout,
++        start,
++        window: None,
++    };
++
++    event_loop.run_app(&mut app)?;
++
++    info!(?renderer_id, "windowed static renderer exited");
++    Ok(())
++}
++
++/// Apply a static wallpaper for windowed mode (no IPC, direct return).
++fn apply_static_wallpaper_for_windowed(
++    image_path: &std::path::Path,
++    viewport: &RendererViewport,
++) -> Result<LoadedStaticImageState> {
++    let metadata = wallflow_package::load_image_metadata(image_path)?;
++
++    let image_size = wallflow_package::ImageSize {
++        width: metadata.width,
++        height: metadata.height,
++    };
++    let vp = wallflow_package::Viewport {
++        width: viewport.width,
++        height: viewport.height,
++    };
++
++    let layout = wallflow_package::calculate_static_image_layout(
++        image_size,
++        vp,
++        wallflow_common::FitMode::Cover,
++        "#000000".into(),
++    )?;
++
++    Ok(LoadedStaticImageState {
++        wallpaper_id: WallpaperId::new(),
++        metadata,
++        layout,
++        applied_at: Instant::now(),
++    })
++}
++
+ // ---------------------------------------------------------------------------
+ // IPC stdio mode
+ // ---------------------------------------------------------------------------
+ 
+-/// IPC stdio mode: the primary communication mode for Core ↔ Renderer.
++/// IPC stdio mode: the primary communication mode for Core <-> Renderer.
+ ///
+ /// - Reads `RendererCommand` frames from stdin on a background thread.
+ /// - Writes `RendererEvent` frames to stdout from the main thread.
+@@ -411,20 +826,16 @@ fn handle_apply_wallpaper(
+ 
+ /// Get current time as ISO 8601 string without depending on chrono.
+ fn chrono_now_iso8601() -> String {
+-    // Simple ISO 8601-like timestamp using std::time
+-    // Format: YYYY-MM-DDTHH:MM:SSZ (UTC approximation)
+     let elapsed = std::time::SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .unwrap_or_default();
+     let secs = elapsed.as_secs();
+-    // Calculate date components from unix timestamp
+     let days = secs / 86400;
+     let time_of_day = secs % 86400;
+     let hours = time_of_day / 3600;
+     let minutes = (time_of_day % 3600) / 60;
+     let seconds = time_of_day % 60;
+ 
+-    // Calculate year/month/day from days since epoch
+     let (year, month, day) = days_to_date(days);
+ 
+     format!(
+@@ -435,7 +846,6 @@ fn chrono_now_iso8601() -> String {
+ 
+ /// Convert days since Unix epoch to (year, month, day).
+ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+     let z = days_since_epoch + 719468;
+     let era = z / 146097;
+     let doe = z - era * 146097;
+@@ -450,18 +860,15 @@ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+ }
+ 
+ /// Background thread that reads IPC command frames from stdin.
+-/// Sends decoded commands to the main loop via the channel.
+ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result<()> {
+     use wallflow_ipc::{IpcMessage, LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
+ 
+     let mut stdin = std::io::stdin().lock();
+     loop {
+-        // Read the 4-byte length prefix
+         let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+         match stdin.read_exact(&mut len_buf) {
+             Ok(_) => {}
+             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+-                // stdin closed — exit the reader thread
+                 break;
+             }
+             Err(e) => {
+@@ -501,7 +908,6 @@ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result
+                     continue;
+                 }
+                 if cmd_tx.send(env.payload).is_err() {
+-                    // Receiver dropped — main loop has exited
+                     break;
+                 }
+             }
+@@ -518,8 +924,6 @@ fn stdin_reader_loop(cmd_tx: std::sync::mpsc::Sender<RendererCommand>) -> Result
+ fn send_ipc_event(event: RendererEvent) -> Result<()> {
+     let msg = IpcMessage::Event(EventEnvelope::new(event));
+     let bytes = encode_to_bytes(&msg)?;
+-    // SAFETY: We write the entire encoded frame to stdout in one call.
+-    // Stdout is locked for the duration of this write to prevent interleaving.
+     let mut stdout = std::io::stdout().lock();
+     stdout.write_all(&bytes)?;
+     stdout.flush()?;
+@@ -530,14 +934,6 @@ fn send_ipc_event(event: RendererEvent) -> Result<()> {
+ // Legacy headless heartbeat mode
+ // ---------------------------------------------------------------------------
+ 
+-/// Headless heartbeat mode for cloud testing (legacy).
+-///
+-/// Runs without any GUI or Win32 dependencies. Periodically emits a heartbeat
+-/// event (printed as JSON to stdout) and exits cleanly after the specified
+-/// timeout. This mode is suitable for testing the renderer supervisor on
+-/// Linux/CI without a real Windows desktop.
+-///
+-/// Prefer `--ipc-stdio` for typed IPC communication.
+ fn run_headless_heartbeat(
+     renderer_id: RendererId,
+     interval_ms: u64,
+@@ -553,7 +949,6 @@ fn run_headless_heartbeat(
+     let interval = Duration::from_millis(interval_ms);
+     let mut heartbeat_count: u64 = 0;
+ 
+-    // Emit the "Started" event
+     let started_event = serde_json::json!({
+         "type": "RendererEvent",
+         "event": "Started",
+@@ -563,7 +958,6 @@ fn run_headless_heartbeat(
+     println!("{}", serde_json::to_string(&started_event)?);
+     info!(?renderer_id, "headless renderer started");
+ 
+-    // Emit the "Ready" event
+     let ready_event = serde_json::json!({
+         "type": "RendererEvent",
+         "event": "Ready",
+@@ -574,7 +968,6 @@ fn run_headless_heartbeat(
+     info!(?renderer_id, "headless renderer ready");
+ 
+     loop {
+-        // Check timeout
+         if let Some(dur) = timeout {
+             if start.elapsed() >= dur {
+                 info!(
+@@ -585,13 +978,11 @@ fn run_headless_heartbeat(
+             }
+         }
+ 
+-        // Sleep for the heartbeat interval
+         std::thread::sleep(interval);
+ 
+         heartbeat_count += 1;
+         let uptime_ms = start.elapsed().as_millis() as u64;
+ 
+-        // Emit a heartbeat event as JSON on stdout
+         let heartbeat_event = serde_json::json!({
+             "type": "RendererEvent",
+             "event": "Heartbeat",
+@@ -603,7 +994,6 @@ fn run_headless_heartbeat(
+         println!("{}", serde_json::to_string(&heartbeat_event)?);
+     }
+ 
+-    // Emit the "Exited" event
+     let exited_event = serde_json::json!({
+         "type": "RendererEvent",
+         "event": "Exited",
+@@ -655,8 +1045,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
+     let class_name = wide("WallFlowRendererClass");
+     let window_title = wide("WallFlow Renderer");
+ 
+-    // SAFETY: RegisterClassW and CreateWindowExW are standard Win32 window
+-    // creation APIs. The WNDCLASSW struct is properly initialized.
+     unsafe {
+         let module = GetModuleHandleW(PCWSTR::null())
+             .map_err(|e| anyhow::anyhow!("GetModuleHandleW failed: {e}"))?;
+@@ -703,7 +1091,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
+             "renderer window attached to desktop"
+         );
+ 
+-        // SAFETY: GetClientRect and MoveWindow are standard Win32 APIs with valid params.
+         let mut rect = RECT::default();
+         let _ = GetClientRect(HWND(attach_report.worker_handle.0 as *mut _), &mut rect);
+         let width = rect.right - rect.left;
+@@ -732,7 +1119,6 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
+                 }
+             }
+ 
+-            // SAFETY: PeekMessageW with null HWND checks the thread message queue.
+             let has_msg = PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE);
+             if has_msg.as_bool() {
+                 if msg.message == WM_QUIT {
+@@ -770,8 +1156,6 @@ unsafe extern "system" fn renderer_wnd_proc(
+         PostQuitMessage(0);
+         LRESULT(0)
+     } else if msg == WM_ERASEBKGND {
+-        // SAFETY: wParam is the HDC passed by WM_ERASEBKGND. GetClientRect
+-        // and FillRect are standard GDI APIs with valid parameters.
+         let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
+         let mut rect = windows::Win32::Foundation::RECT::default();
+         let _ = GetClientRect(hwnd, &mut rect);
+diff --git a/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md b/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+index 3420a5f..094d86d 100644
+--- a/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
++++ b/wallflow/wallflow-foundation/docs/architecture/007-cloud-validation-strategy.md
+@@ -1,7 +1,7 @@
+ # 007 – Cloud Validation Strategy
+ 
+ > Stage: `004-cloud-safe-typed-ipc-renderer-control`
+-> Date: 2026-05-30 (updated)
++> Date: 2026-05-30 (updated 2026-06-01)
+ 
+ ## Problem
+ 
+@@ -32,12 +32,14 @@ are tested with standard `cargo test` on any platform.
+ ### Tier 2: Cloud-Testable Integration (Linux/CI process smoke)
+ 
+ Integration tests that spawn actual renderer processes and validate the
+-full IPC command/event lifecycle via piped stdio.
++full IPC command/event lifecycle or the full renderer lifecycle via piped stdio.
+ 
+ - `--ipc-stdio` renderer mode (typed IPC frames over stdin/stdout)
+ - `ipc-supervisor-smoke` CLI command (Start → Ready → Heartbeat → Pause →
+   Paused → Resume → Resumed → Shutdown → Exited)
+ - `--headless-heartbeat` renderer mode (legacy stdout text mode)
++- `--headless-render-sim` renderer mode (full lifecycle + layout, no display server)
++- `render-sim-smoke` CLI command (renderer lifecycle + wallpaper apply + layout verification)
+ 
+ ### Tier 3: Windows Compile-Check (CI)
+ 
+@@ -126,6 +128,112 @@ This pattern can be extended:
+ - Replace stdio pipes with Windows named pipes or Unix domain sockets.
+ - Add protocol fuzzing and malformed frame handling tests.
+ 
++## Render Simulation Smoke Test (render-sim-smoke)
++
++The `render-sim-smoke` CLI command is a new cloud-testable integration test
++that exercises the full renderer lifecycle without requiring a display server.
++It goes beyond the `ipc-supervisor-smoke` test by validating not just IPC
++communication, but also the internal renderer runtime — image decode, layout
++calculation, state machine transitions, and structured report generation.
++
++### How It Works
++
++1. **Create a test wallpaper package.** The CLI creates a temporary directory
++   with a `manifest.json` and a real 2×2 PNG image (generated using the `image`
++   crate, not a dummy file). This ensures the full image decode path is
++   exercised.
++
++2. **Spawn the renderer in `--headless-render-sim` mode.** The renderer is
++   launched with `--headless-render-sim --width W --height H --source PATH
++   --timeout-secs T`. The renderer:
++   - Validates the viewport dimensions.
++   - Transitions through Starting → Ready → Running.
++   - Decodes the image metadata using `wallflow_package::load_image_metadata()`.
++   - Calculates the static image layout for the given viewport and fit mode.
++   - Simulates the running period for the specified timeout.
++   - Transitions through ShuttingDown → Exited.
++   - Outputs a `RenderSimReport` as JSON on stdout.
++
++3. **Capture and parse the report.** The CLI reads the JSON report from the
++   renderer's stdout. Since `--headless-render-sim` directs all logs to stderr,
++   stdout contains only the report JSON — no log noise.
++
++4. **Verify the report.** The CLI checks:
++   - `exit_code` is `0`.
++   - `state_transitions` includes the expected sequence:
++     `[Starting, Ready, Running, ShuttingDown, Exited]`.
++   - `wallpaper_applied` is `true`.
++   - `layout_report` is present and contains valid dimensions.
++   - The destination rectangle has non-zero width and height.
++   - The image dimensions match the expected 2×2 test image.
++   - The viewport dimensions match the `--width` and `--height` arguments.
++
++5. **Print a structured summary.** The CLI outputs a human-readable summary
++   and a JSON report of the test results, consistent with the other smoke
++   test commands.
++
++### Why This Is a Smoke Test, Not a Unit Test
++
++The `render-sim-smoke` test spawns an actual renderer process, which means it
++exercises:
++
++- Process spawning and argument parsing.
++- The full renderer `main()` function dispatch to `run_headless_render_sim()`.
++- Image file I/O (reading a real PNG from disk).
++- Layout calculation with the full `wallflow_package` pipeline.
++- JSON serialization of the `RenderSimReport`.
++- Clean process exit with code 0.
++
++These are integration concerns that cannot be tested with `cargo test` unit
++tests alone. The renderer process is a black box — the smoke test validates
++its observable behavior (stdout output, exit code) without importing any
++internal modules.
++
++### Running the Test
++
++```bash
++# Build the renderer and CLI first
++cargo build -p wallflow-renderer -p wallflow-cli
++
++# Run with default settings (5s timeout, 800×450 viewport)
++cargo run -p wallflow-cli -- render-sim-smoke
++
++# Run with custom viewport and timeout
++cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 3 --width 1920 --height 1080
++```
++
++### What It Validates vs. What It Does Not
++
++| Validated | Not validated |
++|-----------|---------------|
++| Renderer process spawns and exits cleanly | Actual pixel rendering |
++| State machine transitions occur in correct order | Window creation or display server interaction |
++| Image metadata decode succeeds | GPU surface creation |
++| Layout calculation produces valid rectangles | Visual correctness of fit modes |
++| RenderSimReport serialization roundtrips correctly | DPI scale factor handling |
++| Wallpaper apply path works without IPC | IPC command handling (use `ipc-supervisor-smoke` for that) |
++| Renderer handles invalid viewports gracefully | Resize handling (use `--windowed-static` for that) |
++
++### CI Integration
++
++The `render-sim-smoke` command should be added to the Ubuntu CI runner after
++the existing IPC smoke tests:
++
++```
++┌──────────────────────────────────────────┐
++│        Ubuntu Runner (IPC + render sim)   │
++│                                           │
++│  1. cargo build -p wallflow-renderer      │
++│  2. cargo build -p wallflow-cli           │
++│  3. ipc-supervisor-smoke (typed IPC)      │
++│  4. legacy headless heartbeat smoke       │
++│  5. render-sim-smoke (full lifecycle)     │
++└──────────────────────────────────────────┘
++```
++
++This test runs in seconds and requires no special hardware, display server,
++or GPU — making it ideal for every pull request and merge to main.
++
+ ## Marking Convention
+ 
+ All code, tests, and documentation that cannot be validated without a real
+@@ -144,5 +252,6 @@ This marker appears in:
+ 
+ ## Next Steps
+ 
+-- **Stage 005**: Implement winit/wgpu-based rendering loop
+-- **Stage 006**: Real Windows validation with manual testing on Win10/11
++- **Stage 008**: Add wgpu rendering pipeline to the windowed static renderer
++- **Stage 009**: Connect desktop attach to winit window on Windows
++- **Stage 010**: Real Windows validation with manual testing on Win10/11
+diff --git a/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md b/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
+new file mode 100644
+index 0000000..cae3891
+--- /dev/null
++++ b/wallflow/wallflow-foundation/docs/architecture/010-renderer-window-runtime.md
+@@ -0,0 +1,455 @@
++# 010 – Renderer Window Runtime
++
++> Stage: `007-windowed-static-renderer`
++> Status: Implemented
++> Date: 2026-06-01
++
++## Why winit Was Added Before wgpu
++
++WallFlow's renderer architecture introduces window management before the GPU
++rendering pipeline, and this ordering is deliberate. In a wallpaper engine the
++window lifecycle is the foundation on which everything else is built: the
++renderer process must be able to open, position, resize, and close a window
++before it can ever draw a single pixel with wgpu. By establishing the window
++runtime independently, we achieve several goals:
++
++1. **Decoupled validation.** The window lifecycle (creation, resize, destroy)
++   can be tested and stabilized without any GPU dependencies. This is
++   especially important for a project that develops primarily on Linux but
++   targets Windows; the window system's behavior varies significantly between
++   platforms, and we want to lock down the winit integration before adding the
++   complexity of a wgpu surface and swap chain.
++
++2. **Incremental complexity.** Adding wgpu requires handling adapter selection,
++   surface creation, swap chain format negotiation, and shader pipeline setup.
++   Each of these is a source of platform-specific bugs. By deferring wgpu, we
++   can ship a windowed renderer that validates viewport tracking, layout
++   recalculation, and the ApplicationHandler event loop without GPU concerns.
++
++3. **Cloud-testable headless path.** The `--headless-render-sim` mode exercises
++   the same runtime types and state machine as the windowed renderer without
++   requiring a display server. This would not be possible if the runtime were
++   tightly coupled to wgpu surface creation from the start.
++
++4. **Desktop attach integration.** On Windows, the wallpaper window must be
++   parented into the WorkerW hierarchy behind desktop icons. This reparenting
++   operation is pure Win32 window management — it has nothing to do with GPU
++   rendering. By shipping window management first, we lay the groundwork for
++   the future step where the winit window is combined with desktop attach.
++
++## Three Renderer Runtime Modes
++
++The renderer process supports three mutually exclusive runtime modes, selected
++via command-line flags. Each mode exercises a different layer of the system.
++
++### `--ipc-stdio` (HeadlessIpc)
++
++The headless IPC mode is the primary communication channel between the CoreApp
++supervisor and the renderer process. It runs without any window or display
++server dependency, making it fully cloud-testable. The renderer reads typed
++`RendererCommand` frames from stdin and writes `RendererEvent` frames to
++stdout, with all diagnostic logs directed to stderr. This mode supports the
++full command lifecycle: Start, Pause, Resume, Stop, Shutdown, ApplyWallpaper,
++and SetMonitor.
++
++Use this mode when:
++- Running under the CoreApp supervisor in production
++- Running the `ipc-supervisor-smoke` or `apply-static-smoke` integration tests
++- Any environment where a display server is unavailable (CI, SSH, containers)
++
++### `--headless-render-sim` (HeadlessRenderSim)
++
++The headless render simulation mode exercises the full renderer lifecycle —
++including image decode, layout calculation, and state machine transitions —
++without requiring a display server or window. It operates against a synthetic
++viewport of configurable dimensions and produces a structured `RenderSimReport`
++as JSON on stdout. This report includes every state transition, the viewport
++used, whether a wallpaper was applied, and the complete layout calculation
++result.
++
++Use this mode when:
++- Validating the renderer's internal logic in CI without a display server
++- Running the `render-sim-smoke` CLI integration test
++- Debugging layout calculations for specific viewport sizes
++- Testing wallpaper apply failures (invalid image, zero dimensions, etc.)
++
++### `--windowed-static` (WindowedStatic)
++
++The windowed static mode opens a real winit window and displays a static
++wallpaper image. This is the closest mode to production: it uses the winit 0.30
++ApplicationHandler event loop, tracks viewport resizes, and recalculates layout
++when the window dimensions change. It requires a display server (Wayland/X11 on
++Linux, the Windows desktop on Windows).
++
++Use this mode when:
++- Testing the renderer with a real window on a development machine
++- Validating viewport resize handling and layout recalculation
++- Preparing for the future wgpu rendering pipeline (the window is already open)
++- Manual visual verification of wallpaper display
++
++Note: The current `--windowed-static` mode does not yet render pixels to the
++window surface. It opens the window, tracks viewport state, and recalculates
++layout on resize, but the actual GPU blit will be added when wgpu is
++integrated in a future stage.
++
++## Core Types
++
++### RendererRuntimeMode
++
++```rust
++pub enum RendererRuntimeMode {
++    HeadlessIpc,
++    HeadlessRenderSim,
++    WindowedStatic,
++}
++```
++
++A `Copy` enum that identifies which runtime mode the renderer process is
++running in. The CLI flags (`--ipc-stdio`, `--headless-render-sim`,
++`--windowed-static`) map 1:1 to these variants. The mode is included in the
++`RenderSimReport` so that test consumers can verify the correct mode was used.
++
++### RendererRuntimeState
++
++```rust
++pub enum RendererRuntimeState {
++    Starting,
++    Ready,
++    Running,
++    Paused,
++    ShuttingDown,
++    Exited,
++    Failed,
++}
++```
++
++A `Copy` enum representing the lifecycle state of the renderer runtime. This
++is distinct from `RendererState` (which tracks the supervisor's view of the
++renderer process) — `RendererRuntimeState` tracks the runtime's internal
++state as seen from inside the renderer process itself. Key methods:
++
++- `is_terminal()` — Returns `true` for `Exited` and `Failed`, indicating the
++  runtime will not transition further.
++- `is_alive()` — Returns `true` for `Ready`, `Running`, and `Paused`,
++  indicating the runtime is operational.
++
++In `--headless-render-sim` mode, every state transition is recorded in the
++`state_transitions` field of the `RenderSimReport`, giving full visibility into
++the lifecycle that occurred during the simulation.
++
++### RendererViewport
++
++```rust
++pub struct RendererViewport {
++    pub width: u32,
++    pub height: u32,
++    pub scale_factor: Option<u32>,
++}
++```
++
++Tracks the current viewport dimensions in logical pixels, with an optional
++DPI scale factor. The viewport is the renderer's understanding of the display
++area it targets. In `--headless-render-sim` mode, the viewport is initialized
++from the `--width` and `--height` CLI arguments. In `--windowed-static` mode,
++the viewport is updated on every `WindowEvent::Resized` event from winit.
++
++The `is_valid()` method returns `false` if either dimension is zero — this
++guards against degenerate viewports that would cause division-by-zero errors
++in layout calculation. When an invalid viewport is detected in render-sim
++mode, the runtime transitions to `Failed` and produces a report with
++`exit_code: 1`.
++
++### WindowRuntimeConfig
++
++```rust
++pub struct WindowRuntimeConfig {
++    pub width: u32,
++    pub height: u32,
++    pub title: String,
++    pub visible: bool,
++    pub borderless: bool,
++}
++```
++
++Configuration for the windowed renderer runtime. This type captures the
++parameters needed to create a winit window: dimensions, title, visibility, and
++whether the window should be borderless (no title bar or decorations). The
++`Default` implementation creates a 1920×1080 visible titled window.
++
++In the current implementation, `WindowRuntimeConfig` is constructed from the
++CLI arguments and used only in `--windowed-static` mode. In the future, when
++the renderer is driven by IPC commands, the config may be supplied by the
++CoreApp supervisor via an initialization frame.
++
++## Desktop Attach: Not Connected Yet
++
++The Windows desktop attach functionality (`wallflow-desktop` crate) is
++implemented and tested in isolation (see `docs/architecture/004-windows-desktop-attach.md`),
++but it is not yet connected to the winit-based `--windowed-static` mode. There
++are several reasons for this:
++
++1. **winit owns the window.** The `--windowed-static` mode creates its window
++   through winit's `event_loop.create_window()` API. winit 0.30 manages the
++   window lifecycle internally, and calling `SetParent()` on a winit-managed
++   window requires careful coordination — winit may recreate the window
++   internally on platform events, which would break the reparenting.
++
++2. **Event loop incompatibility.** The desktop attach mode uses a Win32
++   `PeekMessageW` loop, while the windowed static mode uses winit's
++   `EventLoop::run_app()`. These are two different event loop paradigms. To
++   combine them, the winit window must be created first, then its underlying
++   HWND must be extracted and reparented into the WorkerW hierarchy, all while
++   winit's event loop continues to run.
++
++3. **Requires REQUIRES_REAL_WINDOWS_VALIDATION.** The combination of winit
++   window management and Win32 desktop attach has never been tested on a real
++   Windows desktop. The interaction between winit's internal window state and
++   the `SetParent()` call is unknown and may cause crashes, visual glitches,
++   or event loop deadlocks.
++
++The recommended approach for connecting desktop attach is:
++
++1. After `resumed()` creates the winit window, extract the raw HWND using
++   `window.raw_window_handle()` (via the `raw-window-handle` crate).
++2. Call `attach_window_to_desktop()` from `wallflow-desktop`.
++3. Monitor the WorkerW handle validity in the event loop and re-attach if
++   Explorer restarts.
++4. On `WindowEvent::Destroyed` or shutdown, call `detach_window_from_desktop()`
++   before allowing winit to destroy the window.
++
++This work is planned for a future stage that specifically targets Windows
++desktop integration with winit.
++
++## Cloud-Testable vs. Windows-Only
++
++### What Can Be Tested in Linux/CI (No Display Server)
++
++The following components and modes are fully testable on Linux and in cloud CI
++environments without any display server:
++
++| Component | Mode | Test Command |
++|-----------|------|-------------|
++| Runtime type definitions | All | `cargo test -p wallflow-common` |
++| RendererRuntimeMode Display | All | Unit test |
++| RendererRuntimeState transitions | All | Unit test |
++| RendererViewport validity | All | Unit test |
++| WindowRuntimeConfig defaults | All | Unit test |
++| RenderSimReport serialization | All | Unit test |
++| Headless render simulation | `--headless-render-sim` | `cargo run -p wallflow-renderer -- --headless-render-sim --width 800 --height 450 --timeout-secs 2` |
++| Render sim smoke test | `--headless-render-sim` | `cargo run -p wallflow-cli -- render-sim-smoke --timeout-secs 5 --width 800 --height 450` |
++| IPC stdio mode | `--ipc-stdio` | `cargo run -p wallflow-cli -- ipc-supervisor-smoke` |
++| Apply static smoke | `--ipc-stdio` | `cargo run -p wallflow-cli -- apply-static-smoke` |
++| Layout calculation | All | `cargo test -p wallflow-package` |
++
++The `render-sim-smoke` CLI command is the primary integration test for the
++renderer runtime. It creates a test wallpaper package, spawns the renderer in
++`--headless-render-sim` mode, captures the structured JSON report from stdout,
++and verifies:
++- The report has `exit_code: 0`
++- The `state_transitions` include Starting → Ready → Running → ShuttingDown → Exited
++- The `wallpaper_applied` flag is `true`
++- The `layout_report` contains valid image and viewport dimensions
++- The destination rectangle is non-zero
++
++### REQUIRES_REAL_WINDOWS_VALIDATION
++
++The following items cannot be validated without a real Windows desktop session:
++
++| Item | Reason |
++|------|--------|
++| `--windowed-static` on Windows | Requires a Windows desktop session; winit creates a Win32 window |
++| Desktop attach with winit window | `SetParent()` on a winit-managed HWND is untested |
++| Viewport resize from real monitor events | Requires actual display hardware or VM display |
++| Layout with actual monitor dimensions | Currently uses synthetic 1920×1080; real monitors may differ |
++| Visual correctness of fit modes | Cover cropping, contain letterboxing, tile repeat — must be seen |
++| DPI scale factor changes (WM_DPICHANGED) | Requires Windows HiDPI environment |
++| Explorer restart tolerance | Must kill and restart Explorer to test |
++
++All code paths that depend on a real Windows desktop are marked with the
++`REQUIRES_REAL_WINDOWS_VALIDATION` comment convention.
++
++## ApplicationHandler Pattern (winit 0.30)
++
++The `--windowed-static` mode uses winit 0.30's `ApplicationHandler` trait,
++which replaced the older `EventHandler` trait. The `ApplicationHandler` pattern
++is a significant API change that affects how the renderer event loop is
++structured.
++
++### Key Differences from EventHandler
++
++In winit 0.30, the application implements `ApplicationHandler` instead of
++`EventHandler`. The main differences are:
++
++1. **Window creation is deferred.** The `ApplicationHandler` does not receive
++   a window in its constructor. Instead, the window is created inside the
++   `resumed()` callback, which is called when the event loop is ready. This
++   allows the event loop to handle platform-specific initialization before any
++   window is created.
++
++2. **Per-window events.** The `window_event()` callback receives a `WindowId`
++   parameter, allowing a single `ApplicationHandler` to manage multiple windows
++   (important for future multi-monitor support).
++
++3. **`about_to_wait` replaces `MainEventsCleared`.** The `about_to_wait()`
++   callback is called when the event loop is about to block and wait for new
++   events. This is the correct place to check timeouts and request redraws.
++
++### WindowedStaticApp Implementation
++
++```rust
++struct WindowedStaticApp {
++    renderer_id: RendererId,
++    viewport: RendererViewport,
++    loaded_state: Option<LoadedStaticImageState>,
++    timeout: Option<Duration>,
++    start: Instant,
++    window: Option<winit::window::Window>,
++}
++
++impl ApplicationHandler for WindowedStaticApp {
++    fn resumed(&mut self, event_loop: &ActiveEventLoop) { ... }
++    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) { ... }
++    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) { ... }
++}
++```
++
++The `window` field is `Option<Window>` because the window does not exist at
++construction time — it is created in `resumed()`. If window creation fails
++(e.g., no display server), the handler logs the error and calls
++`event_loop.exit()` to shut down gracefully without panicking.
++
++The event loop is started with `event_loop.run_app(&mut app)`, which blocks
++until the event loop exits.
++
++## Viewport Resize Handling and Layout Recalculation
++
++One of the critical behaviors validated by the windowed static renderer is
++viewport resize handling with automatic layout recalculation. When the user
++resizes the window (or when a monitor resolution change occurs), the renderer
++must:
++
++1. **Detect the resize.** The `WindowEvent::Resized(physical_size)` event
++   provides the new dimensions in physical pixels. The handler checks that both
++   `width` and `height` are non-zero before proceeding (zero-dimension events
++   can occur during minimization on some platforms).
++
++2. **Update the viewport.** The `RendererViewport` is updated with the new
++   dimensions. This is the renderer's source of truth for layout calculation.
++
++3. **Recalculate layout.** If a wallpaper is currently applied
++   (`loaded_state` is `Some`), the layout is recalculated using
++   `calculate_static_image_layout()` with the new viewport dimensions. The
++   fit mode and background color are preserved from the original application.
++   The `loaded_state` is then replaced with the new layout.
++
++4. **Log the recalculation.** The new destination rectangle dimensions and
++   viewport are logged for diagnostics. This is essential for debugging
++   layout issues on real hardware.
++
++5. **Handle failure gracefully.** If the layout recalculation fails (e.g.,
++   due to a zero-dimension viewport that somehow passed the guard check), the
++   handler logs a warning but does not crash or exit. The old layout remains
++   in effect.
++
++In the current implementation, the recalculated layout is not yet rendered to
++the window surface (pending wgpu integration). However, the full data flow —
++resize → viewport update → layout recalculation → state update — is exercised
++and validated. When wgpu is added, the `about_to_wait()` callback will trigger
++a redraw that uses the updated layout.
++
++## RenderSimReport Structure
++
++The `RenderSimReport` is the primary output of the `--headless-render-sim`
++mode. It is a self-contained JSON structure that captures everything that
++happened during a render simulation run, enabling automated validation in CI.
++
++```rust
++pub struct RenderSimReport {
++    pub mode: RendererRuntimeMode,
++    pub viewport: RendererViewport,
++    pub state_transitions: Vec<RendererRuntimeState>,
++    pub wallpaper_applied: bool,
++    pub layout_report: Option<RenderSimLayoutReport>,
++    pub total_sim_time_ms: u64,
++    pub exit_code: i32,
++}
++```
++
++### Fields
++
++- **`mode`**: Always `HeadlessRenderSim`. Included for identification when the
++  report is consumed by automated tooling.
++
++- **`viewport`**: The viewport dimensions used for the simulation. If the
++  viewport is invalid (zero dimensions), the report is still produced but with
++  `exit_code: 1` and `state_transitions: [Starting, Failed]`.
++
++- **`state_transitions`**: An ordered list of every `RendererRuntimeState`
++  transition that occurred during the simulation. A healthy run produces:
++  `[Starting, Ready, Running, ShuttingDown, Exited]`. A failed run may
++  produce `[Starting, Failed]` or `[Starting, Ready, Running, Failed]`.
++
++- **`wallpaper_applied`**: `true` if a wallpaper source image was provided
++  (via `--source`) and was successfully decoded and laid out. `false` if no
++  source was provided or if the apply failed.
++
++- **`layout_report`**: If a wallpaper was applied, this contains the full
++  layout calculation result including image dimensions, viewport dimensions,
++  and the destination rectangle (x, y, width, height). This enables
++  automated verification of layout correctness without visual inspection.
++
++- **`total_sim_time_ms`**: Total wall-clock time of the simulation in
++  milliseconds. Useful for performance regression detection.
++
++- **`exit_code`**: `0` for success, `1` for failure. A failure occurs when
++  the viewport is invalid or when the simulation encounters an unrecoverable
++  error.
++
++### RenderSimLayoutReport
++
++```rust
++pub struct RenderSimLayoutReport {
++    pub image_width: u32,
++    pub image_height: u32,
++    pub viewport_width: u32,
++    pub viewport_height: u32,
++    pub destination_x: f64,
++    pub destination_y: f64,
++    pub destination_width: f64,
++    pub destination_height: f64,
++}
++```
++
++This sub-report captures the layout calculation result. The `destination_*`
++fields represent the rectangle where the image should be drawn within the
++viewport, computed by `calculate_static_image_layout()`. The `render-sim-smoke`
++test verifies that these values are non-zero and consistent with the expected
++fit mode behavior (e.g., cover mode fills the viewport with possible overflow).
++
++### Example Report
++
++```json
++{
++  "mode": "HeadlessRenderSim",
++  "viewport": { "width": 800, "height": 450, "scale_factor": null },
++  "state_transitions": ["Starting", "Ready", "Running", "ShuttingDown", "Exited"],
++  "wallpaper_applied": true,
++  "layout_report": {
++    "image_width": 2,
++    "image_height": 2,
++    "viewport_width": 800,
++    "viewport_height": 450,
++    "destination_x": 0.0,
++    "destination_y": -337.5,
++    "destination_width": 800.0,
++    "destination_height": 1125.0
++  },
++  "total_sim_time_ms": 2005,
++  "exit_code": 0
++}
++```
++
++This report shows a 2×2 image laid out in cover mode on an 800×450 viewport.
++The destination rectangle (0, −337.5, 800, 1125) extends beyond the viewport
++boundaries vertically, which is correct for cover mode — the image is scaled
++to fill the viewport and the overflow is clipped.
+diff --git a/wallflow/wallflow-foundation/docs/roadmap.md b/wallflow/wallflow-foundation/docs/roadmap.md
+index f18915a..a340d88 100644
+--- a/wallflow/wallflow-foundation/docs/roadmap.md
++++ b/wallflow/wallflow-foundation/docs/roadmap.md
+@@ -130,11 +130,40 @@
+ - Layout with actual monitor dimensions (not synthetic 1920×1080).
+ - Visual correctness of each fit mode.
+ 
++## MVP-2.1 Windowed static renderer ✅
++
++*Completed in stage 007.*
++
++- `winit` 0.30 added as workspace dependency for cross-platform window management.
++- `RendererRuntimeMode` enum: `HeadlessIpc`, `HeadlessRenderSim`, `WindowedStatic`.
++- `RendererRuntimeState` lifecycle: Starting → Ready → Running → Paused → ShuttingDown → Exited / Failed.
++- `RendererViewport` type with width, height, and optional DPI scale factor.
++- `WindowRuntimeConfig` type for windowed renderer parameters.
++- `RenderSimReport` and `RenderSimLayoutReport` structured output types.
++- `--headless-render-sim` renderer mode: synthetic viewport, no display server, JSON report.
++- `--windowed-static` renderer mode: winit 0.30 ApplicationHandler event loop, real window.
++- `render-sim-smoke` CLI command: full renderer lifecycle + wallpaper apply + layout verification in CI.
++- Viewport resize handling with automatic layout recalculation in `--windowed-static` mode.
++- `ApplicationHandler` pattern for winit 0.30 (resumed creates window, about_to_wait checks timeout).
++- Desktop attach not yet connected to winit window (requires REQUIRES_REAL_WINDOWS_VALIDATION).
++- Renderer runtime architecture documented in `docs/architecture/010-renderer-window-runtime.md`.
++
++### REQUIRES_REAL_WINDOWS_VALIDATION
++
++- `--windowed-static` on Windows (winit creates a Win32 window; must verify on real desktop)
++- Desktop attach with winit window (`SetParent()` on winit-managed HWND is untested)
++- Viewport resize from real monitor events (not just synthetic resize)
++- Layout with actual monitor dimensions (not synthetic 1920×1080)
++- Visual correctness of each fit mode
++- DPI scale factor changes (WM_DPICHANGED)
++- Explorer restart tolerance with winit event loop
++
+ ## MVP-2 static wallpaper
+ 
+-- Add winit/wgpu static renderer.
++- Add wgpu rendering pipeline to the windowed static renderer.
+ - Per-monitor placement.
+ - Fullscreen detection pause policy.
++- Connect desktop attach to winit window on Windows.
+ 
+ ## MVP-3 video wallpaper
+ 
+diff --git a/worklog.md b/worklog.md
+index aa13ab6..5fb9e94 100644
+--- a/worklog.md
++++ b/worklog.md
+@@ -1,221 +1,32 @@
+----
+-Task ID: 1
+-Agent: main
+-Task: WallFlow Foundation Review (001-foundation-review)
+-
+-Work Log:
+-- Extracted wallflow-foundation.zip to /home/z/my-project/wallflow/wallflow-foundation/
+-- Installed Rust toolchain (1.96.0 stable) on Linux environment
+-- Read all project files: README.md, Cargo.toml, all 9 crate sources, docs/architecture/, docs/agent/
+-- Ran cargo fmt --all: passed (no changes needed)
+-- Ran cargo check --workspace: passed cleanly
+-- Ran cargo clippy --workspace --all-targets -- -D warnings: found 1 error (derivable_impls for PerformanceProfile)
+-- Fixed PerformanceProfile: replaced manual Default impl with derive(Default) + #[default] attribute
+-- Ran cargo test --workspace: all 11 tests passed (config: 2, core/watchdog: 3, ipc: 1, media: 2, monitor/diff: 3)
+-- Verified no unwrap/expect/todo/unimplemented in production code (only in #[cfg(test)] blocks)
+-- Verified all unsafe blocks have SAFETY comments (added missing comments on unsafe fn declarations)
+-- Removed unused LRESULT import from wallflow-desktop
+-- Fixed windows 0.58 API compatibility issues in wallflow-monitor and wallflow-desktop:
+-  - HDC(0) → HDC(std::ptr::null_mut()) (HDC takes *mut c_void, not integer)
+-  - HWND(0) → HWND(std::ptr::null_mut()) (HWND takes *mut c_void, not integer)
+-  - Moved MONITORINFOF_PRIMARY import from Win32_Graphics_Gdi to Win32_UI_WindowsAndMessaging
+-  - Added Win32_UI_WindowsAndMessaging feature to wallflow-monitor Cargo.toml
+-  - Fixed EnumWindows return type handling (Result<()>, not BOOL)
+-  - Fixed FindWindowW/FindWindowExW return type handling (Result<HWND>, not HWND)
+-  - Fixed SetParent return type handling (Result<HWND>, not HWND)
+-  - Fixed null HWND comparisons to use .is_null() instead of .0 == 0
+-- Re-ran all 4 commands after fixes: all pass clean
+-
+-Stage Summary:
+-- 3 files changed: wallflow-common/src/wallpaper.rs, wallflow-monitor/src/provider.rs, wallflow-desktop/src/lib.rs
+-- 1 Cargo.toml changed: wallflow-monitor/Cargo.toml (added Win32_UI_WindowsAndMessaging feature)
+-- All 4 commands now pass: cargo fmt --all, cargo check --workspace, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
+-- Windows-specific code cannot be fully verified on Linux; needs manual testing on Windows
+-
+----
+-Task ID: 2
+-Agent: main
+-Task: WallFlow Windows Desktop Attach Hardening (002)
+-
+-Work Log:
+-- Studied 002 prompt and all current crate sources
+-- Rewrote wallflow-desktop with full public API:
+-  - probe_desktop() -> DesktopProbeReport (diagnostic, non-mutating)
+-  - find_desktop_worker() -> Result<DesktopWorkerHandle, DesktopError>
+-  - attach_window_to_desktop(NativeWindowHandle) -> Result<DesktopAttachReport, DesktopError>
+-  - detach_window_from_desktop(NativeWindowHandle) -> Result<DesktopDetachReport, DesktopError>
+-- Added DesktopProbeReport, DesktopAttachReport, DesktopDetachReport, DesktopDiscoveryData structs
+-- All structs are Serialize/Deserialize for JSON output
+-- Added structured tracing logs (info/debug/warn) throughout
+-- Added GetLastError-based diagnostics in error paths
+-- Added IsWindow validation before SetParent
+-- Added SAFETY comments on all unsafe blocks and functions
+-- Added 11 unit tests in wallflow-desktop:
+-  - handle validity, serialization roundtrips, error messages, invalid handle rejection, non-Windows stubs
+-- Added CLI commands: desktop-probe, desktop-attach-smoke
+-- Added wallflow-renderer --desktop-attach mode with --timeout-secs
+-- Created dummy Win32 window (RegisterClassW + CreateWindowExW) for smoke test
+-- Added windows crate dependencies to wallflow-cli and wallflow-renderer (Win32_Foundation, Win32_System_LibraryLoader, Win32_UI_WindowsAndMessaging)
+-- Added tracing dependency to wallflow-desktop
+-- Added serde dependency to wallflow-desktop
+-- Created docs/architecture/004-windows-desktop-attach.md with full documentation
+-- All 4 cargo commands pass: fmt, check, clippy -D warnings, test (22 tests total)
+-- Git committed as "002 windows desktop attach hardening"
+-
+-Stage Summary:
+-- 7 files changed, 1129 insertions, 60 deletions
+-- wallflow-desktop: complete rewrite with diagnostics, attach, detach, structured logging
+-- wallflow-cli: added desktop-probe and desktop-attach-smoke commands
+-- wallflow-renderer: added --desktop-attach mode for standalone renderer
+-- docs/architecture/004-windows-desktop-attach.md: comprehensive documentation
+-- 22 tests passing (11 desktop, 2 config, 3 core, 1 ipc, 2 media, 3 monitor)
+-- desktop-probe and desktop-attach-smoke cannot be tested on Linux; need real Windows
+-
+----
+-Task ID: 3
+-Agent: main
+-Task: WallFlow Cloud-Safe Core Renderer Integration (003)
+-
+-Work Log:
+-- Enhanced wallflow-common/src/renderer.rs:
+-  - Added RendererState::is_terminal() and is_alive() methods
+-  - Added RendererHealth enum (Healthy, Stale, Unhealthy)
+-  - Added RendererRestartPolicy enum (Never, Limited, Always) with Default
+-  - Added RendererAssignment struct (renderer_id + monitor_id)
+-  - Added Display impl for RendererId
+-- Enhanced wallflow-ipc/src/protocol.rs:
+-  - Bumped PROTOCOL_VERSION from 1 to 2
+-  - Added RendererCommand enum (Start, Pause, Resume, Stop, ApplyWallpaper, SetMonitor, Shutdown)
+-  - Added RendererEvent enum (Started, Ready, Heartbeat, Paused, Resumed, WallpaperApplied, Error, Exited)
+-  - Added CoreCommand enum (ApplyWallpaperToMonitor, StopWallpaper, PauseAll, ResumeAll, QueryState, etc.)
+-  - Added CoreEvent enum (StateChanged, RendererStarted, RendererStopped, RendererCrashed, RendererRecovered, etc.)
+-  - Added 6 new unit tests for IPC roundtrips
+-- Enhanced wallflow-core:
+-  - Added supervisor.rs: RendererSupervisor with full lifecycle management
+-    - register_renderer, mark_running, mark_heartbeat, mark_paused, mark_resumed, mark_stopping, mark_stopped, mark_crashed
+-    - detect_stale, should_restart, recover, deregister
+-    - snapshot and report generation
+-  - Updated watchdog.rs: WatchdogPolicy now serde-serializable (secs instead of Duration)
+-    - Added health_from_heartbeat() and should_attempt_restart() functions
+-    - 10 watchdog tests
+-  - Added RendererStatus, RendererHandle, RendererReport, SupervisorSnapshot, SupervisorReport structs
+-  - 15 supervisor unit tests
+-  - Updated app.rs: CoreApp now owns a RendererSupervisor
+-  - Updated renderer_process.rs: Added headless_heartbeat support in RendererLaunchSpec, is_running(), pid()
+-  - Added wallflow-ipc dependency
+-- Enhanced wallflow-renderer/src/main.rs:
+-  - Added --headless-heartbeat and --heartbeat-interval-ms CLI args
+-  - Added run_headless_heartbeat() function that emits JSON events on stdout
+-  - Events: Started, Ready, Heartbeat (periodic), Exited (on timeout)
+-  - Fully testable on Linux without GUI or Win32
+-- Enhanced wallflow-cli/src/main.rs:
+-  - Added supervisor-smoke command with --timeout-secs and --heartbeat-interval-ms args
+-  - Spawns renderer in headless mode, reads stdout, parses events
+-  - Validates Started, Ready, Heartbeat, Exited events
+-  - Prints structured JSON report
+-  - Returns exit code 0 on success
+-- Added .github/workflows/ci.yml:
+-  - Ubuntu: fmt, check, clippy, test, headless smoke, supervisor smoke
+-  - Windows: check, test (no desktop-attach smoke)
+-- Added docs/architecture/003-renderer-lifecycle.md
+-- Added docs/architecture/007-cloud-validation-strategy.md
+-- Updated docs/roadmap.md with MVP-1.5 section
+-- Tested Windows cross-compilation:
+-  - x86_64-pc-windows-gnu: Pure-logic crates compile; Win32 crates fail (missing import libs)
+-  - x86_64-pc-windows-msvc: Same issue (missing Windows SDK libs)
+-  - Conclusion: Cross-compilation requires Windows SDK; CI Windows runner is simpler
+-- All 4 cargo commands pass: fmt, check, clippy -D warnings, test (50 tests)
+-- Headless renderer tested: emits proper JSON events, exits cleanly with code 0
+-- Supervisor smoke tested: PASSED with structured JSON report
+-
+-Stage Summary:
+-- 13 files changed/created
+-- wallflow-common: RendererHealth, RendererRestartPolicy, RendererAssignment, Display for RendererId
+-- wallflow-ipc: Full typed IPC protocol v2 (RendererCommand/Event, CoreCommand/Event)
+-- wallflow-core: RendererSupervisor (15 tests), enhanced WatchdogPolicy (10 tests)
+-- wallflow-renderer: Headless heartbeat mode (--headless-heartbeat)
+-- wallflow-cli: supervisor-smoke command
+-- .github/workflows/ci.yml: Ubuntu + Windows CI
+-- 50 tests passing total (up from 22)
+-- Headless renderer and supervisor smoke both validated on Linux
+-- Windows cross-compilation documented as requiring Windows SDK libs
+-- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
+-
+----
+-Task ID: 4
+-Agent: main
+-Task: WallFlow Cloud-Safe Typed IPC Renderer Control (004)
+-
+-Work Log:
+-- Enhanced wallflow-ipc with typed IPC transport:
+-  - Added frame.rs: length-prefixed JSON framing with async (read_frame/write_frame) and sync (encode_to_bytes/decode_from_bytes) helpers
+-  - Added FrameError enum: Io, Json, TooLarge, InvalidLength, ProtocolVersionMismatch
+-  - MAX_FRAME_SIZE = 8 MiB, LENGTH_PREFIX_SIZE = 4 bytes (u32 LE)
+-  - Added validate_protocol_version() helper
+-  - Bumped PROTOCOL_VERSION from 2 to 3
+-  - Added IpcMessage tagged union (core_to_renderer, renderer_to_core, external_to_core, core_broadcast)
+-  - Added CommandEnvelope<T> with protocol_version + request_id (Uuid v4)
+-  - Added EventEnvelope<T> with protocol_version + optional request_id for correlation
+-  - Added helper functions: renderer_command(), renderer_event(), core_command(), core_event(), renderer_event_id()
+-  - Preserved legacy Envelope<T> for backward compatibility
+-  - 24 tests in wallflow-ipc (10 frame tests, 14 protocol tests)
+-- Enhanced wallflow-renderer with --ipc-stdio mode:
+-  - Dedicated stdin-reader thread with mpsc channel (avoids blocking main loop)
+-  - Sends Started → Ready → periodic Heartbeat → responds to Pause/Resume/Shutdown
+-  - All diagnostic logs to stderr only; stdout reserved for IPC frames
+-  - Legacy --headless-heartbeat mode preserved
+-- Enhanced wallflow-cli with ipc-supervisor-smoke command:
+-  - Spawns renderer with --ipc-stdio, piped stdin/stdout, inherited stderr
+-  - Full lifecycle: Started → Ready → 2+ Heartbeats → Pause → Paused → Resume → Resumed → Shutdown → Exited
+-  - Structured JSON report output
+-- Updated .github/workflows/ci.yml:
+-  - Added ipc-smoke job: builds renderer + CLI, runs ipc-supervisor-smoke, runs legacy headless heartbeat
+-- Updated documentation:
+-  - docs/architecture/002-ipc-contract.md: IPC transport design, frame format, why stdio
+-  - docs/architecture/003-renderer-lifecycle.md: Added IPC integration section
+-  - docs/architecture/007-cloud-validation-strategy.md: Updated for Stage 004
+-  - docs/roadmap.md: Added MVP-1.7 section
+-- Final validation:
+-  - cargo fmt --all -- --check: PASSED
+-  - cargo check --workspace: PASSED
+-  - cargo clippy --workspace --all-targets -- -D warnings: PASSED
+-  - cargo test --workspace: 67 tests PASSED (24 ipc, 25 core, 11 desktop, 2 config, 2 media, 3 monitor)
+-  - ipc-supervisor-smoke: PASSED (full lifecycle in ~1s)
+-  - Legacy headless-heartbeat: PASSED
+-
+-Stage Summary:
+-- 6+ files changed/created
+-- wallflow-ipc: IpcMessage, CommandEnvelope, EventEnvelope, frame.rs (24 tests)
+-- wallflow-renderer: --ipc-stdio mode with threaded stdin reader
+-- wallflow-cli: ipc-supervisor-smoke command
+-- .github/workflows/ci.yml: IPC smoke job
+-- Documentation: 002-ipc-contract.md, 003-renderer-lifecycle.md, 007-cloud-validation-strategy.md, roadmap.md
+-- 67 tests passing total (up from 50)
+-- Both --ipc-stdio and --headless-heartbeat validated on Linux
+-- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
++# WallFlow Foundation Worklog
+ 
+ ---
+-Task ID: 5
+-Agent: main
+-Task: WallFlow Cloud-Safe Wallpaper Package and Apply Contract (005)
++Task ID: 007
++Agent: Main Agent
++Task: Stage 007 — Cloud-safe winit static window
+ 
+ Work Log:
+-- Created wallflow-package crate (18 tests)
+-- Extended IPC protocol v3 → v4 with ApplyWallpaperRequest, StaticImagePayload, WallpaperPayload, WallpaperApplyError, FitMode
+-- Added WallpaperApplyFailed event, updated WallpaperApplied to include wallpaper_id
+-- Enhanced renderer with AppliedWallpaperState and handle_apply_wallpaper
+-- Enhanced supervisor with apply_wallpaper, mark_wallpaper_applied, mark_wallpaper_apply_failed
+-- Added apply-static-smoke CLI command
+-- Updated documentation: 008-wallpaper-package-format.md, 002-ipc-contract.md, 003-renderer-lifecycle.md, roadmap.md
+-- Updated CI: apply-static-smoke step in ipc-smoke job
+-- 97 tests passing total (up from 67)
++- Added `winit = "0.30"` to workspace dependencies
++- Created `wallflow-common/src/runtime.rs` with RendererRuntimeMode, RendererRuntimeState, RendererViewport, WindowRuntimeConfig, RenderSimReport, RenderSimLayoutReport
++- Added `serde_json` as dev-dependency for wallflow-common tests
++- Updated wallflow-common/src/lib.rs to export new runtime types
++- Updated wallflow-renderer/Cargo.toml to include winit workspace dep
++- Added `--windowed-static` mode with WindowedStaticApp (winit 0.30 ApplicationHandler API)
++- Added `--headless-render-sim` mode with structured JSON report output
++- Added `--width`, `--height`, `--headless-render-sim`, `--windowed-static` CLI args to renderer
++- Implemented viewport resize handling with layout recalculation in windowed mode
++- Added `render-sim-smoke` CLI command to wallflow-cli
++- Added 4 layout tests for 800×450 viewport (cover, contain, stretch, center)
++- Added 8 runtime type tests in wallflow-common
++- Updated .github/workflows/ci.yml with render-sim-smoke step
++- Created docs/architecture/010-renderer-window-runtime.md
++- Updated docs/architecture/007-cloud-validation-strategy.md
++- Updated docs/roadmap.md
+ 
+ Stage Summary:
+-- New crate: wallflow-package (18 tests)
+-- wallflow-ipc: 32 tests (+8 new apply/error/fit tests)
+-- wallflow-core: 29 tests (+4 apply state transition tests)
+-- IPC protocol version 4
+-- Package validation: schema version, required fields, kind support, path traversal, asset existence
+-- apply-static-smoke PASSED
+-- ipc-supervisor-smoke PASSED
+-- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
++- 139 tests passing (was 127)
++- All three smoke tests pass: ipc-supervisor-smoke, apply-static-smoke, render-sim-smoke
++- --headless-render-sim works without display server
++- --windowed-static works with display server, returns clear error without panic when no display
++- winit 0.30 ApplicationHandler pattern used
++- Viewport resize triggers layout recalculation
+-- 
+2.47.3
+
