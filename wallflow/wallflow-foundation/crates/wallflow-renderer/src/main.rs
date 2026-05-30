@@ -107,7 +107,8 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
         attach_window_to_desktop, detach_window_from_desktop, probe_desktop, NativeWindowHandle,
     };
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, FillRect};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -150,16 +151,18 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
             anyhow::bail!("RegisterClassW failed (error: {})", err.0);
         }
 
-        // Step 3: Create the renderer window
+        // Step 3: Create the renderer window (popup, full screen size)
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             PCWSTR(class_name.0.as_ptr()),
             PCWSTR(window_title.0.as_ptr()),
-            WINDOW_STYLE::WS_OVERLAPPEDWINDOW,
+            WINDOW_STYLE::WS_POPUP | WINDOW_STYLE::WS_VISIBLE,
             0,
             0,
-            800,
-            600,
+            screen_w,
+            screen_h,
             None,
             None,
             module,
@@ -170,23 +173,31 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
         let native_handle = NativeWindowHandle(hwnd.0 as isize);
         info!(hwnd = hwnd.0 as isize, "renderer window created");
 
-        // Step 4: Show and attach
-        ShowWindow(hwnd, SW_SHOW);
-        info!("renderer window shown");
-
+        // Step 4: Attach to desktop
         let attach_report = attach_window_to_desktop(native_handle)?;
         info!(
             worker = attach_report.worker_handle.0,
             previous_parent = attach_report.previous_parent_hwnd,
             "renderer window attached to desktop"
         );
+
+        // After SetParent, reposition the window to fill the WorkerW client area.
+        // SAFETY: GetClientRect and MoveWindow are standard Win32 APIs with valid params.
+        let mut rect = RECT::default();
+        let _ = GetClientRect(HWND(attach_report.worker_handle.0 as *mut _), &mut rect);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let _ = MoveWindow(hwnd, 0, 0, width, height, true);
+
         println!(
-            "Renderer attached to desktop (WorkerW HWND: {:#x}). \
+            "Renderer attached to desktop (WorkerW HWND: {:#x}, sized {}x{}). \
              Window is behind desktop icons.",
-            attach_report.worker_handle.0 as usize
+            attach_report.worker_handle.0 as usize, width, height
         );
 
-        // Step 5: Run message loop with optional timeout
+        // Step 5: Run message loop with optional timeout.
+        // Using PeekMessageW + sleep instead of GetMessageW so the timeout works
+        // even when no messages arrive.
         let start = Instant::now();
         let timeout = if timeout_secs > 0 {
             Some(Duration::from_secs(timeout_secs))
@@ -204,17 +215,20 @@ fn run_desktop_attach_renderer(timeout_secs: u64) -> Result<()> {
                 }
             }
 
-            // SAFETY: GetMessageW with null HWND retrieves messages for all windows
-            // on the calling thread. The MSG buffer is stack-allocated and valid.
-            let ret = GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0);
-            if !ret.as_bool() {
-                // WM_QUIT received
-                info!("WM_QUIT received, exiting message loop");
-                break;
+            // SAFETY: PeekMessageW with null HWND checks the thread message queue.
+            // PM_REMOVE removes the message after retrieval.
+            let has_msg = PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE);
+            if has_msg.as_bool() {
+                if msg.message == WM_QUIT {
+                    info!("WM_QUIT received, exiting message loop");
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else {
+                // No messages — sleep briefly to avoid busy-waiting
+                std::thread::sleep(Duration::from_millis(50));
             }
-
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
         }
 
         // Step 6: Detach and cleanup
@@ -241,6 +255,16 @@ unsafe extern "system" fn renderer_wnd_proc(
     if msg == WM_DESTROY {
         PostQuitMessage(0);
         LRESULT(0)
+    } else if msg == WM_ERASEBKGND {
+        // SAFETY: wParam is the HDC passed by WM_ERASEBKGND. GetClientRect
+        // and FillRect are standard GDI APIs with valid parameters.
+        let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetClientRect(hwnd, &mut rect);
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00804040));
+        let _ = FillRect(hdc, &rect, brush);
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush);
+        LRESULT(1) // background was erased
     } else {
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }

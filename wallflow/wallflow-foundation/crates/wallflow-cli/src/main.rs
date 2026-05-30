@@ -111,13 +111,14 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_desktop_attach_smoke_impl() -> Result<()> {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use wallflow_desktop::{
         attach_window_to_desktop, detach_window_from_desktop, find_desktop_worker, probe_desktop,
         NativeWindowHandle,
     };
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, FillRect, GetDC, ReleaseDC};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -149,8 +150,9 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("GetModuleHandleW failed: {e}"))?;
 
         let wnd_class = WNDCLASSW {
-            lpfnWndProc: Some(def_window_proc),
+            lpfnWndProc: Some(smoke_wnd_proc),
             hInstance: module,
+            hbrBackground: COLOR_WINDOW,
             lpszClassName: PCWSTR(class_name.0.as_ptr()),
             ..Default::default()
         };
@@ -161,15 +163,19 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
             anyhow::bail!("RegisterClassW failed (error: {})", err.0);
         }
 
+        // Create as a popup window — no title bar or borders. WS_POPUP | WS_VISIBLE
+        // is the correct style for a wallpaper background window.
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             PCWSTR(class_name.0.as_ptr()),
             PCWSTR(window_title.0.as_ptr()),
-            WINDOW_STYLE::WS_OVERLAPPEDWINDOW,
+            WINDOW_STYLE::WS_POPUP | WINDOW_STYLE::WS_VISIBLE,
             0,
             0,
-            800,
-            600,
+            screen_w,
+            screen_h,
             None,
             None,
             module,
@@ -180,31 +186,61 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
         let native_handle = NativeWindowHandle(hwnd.0 as isize);
         println!("Created dummy renderer window: HWND {:#x}", hwnd.0 as usize);
 
-        // Step 4: Show the window briefly before attaching
-        ShowWindow(hwnd, SW_SHOW);
-        println!("Window shown (you should see it for a moment).");
-
-        // Step 5: Attach to desktop
+        // Step 4: Attach to desktop
         let attach_report = attach_window_to_desktop(native_handle)?;
         println!(
             "=== Attach Result ===\n{}",
             serde_json::to_string_pretty(&attach_report)?
         );
-        println!("Window is now behind desktop icons!");
 
-        // Step 6: Wait a few seconds so user can verify
-        println!("Waiting 5 seconds to verify...");
-        std::thread::sleep(Duration::from_secs(5));
+        // After SetParent, reposition the window to fill the WorkerW client area.
+        // SAFETY: GetClientRect and MoveWindow are standard Win32 APIs with valid parameters.
+        let mut rect = RECT::default();
+        let _ = GetClientRect(HWND(worker.0 as *mut _), &mut rect);
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let _ = MoveWindow(hwnd, 0, 0, width, height, true);
 
-        // Step 7: Detach
+        println!(
+            "Window is now behind desktop icons (sized {}x{}).",
+            width, height
+        );
+
+        // Step 5: Run a short message loop so the window can paint itself.
+        // Using PeekMessageW + sleep instead of GetMessageW so we can check the timeout.
+        let start = Instant::now();
+        let mut msg = MSG::default();
+        loop {
+            if start.elapsed() >= Duration::from_secs(5) {
+                break;
+            }
+            // SAFETY: PeekMessageW with null HWND checks the thread message queue.
+            // PM_REMOVE removes the message after retrieval.
+            let has_msg = PeekMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0, PM_REMOVE);
+            if has_msg.as_bool() {
+                if msg.message == WM_QUIT {
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else {
+                // No messages — sleep briefly to avoid busy-waiting
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // Step 6: Detach
         let detach_report = detach_window_from_desktop(native_handle)?;
         println!(
             "=== Detach Result ===\n{}",
             serde_json::to_string_pretty(&detach_report)?
         );
 
-        // Step 8: Destroy the window
-        let _ = DestroyWindow(hwnd);
+        // Step 7: Destroy the window
+        let destroy_result = DestroyWindow(hwnd);
+        if let Err(e) = destroy_result {
+            eprintln!("Warning: DestroyWindow failed: {e}");
+        }
         println!("Dummy window destroyed. Smoke test complete.");
     }
 
@@ -212,7 +248,7 @@ fn run_desktop_attach_smoke_impl() -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-unsafe extern "system" fn def_window_proc(
+unsafe extern "system" fn smoke_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -221,6 +257,18 @@ unsafe extern "system" fn def_window_proc(
     if msg == WM_DESTROY {
         PostQuitMessage(0);
         LRESULT(0)
+    } else if msg == WM_ERASEBKGND {
+        // SAFETY: wParam is the HDC passed by WM_ERASEBKGND. GetClientRect
+        // and FillRect are standard GDI APIs with valid parameters.
+        let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
+        let mut rect = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rect);
+        // Paint a dark blue background (BGR: 0x804040) so the window is
+        // clearly visible against the default desktop.
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00804040));
+        let _ = FillRect(hdc, &rect, brush);
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush);
+        LRESULT(1) // background was erased
     } else {
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
