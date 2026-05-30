@@ -21,6 +21,7 @@ wallflow-desktop = { path = "../wallflow-desktop" }
 wallflow-ipc = { path = "../wallflow-ipc" }
 wallflow-monitor = { path = "../wallflow-monitor" }
 wallflow-package = { path = "../wallflow-package" }
+wallflow-render = { path = "../wallflow-render" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

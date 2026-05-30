@@ -26,3 +26,18 @@ impl std::fmt::Display for FitMode {
         }
     }
 }
+
+impl std::str::FromStr for FitMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "cover" => Ok(FitMode::Cover),
+            "contain" => Ok(FitMode::Contain),
+            "stretch" => Ok(FitMode::Stretch),
+            "center" => Ok(FitMode::Center),
+            "tile" => Ok(FitMode::Tile),
+            _ => Err(()),
+        }
+    }
+}

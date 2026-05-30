@@ -98,6 +98,11 @@ enum Command {
         #[arg(long, default_value_t = 450)]
         height: u32,
     },
+
+    /// Create a test PNG, run the renderer in --headless-render-sim mode
+    /// with --source and --render-output, and verify the output PNG.
+    /// This is the cloud-testable static render output integration test.
+    RenderOutputSmoke,
 }
 
 fn main() -> Result<()> {
@@ -161,6 +166,9 @@ fn main() -> Result<()> {
             height,
         } => {
             run_render_sim_smoke(timeout_secs, width, height)?;
+        }
+        Command::RenderOutputSmoke => {
+            run_render_output_smoke()?;
         }
     }
 
@@ -1432,6 +1440,212 @@ fn run_render_sim_smoke(timeout_secs: u64, width: u32, height: u32) -> Result<()
         }
 
         // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Render output smoke test
+// ---------------------------------------------------------------------------
+
+fn run_render_output_smoke() -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+    use tokio::time;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Step 1: Create a temporary 2x2 PNG with distinct colors
+        let temp_dir = std::env::temp_dir().join("wallflow-render-output-smoke");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let mut img = image::RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255])); // red
+        img.put_pixel(1, 0, image::Rgba([0, 255, 0, 255])); // green
+        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255])); // blue
+        img.put_pixel(1, 1, image::Rgba([255, 255, 255, 255])); // white
+        let source_path = temp_dir.join("source.png");
+        img.save(&source_path)?;
+
+        let output_path = temp_dir.join("output.png");
+        let source_path_str = source_path.to_string_lossy().to_string();
+        let output_path_str = output_path.to_string_lossy().to_string();
+
+        println!("=== Render Output Smoke Test ===");
+        println!("Source image: {}", source_path.display());
+        println!("Output path: {}", output_path.display());
+
+        // Step 2: Run renderer in --headless-render-sim mode with --source and --render-output
+        let renderer_exe = find_renderer_exe()?;
+        println!("Renderer exe: {}", renderer_exe.display());
+
+        let mut child = Command::new(&renderer_exe)
+            .arg("--headless-render-sim")
+            .arg("--width")
+            .arg("800")
+            .arg("--height")
+            .arg("450")
+            .arg("--timeout-secs")
+            .arg("2")
+            .arg("--fit")
+            .arg("cover")
+            .arg("--source")
+            .arg(&source_path_str)
+            .arg("--render-output")
+            .arg(&output_path_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+
+        let pid = child.id();
+        println!("Renderer spawned (PID: {:?})", pid);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
+        let stdout_reader = tokio::io::BufReader::new(stdout);
+        let mut lines = stdout_reader.lines();
+
+        let deadline = time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+
+        let mut report_json = String::new();
+        let mut report_received = false;
+
+        tokio::select! {
+            _ = &mut deadline => {
+                eprintln!("Render output smoke timed out waiting for report");
+                let _ = child.kill().await;
+            }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        report_json = line;
+                        report_received = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Error reading renderer stdout: {e}");
+                    }
+                }
+            }
+        }
+
+        // Wait for the process to exit
+        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(e)) => {
+                eprintln!("Error waiting for renderer: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Renderer did not exit in time, killing");
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let total_elapsed = start.elapsed();
+        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
+
+        // Step 3: Verify the output PNG
+        let mut output_exists = false;
+        let mut output_decodes = false;
+        let mut output_width_ok = false;
+        let mut output_height_ok = false;
+        let mut checksum_present = false;
+
+        if output_path.exists() {
+            output_exists = true;
+            match image::open(&output_path) {
+                Ok(decoded) => {
+                    output_decodes = true;
+                    if decoded.width() == 800 {
+                        output_width_ok = true;
+                    }
+                    if decoded.height() == 450 {
+                        output_height_ok = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to decode output PNG: {e}");
+                }
+            }
+        } else {
+            eprintln!("Output PNG does not exist: {}", output_path.display());
+        }
+
+        // Check checksum in report
+        if report_received {
+            if let Ok(report_val) = serde_json::from_str::<serde_json::Value>(&report_json) {
+                if report_val
+                    .get("render_output")
+                    .and_then(|r| r.get("checksum"))
+                    .is_some()
+                {
+                    checksum_present = true;
+                }
+            }
+        }
+
+        let success = output_exists
+            && output_decodes
+            && output_width_ok
+            && output_height_ok
+            && checksum_present
+            && process_exit_code == Some(0);
+
+        let verification = serde_json::json!({
+            "output_exists": output_exists,
+            "output_decodes": output_decodes,
+            "output_width_ok": output_width_ok,
+            "output_height_ok": output_height_ok,
+            "checksum_present": checksum_present,
+            "process_exit_code": process_exit_code,
+        });
+
+        let report = serde_json::json!({
+            "test": "render-output-smoke",
+            "success": success,
+            "total_elapsed_ms": total_elapsed.as_millis() as u64,
+            "renderer_pid": pid,
+            "output_path": output_path_str,
+            "verification": verification,
+        });
+
+        println!("\n=== Render Output Smoke Report ===");
+        println!("{}", serde_json::to_string_pretty(&report)?);
+
+        if success {
+            println!("\nRender output smoke test PASSED.");
+        } else {
+            eprintln!("\nRender output smoke test FAILED.");
+            if !output_exists {
+                eprintln!("  Missing: output PNG file");
+            }
+            if !output_decodes {
+                eprintln!("  Failed: output PNG does not decode");
+            }
+            if !output_width_ok {
+                eprintln!("  Failed: output width is not 800");
+            }
+            if !output_height_ok {
+                eprintln!("  Failed: output height is not 450");
+            }
+            if !checksum_present {
+                eprintln!("  Missing: checksum in report");
+            }
+        }
+
+        // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         Ok(())

@@ -84,6 +84,15 @@ struct Args {
     /// Window/viewport height in pixels (used with --windowed-static and --headless-render-sim).
     #[arg(long, default_value_t = 450)]
     height: u32,
+
+    /// When used with --headless-render-sim and --source, render the image to a PNG output file.
+    /// If not specified, only the layout simulation is performed (no pixel output).
+    #[arg(long)]
+    render_output: Option<PathBuf>,
+
+    /// Fit mode for static image rendering (used with --headless-render-sim --source --render-output).
+    #[arg(long, default_value = "cover")]
+    fit: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,12 +136,21 @@ fn main() -> Result<()> {
     }
 
     if args.headless_render_sim {
+        let fit = match args.fit.parse::<wallflow_common::FitMode>() {
+            Ok(f) => f,
+            Err(()) => {
+                eprintln!("invalid fit mode: {}", args.fit);
+                return Err(anyhow::anyhow!("invalid fit mode: {}", args.fit));
+            }
+        };
         return run_headless_render_sim(
             renderer_id,
             args.width,
             args.height,
             args.timeout_secs,
             args.source.as_deref(),
+            args.render_output.as_deref(),
+            fit,
         );
     }
 
@@ -211,6 +229,8 @@ fn run_headless_render_sim(
     height: u32,
     timeout_secs: u64,
     source: Option<&std::path::Path>,
+    render_output_path: Option<&std::path::Path>,
+    fit: wallflow_common::FitMode,
 ) -> Result<()> {
     let start = Instant::now();
     let timeout = if timeout_secs > 0 {
@@ -247,38 +267,99 @@ fn run_headless_render_sim(
     // Try to apply a static wallpaper if a source image path was provided
     let mut wallpaper_applied = false;
     let mut layout_report: Option<RenderSimLayoutReport> = None;
+    let mut render_output_report: Option<serde_json::Value> = None;
 
     if let Some(image_path) = source {
-        match apply_static_wallpaper_for_sim(image_path, &viewport) {
-            Ok((metadata, layout)) => {
-                wallpaper_applied = true;
-                layout_report = Some(RenderSimLayoutReport {
-                    image_width: metadata.width,
-                    image_height: metadata.height,
-                    viewport_width: viewport.width,
-                    viewport_height: viewport.height,
-                    destination_x: layout.destination_rect.x,
-                    destination_y: layout.destination_rect.y,
-                    destination_width: layout.destination_rect.width,
-                    destination_height: layout.destination_rect.height,
-                });
-                info!(
-                    ?renderer_id,
-                    image_path = %image_path.display(),
-                    image_width = metadata.width,
-                    image_height = metadata.height,
-                    "wallpaper applied in render sim"
-                );
+        // If render_output_path is specified, do actual rendering
+        if let Some(output_path) = render_output_path {
+            match render_static_image_for_sim(image_path, &viewport, fit, output_path) {
+                Ok((metadata, layout, output)) => {
+                    wallpaper_applied = true;
+                    layout_report = Some(RenderSimLayoutReport {
+                        image_width: metadata.width,
+                        image_height: metadata.height,
+                        viewport_width: viewport.width,
+                        viewport_height: viewport.height,
+                        destination_x: layout.destination_rect.x,
+                        destination_y: layout.destination_rect.y,
+                        destination_width: layout.destination_rect.width,
+                        destination_height: layout.destination_rect.height,
+                    });
+                    let meta = output.metadata();
+                    render_output_report = Some(serde_json::json!({
+                        "output_path": output_path.to_string_lossy(),
+                        "output_width": meta.width,
+                        "output_height": meta.height,
+                        "checksum": meta.checksum,
+                        "pixel_format": meta.pixel_format,
+                        "file_size_bytes": meta.file_size_bytes,
+                        "layout": {
+                            "image_width": metadata.width,
+                            "image_height": metadata.height,
+                            "viewport_width": viewport.width,
+                            "viewport_height": viewport.height,
+                            "destination_x": layout.destination_rect.x,
+                            "destination_y": layout.destination_rect.y,
+                            "destination_width": layout.destination_rect.width,
+                            "destination_height": layout.destination_rect.height,
+                            "fit": format!("{:?}", fit).to_lowercase(),
+                        },
+                        "source_image": {
+                            "width": metadata.width,
+                            "height": metadata.height,
+                            "color_type": metadata.color_type,
+                            "detected_format": metadata.detected_format,
+                            "file_size_bytes": metadata.file_size_bytes,
+                        },
+                    }));
+                    info!(
+                        ?renderer_id,
+                        image_path = %image_path.display(),
+                        output_path = %output_path.display(),
+                        output_width = meta.width,
+                        output_height = meta.height,
+                        "static image rendered to PNG output"
+                    );
+                }
+                Err(e) => {
+                    warn!(?renderer_id, error = %e, "failed to render static image");
+                }
             }
-            Err(e) => {
-                warn!(?renderer_id, error = %e, "failed to apply wallpaper in render sim");
+        } else {
+            // Legacy behavior: layout-only simulation
+            match apply_static_wallpaper_for_sim(image_path, &viewport, fit) {
+                Ok((metadata, layout)) => {
+                    wallpaper_applied = true;
+                    layout_report = Some(RenderSimLayoutReport {
+                        image_width: metadata.width,
+                        image_height: metadata.height,
+                        viewport_width: viewport.width,
+                        viewport_height: viewport.height,
+                        destination_x: layout.destination_rect.x,
+                        destination_y: layout.destination_rect.y,
+                        destination_width: layout.destination_rect.width,
+                        destination_height: layout.destination_rect.height,
+                    });
+                    info!(
+                        ?renderer_id,
+                        image_path = %image_path.display(),
+                        image_width = metadata.width,
+                        image_height = metadata.height,
+                        "wallpaper applied in render sim (layout only)"
+                    );
+                }
+                Err(e) => {
+                    warn!(?renderer_id, error = %e, "failed to apply wallpaper in render sim");
+                }
             }
         }
     }
 
-    // Simulate the running period
-    while start.elapsed() < timeout {
-        std::thread::sleep(Duration::from_millis(100));
+    // Simulate the running period (skip if render output was produced — no need to wait)
+    if render_output_report.is_none() {
+        while start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     state_transitions.push(RendererRuntimeState::ShuttingDown);
@@ -286,18 +367,34 @@ fn run_headless_render_sim(
 
     let total_sim_time_ms = start.elapsed().as_millis() as u64;
 
-    let report = RenderSimReport {
-        mode: RendererRuntimeMode::HeadlessRenderSim,
-        viewport,
-        state_transitions,
-        wallpaper_applied,
-        layout_report,
-        total_sim_time_ms,
-        exit_code: 0,
-    };
-
-    let json = serde_json::to_string(&report)?;
-    println!("{json}");
+    // If we have a render output report, output that instead of the sim report
+    if let Some(ref render_report) = render_output_report {
+        let final_report = serde_json::json!({
+            "mode": "headless-render-sim",
+            "viewport": {
+                "width": viewport.width,
+                "height": viewport.height,
+            },
+            "wallpaper_applied": wallpaper_applied,
+            "total_sim_time_ms": total_sim_time_ms,
+            "exit_code": 0,
+            "render_output": render_report,
+        });
+        let json = serde_json::to_string(&final_report)?;
+        println!("{json}");
+    } else {
+        let report = RenderSimReport {
+            mode: RendererRuntimeMode::HeadlessRenderSim,
+            viewport,
+            state_transitions,
+            wallpaper_applied,
+            layout_report,
+            total_sim_time_ms,
+            exit_code: 0,
+        };
+        let json = serde_json::to_string(&report)?;
+        println!("{json}");
+    }
 
     info!(
         ?renderer_id,
@@ -310,6 +407,7 @@ fn run_headless_render_sim(
 fn apply_static_wallpaper_for_sim(
     image_path: &std::path::Path,
     viewport: &RendererViewport,
+    fit: wallflow_common::FitMode,
 ) -> Result<(
     wallflow_package::ImageMetadata,
     wallflow_package::StaticImageLayout,
@@ -325,14 +423,56 @@ fn apply_static_wallpaper_for_sim(
         height: viewport.height,
     };
 
-    let layout = wallflow_package::calculate_static_image_layout(
-        image_size,
-        vp,
-        wallflow_common::FitMode::Cover,
-        "#000000".into(),
-    )?;
+    let layout =
+        wallflow_package::calculate_static_image_layout(image_size, vp, fit, "#000000".into())?;
 
     Ok((metadata, layout))
+}
+
+/// Render a static image for the render simulation with actual PNG output.
+fn render_static_image_for_sim(
+    image_path: &std::path::Path,
+    viewport: &RendererViewport,
+    fit: wallflow_common::FitMode,
+    output_path: &std::path::Path,
+) -> Result<(
+    wallflow_package::ImageMetadata,
+    wallflow_package::StaticImageLayout,
+    wallflow_render::RenderOutput,
+)> {
+    let metadata = wallflow_package::load_image_metadata(image_path)?;
+
+    let image_size = wallflow_package::ImageSize {
+        width: metadata.width,
+        height: metadata.height,
+    };
+    let vp = wallflow_package::Viewport {
+        width: viewport.width,
+        height: viewport.height,
+    };
+
+    let layout =
+        wallflow_package::calculate_static_image_layout(image_size, vp, fit, "#000000".into())?;
+
+    let render_input = wallflow_render::StaticRenderInput {
+        image_path: image_path.to_path_buf(),
+        viewport: vp,
+        fit,
+        background: "#000000".into(),
+        opacity: None,
+    };
+
+    let mut output = wallflow_render::render_static_image_cpu(render_input)?;
+    output.save_png(output_path)?;
+
+    info!(
+        output_path = %output_path.display(),
+        output_width = output.width,
+        output_height = output.height,
+        "render output saved as PNG"
+    );
+
+    Ok((metadata, layout, output))
 }
 
 // ---------------------------------------------------------------------------

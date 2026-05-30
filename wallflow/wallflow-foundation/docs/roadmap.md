@@ -158,7 +158,42 @@
 - DPI scale factor changes (WM_DPICHANGED)
 - Explorer restart tolerance with winit event loop
 
-## MVP-2 static wallpaper
+## MVP-2.2 Cloud-safe static render output ✅
+
+*Completed in stage 008.*
+
+- `wallflow-render` crate: CPU reference renderer producing actual RGBA pixel data.
+- `RenderBackend` enum: `CpuReference` (and `WgpuExperimental` placeholder).
+- `RenderOutput` type: width, height, pixels_rgba, optional output_path.
+- `RenderOutputMetadata` type: dimensions, pixel format, file size, SHA-256 checksum.
+- `StaticRenderInput` type: image_path, viewport, fit, background, opacity.
+- `StaticRenderError` error type: invalid image path, decode, background, viewport, layout, I/O.
+- `render_static_image_cpu()` function: full CPU render pipeline (decode → layout → composite → output).
+- `RgbaColor` type with `parse_hex()`: safe `#RRGGBB` and `#RRGGBBAA` parsing.
+- SHA-256 checksum for render output (via `sha2` crate) for snapshot-like tests.
+- All five fit modes rendered with correct pixel output:
+  - **Cover**: scale to fill viewport, center, clip overflow.
+  - **Contain**: scale to fit within viewport, center, background bars.
+  - **Stretch**: distort to exact viewport, no background.
+  - **Center**: no scaling, centered, background visible.
+  - **Tile**: repeat at native size, fill viewport.
+- Nearest-neighbor scaling (temporary; bilinear/Lanczos later).
+- `--headless-render-sim` enhanced with `--source`, `--render-output`, and `--fit` flags.
+- `render-output-smoke` CLI command: creates test PNG, runs full render, verifies output.
+- 164 tests passing (25 in wallflow-render including pixel-level tests).
+- `render-output-smoke` added to CI on Ubuntu.
+- Render output architecture documented in `docs/architecture/011-static-render-output.md`.
+
+### REQUIRES_REAL_WINDOWS_VALIDATION
+
+- `--windowed-static` on Windows (winit creates a Win32 window; must verify on real desktop)
+- Desktop attach with winit window (`SetParent()` on winit-managed HWND is untested)
+- Viewport resize from real monitor events (not just synthetic resize)
+- Layout with actual monitor dimensions
+- Visual correctness of each fit mode on a real display
+- DPI scale factor changes (WM_DPICHANGED)
+- Explorer restart tolerance with winit event loop
+- wgpu GPU rendering matching CPU reference output
 
 - Add wgpu rendering pipeline to the windowed static renderer.
 - Per-monitor placement.

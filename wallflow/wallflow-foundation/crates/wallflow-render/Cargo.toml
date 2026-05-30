@@ -1,0 +1,15 @@
+[package]
+name = "wallflow-render"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+wallflow-common = { path = "../wallflow-common" }
+wallflow-package = { path = "../wallflow-package" }
