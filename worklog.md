@@ -31,3 +31,42 @@ Stage Summary:
 - 1 Cargo.toml changed: wallflow-monitor/Cargo.toml (added Win32_UI_WindowsAndMessaging feature)
 - All 4 commands now pass: cargo fmt --all, cargo check --workspace, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace
 - Windows-specific code cannot be fully verified on Linux; needs manual testing on Windows
+
+---
+Task ID: 2
+Agent: main
+Task: WallFlow Windows Desktop Attach Hardening (002)
+
+Work Log:
+- Studied 002 prompt and all current crate sources
+- Rewrote wallflow-desktop with full public API:
+  - probe_desktop() -> DesktopProbeReport (diagnostic, non-mutating)
+  - find_desktop_worker() -> Result<DesktopWorkerHandle, DesktopError>
+  - attach_window_to_desktop(NativeWindowHandle) -> Result<DesktopAttachReport, DesktopError>
+  - detach_window_from_desktop(NativeWindowHandle) -> Result<DesktopDetachReport, DesktopError>
+- Added DesktopProbeReport, DesktopAttachReport, DesktopDetachReport, DesktopDiscoveryData structs
+- All structs are Serialize/Deserialize for JSON output
+- Added structured tracing logs (info/debug/warn) throughout
+- Added GetLastError-based diagnostics in error paths
+- Added IsWindow validation before SetParent
+- Added SAFETY comments on all unsafe blocks and functions
+- Added 11 unit tests in wallflow-desktop:
+  - handle validity, serialization roundtrips, error messages, invalid handle rejection, non-Windows stubs
+- Added CLI commands: desktop-probe, desktop-attach-smoke
+- Added wallflow-renderer --desktop-attach mode with --timeout-secs
+- Created dummy Win32 window (RegisterClassW + CreateWindowExW) for smoke test
+- Added windows crate dependencies to wallflow-cli and wallflow-renderer (Win32_Foundation, Win32_System_LibraryLoader, Win32_UI_WindowsAndMessaging)
+- Added tracing dependency to wallflow-desktop
+- Added serde dependency to wallflow-desktop
+- Created docs/architecture/004-windows-desktop-attach.md with full documentation
+- All 4 cargo commands pass: fmt, check, clippy -D warnings, test (22 tests total)
+- Git committed as "002 windows desktop attach hardening"
+
+Stage Summary:
+- 7 files changed, 1129 insertions, 60 deletions
+- wallflow-desktop: complete rewrite with diagnostics, attach, detach, structured logging
+- wallflow-cli: added desktop-probe and desktop-attach-smoke commands
+- wallflow-renderer: added --desktop-attach mode for standalone renderer
+- docs/architecture/004-windows-desktop-attach.md: comprehensive documentation
+- 22 tests passing (11 desktop, 2 config, 3 core, 1 ipc, 2 media, 3 monitor)
+- desktop-probe and desktop-attach-smoke cannot be tested on Linux; need real Windows

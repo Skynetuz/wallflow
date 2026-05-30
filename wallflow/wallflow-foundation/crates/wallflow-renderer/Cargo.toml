@@ -14,3 +14,10 @@ uuid.workspace = true
 wallflow-common = { path = "../wallflow-common" }
 wallflow-desktop = { path = "../wallflow-desktop" }
 wallflow-media = { path = "../wallflow-media" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging"
+] }
