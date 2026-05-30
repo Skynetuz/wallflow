@@ -87,10 +87,47 @@ Use this mode when:
 - Preparing for the future wgpu rendering pipeline (the window is already open)
 - Manual visual verification of wallpaper display
 
-Note: The current `--windowed-static` mode does not yet render pixels to the
-window surface. It opens the window, tracks viewport state, and recalculates
-layout on resize, but the actual GPU blit will be added when wgpu is
-integrated in a future stage.
+Note: The `--windowed-static` mode does not render pixels to the window
+surface. It opens the window, tracks viewport state, and recalculates
+layout on resize, but no pixel blit occurs. For actual pixel presentation,
+use `--windowed-softbuffer` (Stage 010), which uses the CPU reference renderer
+and softbuffer to blit RGBA frames to the window surface.
+
+### `--windowed-softbuffer` (WindowedSoftbuffer)
+
+*Added in Stage 010.*
+
+The windowed softbuffer mode opens a real winit window and presents CPU-rendered
+frames via softbuffer. This is the first mode that actually renders visible pixels
+to a window surface. It uses the CPU reference renderer to produce RGBA frames,
+converts them to the softbuffer `0x00RRGGBB` pixel format, and blits them to the
+window. The mode supports resize handling (viewport update + re-render + re-present),
+timeout-based auto-exit, and clean close on window close request.
+
+Requires a display server (Wayland/X11 on Linux, Desktop on Windows). Not suitable
+for CI/cloud environments. When no display server is available, the mode returns a
+clear error message without panicking.
+
+Use this mode when:
+- Testing the first real visual presentation of wallpaper images
+- Validating the softbuffer pixel conversion pipeline on a real surface
+- Manual visual verification of fit modes and resize behavior
+- Diagnosing display server availability (non-zero exit = no display)
+
+### `--presenter-sim` (PresenterSim)
+
+*Added in Stage 010.*
+
+The presenter simulation mode exercises the same CPU rendering and RGBA→softbuffer
+conversion pipeline as `--windowed-softbuffer`, but without creating a window or
+surface. It outputs a structured `PresenterReport` as JSON to stdout, making it
+fully cloud-safe and suitable for CI.
+
+Use this mode when:
+- Running in CI/cloud environments without a display server
+- Validating the full render + conversion pipeline end-to-end
+- Running `presenter-sim-smoke` integration test
+- Debugging pixel conversion without visual output
 
 ## Core Types
 
@@ -240,6 +277,10 @@ environments without any display server:
 | IPC stdio mode | `--ipc-stdio` | `cargo run -p wallflow-cli -- ipc-supervisor-smoke` |
 | Apply static smoke | `--ipc-stdio` | `cargo run -p wallflow-cli -- apply-static-smoke` |
 | Layout calculation | All | `cargo test -p wallflow-package` |
+| Presenter simulation | `--presenter-sim` | `cargo run -p wallflow-cli -- presenter-sim-smoke` |
+| RGBA→softbuffer pixel conversion | All | `cargo test -p wallflow-render` |
+| Presenter type serialization | All | `cargo test -p wallflow-render` |
+| Presenter config validation | All | `cargo test -p wallflow-render` |
 
 The `render-sim-smoke` CLI command is the primary integration test for the
 renderer runtime. It creates a test wallpaper package, spawns the renderer in
@@ -258,12 +299,14 @@ The following items cannot be validated without a real Windows desktop session:
 | Item | Reason |
 |------|--------|
 | `--windowed-static` on Windows | Requires a Windows desktop session; winit creates a Win32 window |
+| `--windowed-softbuffer` on Windows | Requires display server; visual correctness of frame content, resize |
 | Desktop attach with winit window | `SetParent()` on a winit-managed HWND is untested |
 | Viewport resize from real monitor events | Requires actual display hardware or VM display |
 | Layout with actual monitor dimensions | Currently uses synthetic 1920×1080; real monitors may differ |
 | Visual correctness of fit modes | Cover cropping, contain letterboxing, tile repeat — must be seen |
 | DPI scale factor changes (WM_DPICHANGED) | Requires Windows HiDPI environment |
 | Explorer restart tolerance | Must kill and restart Explorer to test |
+| softbuffer frame content vs CPU reference | Must compare visual output on real display |
 
 All code paths that depend on a real Windows desktop are marked with the
 `REQUIRES_REAL_WINDOWS_VALIDATION` comment convention.

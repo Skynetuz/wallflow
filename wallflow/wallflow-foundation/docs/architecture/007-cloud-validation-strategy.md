@@ -48,6 +48,10 @@ full IPC command/event lifecycle or the full renderer lifecycle via piped stdio.
 - `wgpu-probe` CLI command (GPU capability diagnostic, always exit 0)
 - `wgpu-smoke` CLI command (offscreen render smoke, skips gracefully without GPU)
 - wgpu capability probe and clear-only offscreen render (no GPU required)
+- `presenter-sim-smoke` CLI command (CPU render + RGBA→softbuffer conversion + JSON report verification)
+- `--presenter-sim` renderer mode (cloud-safe presenter simulation without display server)
+- RGBA→softbuffer pixel conversion (all colors, alpha compositing, error handling, size mismatch)
+- Presenter type serialization and configuration validation
 
 ### Tier 3: Windows Compile-Check (CI)
 
@@ -95,7 +99,7 @@ The GitHub Actions Windows runner provides a much simpler solution.
 │  1. cargo fmt --all -- --check            │
 │  2. cargo check --workspace               │
 │  3. cargo clippy (strict)                 │
-│  4. cargo test --workspace (171 tests)     │
+│  4. cargo test --workspace (194 tests)     │
 └──────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
@@ -107,7 +111,9 @@ The GitHub Actions Windows runner provides a much simpler solution.
 │  4. apply-static-smoke (wallpaper apply)  │
 │  5. render-sim-smoke (full lifecycle)     │
 │  6. render-output-smoke (pixel render)    │
-│  7. legacy headless heartbeat smoke       │
+│  7. wgpu-probe (GPU diagnostic)           │
+│  8. presenter-sim-smoke (presenter)       │
+│  9. legacy headless heartbeat smoke       │
 └──────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
@@ -247,6 +253,38 @@ CI runner after the existing IPC smoke tests:
 These tests run in seconds and require no special hardware, display server,
 or GPU — making them ideal for every pull request and merge to main.
 
+## Presenter Sim Smoke Test (presenter-sim-smoke)
+
+*Added in Stage 010.*
+
+The `presenter-sim-smoke` CLI command validates the full rendering + presentation
+conversion pipeline in cloud environments. It goes beyond `render-output-smoke`
+by also exercising the RGBA→softbuffer pixel format conversion:
+
+1. Creates a 2×2 test PNG fixture with distinct pixel colors.
+2. Spawns the renderer in `--presenter-sim` mode with the test image.
+3. Captures the JSON `PresenterReport` from stdout.
+4. Verifies: `rendered == true`, `presented_simulated == true`, checksum present,
+   viewport correct, no error.
+5. Outputs a structured summary and JSON report.
+
+This test validates the complete data flow from image decode through CPU rendering,
+RGBA→softbuffer format conversion, and structured reporting — all without a display
+server or GPU. The `--windowed-softbuffer` mode is NOT tested in CI because it
+requires a display server; its graceful error handling when no display server is
+available has been verified manually.
+
+### What It Validates vs. What It Does Not
+
+| Validated | Not validated |
+|-----------|---------------|
+| CPU render produces RGBA output | Actual pixel presentation to window surface |
+| RGBA→softbuffer u32 conversion correctness | Visual appearance on a real display |
+| PresenterReport structure and serialization | Resize/re-render behavior |
+| Presenter config validation | DPI scale factor handling |
+| Alpha compositing against black background | Frame timing or refresh rate |
+| Error handling for invalid configs | Desktop attachment |
+
 ## Render Output Smoke Test (render-output-smoke)
 
 The `render-output-smoke` CLI command validates the full CPU render pipeline
@@ -282,6 +320,6 @@ This marker appears in:
 
 ## Next Steps
 
-- **Stage 010**: Add wgpu rendering pipeline to the windowed static renderer
-- **Stage 011**: Connect desktop attach to winit window on Windows
+- **Stage 011**: Connect desktop attach to winit window on Windows (requires REQUIRES_REAL_WINDOWS_VALIDATION)
+- **Stage 011+**: wgpu textured rendering pipeline (GPU image compositing, replacing softbuffer for production)
 - **Stage 012**: Real Windows validation with manual testing on Win10/11

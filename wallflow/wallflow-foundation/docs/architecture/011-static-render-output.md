@@ -240,10 +240,28 @@ match backend {
 }
 ```
 
-The current wgpu path is clear-only (it fills the viewport with the background color but does not yet composite the image texture). Full GPU rendering with image compositing will be added in Stage 010. The CPU reference remains available for testing and as a fallback, and continues to produce the authoritative pixel output.
+The current wgpu path is clear-only (it fills the viewport with the background color but does not yet composite the image texture). Full GPU rendering with image compositing will be added in a future stage. The CPU reference remains available for testing and as a fallback, and continues to produce the authoritative pixel output.
+
+## Integration with Softbuffer Presenter (Stage 010)
+
+Stage 010 introduces a presenter layer that consumes the `RenderOutput` from the CPU reference renderer and presents it to a window surface via softbuffer. The data flow is:
+
+```
+StaticRenderInput → render_static_image_cpu() → RenderOutput → rgba_to_softbuffer_u32() → softbuffer surface
+```
+
+The `rgba_to_softbuffer_u32()` function converts the RGBA8 pixel buffer from `RenderOutput.pixels_rgba` into the softbuffer `0x00RRGGBB` format, performing alpha compositing against black for semi-transparent pixels. The `RenderOutput.checksum_sha256()` is included in the `PresenterReport` for cloud-safe validation.
+
+Two renderer modes use this pipeline:
+
+- **`--windowed-softbuffer`**: Creates a real winit window, renders via CPU, converts to softbuffer format, and blits to the surface. Requires a display server.
+- **`--presenter-sim`**: Performs CPU render + conversion without a window, outputs a structured JSON report. Cloud-safe.
+
+The `presenter-sim-smoke` CLI command validates this pipeline end-to-end in CI.
 
 ## What Remains REQUIRES_REAL_WINDOWS_VALIDATION
 
+- `--windowed-softbuffer` visual correctness on Windows (frame content matches CPU reference)
 - Desktop attach behind desktop icons (WorkerW/Progman)
 - Real Explorer window integration
 - Multi-monitor layout

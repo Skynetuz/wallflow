@@ -262,6 +262,15 @@
 - Real GPU adapter capabilities on Windows hardware
 - wgpu GPU rendering matching CPU reference output
 
+## MVP-2.5 Windows desktop attach integration (planned: Stage 011)
+
+- Connect `wallflow-desktop` desktop attach to the winit window from `--windowed-softbuffer`.
+- Extract HWND from winit window via `raw_window_handle()` and call `attach_window_to_desktop()`.
+- Handle Explorer restart by monitoring WorkerW handle validity in the event loop.
+- Detach on shutdown via `detach_window_from_desktop()`.
+- Requires REQUIRES_REAL_WINDOWS_VALIDATION — cannot be tested in CI.
+- Alternative: wgpu textured rendering pipeline (GPU image compositing, replacing softbuffer for production).
+
 ## MVP-3 video wallpaper
 
 - Implement Media Foundation backend.
