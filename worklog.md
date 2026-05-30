@@ -193,3 +193,29 @@ Stage Summary:
 - 67 tests passing total (up from 50)
 - Both --ipc-stdio and --headless-heartbeat validated on Linux
 - REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor
+
+---
+Task ID: 5
+Agent: main
+Task: WallFlow Cloud-Safe Wallpaper Package and Apply Contract (005)
+
+Work Log:
+- Created wallflow-package crate (18 tests)
+- Extended IPC protocol v3 → v4 with ApplyWallpaperRequest, StaticImagePayload, WallpaperPayload, WallpaperApplyError, FitMode
+- Added WallpaperApplyFailed event, updated WallpaperApplied to include wallpaper_id
+- Enhanced renderer with AppliedWallpaperState and handle_apply_wallpaper
+- Enhanced supervisor with apply_wallpaper, mark_wallpaper_applied, mark_wallpaper_apply_failed
+- Added apply-static-smoke CLI command
+- Updated documentation: 008-wallpaper-package-format.md, 002-ipc-contract.md, 003-renderer-lifecycle.md, roadmap.md
+- Updated CI: apply-static-smoke step in ipc-smoke job
+- 97 tests passing total (up from 67)
+
+Stage Summary:
+- New crate: wallflow-package (18 tests)
+- wallflow-ipc: 32 tests (+8 new apply/error/fit tests)
+- wallflow-core: 29 tests (+4 apply state transition tests)
+- IPC protocol version 4
+- Package validation: schema version, required fields, kind support, path traversal, asset existence
+- apply-static-smoke PASSED
+- ipc-supervisor-smoke PASSED
+- REQUIRES_REAL_WINDOWS_VALIDATION: desktop-probe, desktop-attach-smoke, Explorer restart, multi-monitor

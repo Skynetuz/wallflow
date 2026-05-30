@@ -70,6 +70,29 @@
 - GitHub Actions CI updated with IPC smoke test.
 - IPC contract documented in `docs/architecture/002-ipc-contract.md`.
 
+## MVP-1.9 Wallpaper package and apply contract ✅
+
+*Completed in stage 005.*
+
+- Wallpaper package format v0 with manifest.json.
+- `wallflow-package` crate: load, parse, validate wallpaper packages.
+- Static image wallpaper model: image path, fit mode, background color, opacity.
+- Package validation: schema version, required fields, kind support, path traversal prevention, asset existence.
+- IPC protocol v4: `ApplyWallpaperRequest`, `StaticImagePayload`, `WallpaperPayload`, `WallpaperApplyError`, `FitMode`.
+- Renderer `AppliedWallpaperState`: validates and records applied wallpaper via IPC.
+- `apply-static-smoke` CLI command: full package → validate → apply → confirm lifecycle.
+- 97 unit tests passing on Linux.
+- IPC supervisor smoke and apply-static-smoke both passing.
+- Package validation documented in `docs/architecture/008-wallpaper-package-format.md`.
+
+### REQUIRES_REAL_WINDOWS_VALIDATION
+
+- Desktop probe (Progman/WorkerW/SHELLDLL_DefView discovery).
+- Desktop attach smoke test (embedding window behind icons).
+- Explorer restart tolerance.
+- Multi-monitor desktop attach.
+- DPI change handling.
+
 ## MVP-2 static wallpaper
 
 - Add winit/wgpu static renderer.

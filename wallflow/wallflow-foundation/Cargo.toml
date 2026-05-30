@@ -9,7 +9,8 @@ members = [
   "crates/wallflow-media",
   "crates/wallflow-core",
   "crates/wallflow-renderer",
-  "crates/wallflow-cli"
+  "crates/wallflow-cli",
+  "crates/wallflow-package"
 ]
 
 [workspace.package]

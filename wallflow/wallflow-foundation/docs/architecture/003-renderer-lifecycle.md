@@ -179,7 +179,37 @@ Windows desktop or GUI.
 | Error | Core error |
 | SafeModeChanged | Safe mode toggled |
 
-Protocol version is now **2** (bumped from 1 due to new command/event types).
+Protocol version is now **4** (bumped from 3 due to ApplyWallpaperRequest, WallpaperApplyFailed).
+
+## Applied Wallpaper State
+
+When the renderer receives an `ApplyWallpaper` command, it:
+
+1. Validates the wallpaper kind is supported (currently only `StaticImage`).
+2. Validates the image path is not empty.
+3. Records the `AppliedWallpaperState` (wallpaper_id, payload, monitor, timestamp).
+4. Sends `WallpaperApplied { renderer_id, wallpaper_id, monitor_id }` on success.
+5. Sends `WallpaperApplyFailed { renderer_id, wallpaper_id, error }` on failure.
+
+The renderer does **not** yet render the image to the screen. Real GPU rendering
+will be implemented in stage 006 (winit/wgpu renderer). The current behavior
+validates the full IPC apply lifecycle without requiring a GPU.
+
+## Apply Static Smoke Test
+
+```bash
+cargo run -p wallflow-cli -- apply-static-smoke --timeout-secs 10 --heartbeat-interval-ms 500
+```
+
+This command:
+
+1. Creates a temporary test wallpaper package (manifest.json + dummy image).
+2. Validates the package via `wallflow-package`.
+3. Spawns the renderer in `--ipc-stdio` mode.
+4. Sends `ApplyWallpaper` with the static image payload.
+5. Waits for `WallpaperApplied` event.
+6. Sends `Shutdown` and waits for `Exited`.
+7. Prints a structured JSON report.
 
 ## Headless Heartbeat Mode
 
@@ -232,11 +262,12 @@ This command:
 | Area | Tests | Count |
 |------|-------|-------|
 | Watchdog decisions | wallflow-core/watchdog | 10 |
-| Supervisor lifecycle | wallflow-core/supervisor | 15 |
-| IPC protocol roundtrips | wallflow-ipc/protocol | 6 |
-| IPC frame roundtrips | wallflow-ipc/frame | 1 |
+| Supervisor lifecycle | wallflow-core/supervisor | 19 |
+| IPC protocol roundtrips | wallflow-ipc/protocol | 14 |
+| IPC frame roundtrips | wallflow-ipc/frame | 10 |
+| Package validation | wallflow-package | 18 |
 | Desktop attach (stubs) | wallflow-desktop | 11 |
 | Monitor diff | wallflow-monitor/diff | 3 |
 | Config | wallflow-config | 2 |
 | Media backend | wallflow-media | 2 |
-| **Total** | | **50** |
+| **Total** | | **97** |

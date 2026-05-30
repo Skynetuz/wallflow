@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperAssignment};
+use wallflow_common::{MonitorId, MonitorInfo, RendererId, WallpaperId};
 
 /// IPC protocol version. Increment on breaking changes.
 /// Version 2 added the new RendererCommand/RendererEvent/CoreCommand/CoreEvent types.
 /// Version 3 adds the IpcMessage tagged union for unambiguous frame decoding.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Version 4 adds ApplyWallpaperRequest, StaticImagePayload, WallpaperApplyError.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
@@ -137,6 +138,99 @@ impl<T> Envelope<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Wallpaper apply types (IPC payloads)
+// ---------------------------------------------------------------------------
+
+/// How a static image should be fitted to the screen.
+/// Mirrors `wallflow_package::FitMode` but defined independently in the IPC
+/// layer so that the renderer does not need to depend on wallflow-package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FitMode {
+    #[default]
+    Cover,
+    Contain,
+    Stretch,
+    Center,
+    Tile,
+}
+
+impl std::fmt::Display for FitMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FitMode::Cover => write!(f, "cover"),
+            FitMode::Contain => write!(f, "contain"),
+            FitMode::Stretch => write!(f, "stretch"),
+            FitMode::Center => write!(f, "center"),
+            FitMode::Tile => write!(f, "tile"),
+        }
+    }
+}
+
+/// Payload for a static image wallpaper apply request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticImagePayload {
+    /// Absolute or package-relative path to the image file.
+    pub image_path: String,
+    /// How the image should be fitted to the screen.
+    #[serde(default)]
+    pub fit: FitMode,
+    /// Background color as a CSS color string (e.g., "#000000").
+    #[serde(default = "default_background_color")]
+    pub background: String,
+    /// Optional opacity (0-255). None means fully opaque.
+    #[serde(default)]
+    pub opacity: Option<u8>,
+}
+
+fn default_background_color() -> String {
+    "#000000".into()
+}
+
+/// The kind of wallpaper payload being applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum WallpaperPayload {
+    /// Static image wallpaper.
+    #[serde(rename = "static_image")]
+    StaticImage(StaticImagePayload),
+}
+
+/// A request to apply a wallpaper to a renderer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplyWallpaperRequest {
+    /// The wallpaper ID being applied.
+    pub wallpaper_id: WallpaperId,
+    /// The wallpaper payload (kind + data).
+    pub payload: WallpaperPayload,
+    /// The target monitor for this wallpaper.
+    pub target_monitor: MonitorId,
+}
+
+/// Options for applying a wallpaper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WallpaperApplyOptions {
+    /// Whether to transition immediately or wait for the next frame.
+    #[serde(default)]
+    pub immediate: bool,
+}
+
+/// Error that can occur when applying a wallpaper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WallpaperApplyError {
+    /// The wallpaper kind is not supported by this renderer.
+    UnsupportedKind { kind: String },
+    /// The image path is empty or invalid.
+    InvalidImagePath { path: String },
+    /// The image file could not be loaded.
+    ImageLoadFailed { path: String, reason: String },
+    /// The renderer is not in a state that allows applying wallpapers.
+    InvalidRendererState { state: String },
+    /// A generic error occurred.
+    Other { message: String },
+}
+
+// ---------------------------------------------------------------------------
 // Core ↔ Renderer typed protocol
 // ---------------------------------------------------------------------------
 
@@ -151,8 +245,8 @@ pub enum RendererCommand {
     Resume,
     /// Stop rendering and release resources.
     Stop,
-    /// Apply a new wallpaper assignment to this renderer.
-    ApplyWallpaper(WallpaperAssignment),
+    /// Apply a new wallpaper to this renderer with full typed payload.
+    ApplyWallpaper(ApplyWallpaperRequest),
     /// Assign the renderer to a different monitor.
     SetMonitor { monitor_id: MonitorId },
     /// Graceful shutdown request.
@@ -178,7 +272,14 @@ pub enum RendererEvent {
     /// Wallpaper has been successfully applied and is rendering.
     WallpaperApplied {
         renderer_id: RendererId,
+        wallpaper_id: WallpaperId,
         monitor_id: MonitorId,
+    },
+    /// An error occurred while applying a wallpaper.
+    WallpaperApplyFailed {
+        renderer_id: RendererId,
+        wallpaper_id: WallpaperId,
+        error: WallpaperApplyError,
     },
     /// Renderer encountered an error.
     Error {
@@ -196,7 +297,7 @@ pub enum RendererEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CoreCommand {
     /// Apply a wallpaper to a specific monitor, launching a renderer if needed.
-    ApplyWallpaperToMonitor(WallpaperAssignment),
+    ApplyWallpaperToMonitor(ApplyWallpaperRequest),
     /// Stop the wallpaper on a specific monitor.
     StopWallpaper { monitor_id: MonitorId },
     /// Pause all active renderers.
@@ -277,6 +378,7 @@ pub fn renderer_event_id(event: &RendererEvent) -> RendererId {
         RendererEvent::Paused { renderer_id } => *renderer_id,
         RendererEvent::Resumed { renderer_id } => *renderer_id,
         RendererEvent::WallpaperApplied { renderer_id, .. } => *renderer_id,
+        RendererEvent::WallpaperApplyFailed { renderer_id, .. } => *renderer_id,
         RendererEvent::Error { renderer_id, .. } => *renderer_id,
         RendererEvent::Exited { renderer_id, .. } => *renderer_id,
     }
@@ -287,12 +389,141 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renderer_command_roundtrip_json() {
-        let cmd = RendererCommand::ApplyWallpaper(WallpaperAssignment {
+    fn renderer_command_apply_wallpaper_roundtrip() {
+        let cmd = RendererCommand::ApplyWallpaper(ApplyWallpaperRequest {
+            wallpaper_id: WallpaperId::new(),
+            payload: WallpaperPayload::StaticImage(StaticImagePayload {
+                image_path: "/path/to/wallpaper.png".into(),
+                fit: FitMode::Cover,
+                background: "#000000".into(),
+                opacity: None,
+            }),
+            target_monitor: MonitorId("mon-1".into()),
+        });
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        let decoded: RendererCommand = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn renderer_event_wallpaper_applied_roundtrip() {
+        let event = RendererEvent::WallpaperApplied {
+            renderer_id: RendererId::new(),
+            wallpaper_id: WallpaperId::new(),
             monitor_id: MonitorId("mon-1".into()),
-            wallpaper_id: wallflow_common::WallpaperId::new(),
-            kind: wallflow_common::WallpaperKind::None,
-            profile: wallflow_common::PerformanceProfile::Balanced,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn renderer_event_wallpaper_apply_failed_roundtrip() {
+        let event = RendererEvent::WallpaperApplyFailed {
+            renderer_id: RendererId::new(),
+            wallpaper_id: WallpaperId::new(),
+            error: WallpaperApplyError::UnsupportedKind {
+                kind: "video".into(),
+            },
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: RendererEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn wallpaper_apply_error_serialization() {
+        let errors = vec![
+            WallpaperApplyError::UnsupportedKind { kind: "web".into() },
+            WallpaperApplyError::InvalidImagePath { path: "".into() },
+            WallpaperApplyError::ImageLoadFailed {
+                path: "/missing.png".into(),
+                reason: "not found".into(),
+            },
+            WallpaperApplyError::InvalidRendererState {
+                state: "starting".into(),
+            },
+            WallpaperApplyError::Other {
+                message: "something went wrong".into(),
+            },
+        ];
+        for error in errors {
+            let json = serde_json::to_string(&error).expect("serialize");
+            let decoded: WallpaperApplyError = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(error, decoded);
+        }
+    }
+
+    #[test]
+    fn fit_mode_roundtrip() {
+        let modes = vec![
+            FitMode::Cover,
+            FitMode::Contain,
+            FitMode::Stretch,
+            FitMode::Center,
+            FitMode::Tile,
+        ];
+        for mode in modes {
+            let json = serde_json::to_string(&mode).expect("serialize");
+            let decoded: FitMode = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(mode, decoded);
+        }
+    }
+
+    #[test]
+    fn static_image_payload_roundtrip() {
+        let payload = StaticImagePayload {
+            image_path: "content/wallpaper.png".into(),
+            fit: FitMode::Contain,
+            background: "#1a1a2e".into(),
+            opacity: Some(200),
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let decoded: StaticImagePayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn wallpaper_payload_roundtrip() {
+        let payload = WallpaperPayload::StaticImage(StaticImagePayload {
+            image_path: "test.png".into(),
+            fit: FitMode::default(),
+            background: "#000000".into(),
+            opacity: None,
+        });
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let decoded: WallpaperPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn apply_wallpaper_request_roundtrip() {
+        let req = ApplyWallpaperRequest {
+            wallpaper_id: WallpaperId::new(),
+            payload: WallpaperPayload::StaticImage(StaticImagePayload {
+                image_path: "/test/wallpaper.png".into(),
+                fit: FitMode::Cover,
+                background: "#000000".into(),
+                opacity: None,
+            }),
+            target_monitor: MonitorId("primary".into()),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let decoded: ApplyWallpaperRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn renderer_command_roundtrip_json() {
+        let cmd = RendererCommand::ApplyWallpaper(ApplyWallpaperRequest {
+            wallpaper_id: WallpaperId::new(),
+            payload: WallpaperPayload::StaticImage(StaticImagePayload {
+                image_path: "/path/to/image.png".into(),
+                fit: FitMode::Cover,
+                background: "#000000".into(),
+                opacity: None,
+            }),
+            target_monitor: MonitorId("mon-1".into()),
         });
         let json = serde_json::to_string(&cmd).expect("serialize");
         let decoded: RendererCommand = serde_json::from_str(&json).expect("deserialize");
@@ -312,15 +543,15 @@ mod tests {
 
     #[test]
     fn core_command_roundtrip_json() {
-        let cmd = CoreCommand::ApplyWallpaperToMonitor(WallpaperAssignment {
-            monitor_id: MonitorId("mon-2".into()),
-            wallpaper_id: wallflow_common::WallpaperId::new(),
-            kind: wallflow_common::WallpaperKind::Video {
-                path: std::path::PathBuf::from("/test.mp4"),
-                muted: true,
-                looping: true,
-            },
-            profile: wallflow_common::PerformanceProfile::Quality,
+        let cmd = CoreCommand::ApplyWallpaperToMonitor(ApplyWallpaperRequest {
+            wallpaper_id: WallpaperId::new(),
+            payload: WallpaperPayload::StaticImage(StaticImagePayload {
+                image_path: "/test.mp4".into(),
+                fit: FitMode::Stretch,
+                background: "#111111".into(),
+                opacity: None,
+            }),
+            target_monitor: MonitorId("mon-2".into()),
         });
         let json = serde_json::to_string(&cmd).expect("serialize");
         let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize");

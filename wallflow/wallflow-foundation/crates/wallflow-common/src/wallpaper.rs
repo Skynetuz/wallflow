@@ -19,6 +19,12 @@ impl Default for WallpaperId {
     }
 }
 
+impl std::fmt::Display for WallpaperId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Supported wallpaper kinds for the MVP and near-future versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WallpaperKind {

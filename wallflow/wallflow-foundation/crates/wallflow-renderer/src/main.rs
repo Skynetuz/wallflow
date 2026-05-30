@@ -5,8 +5,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
-use wallflow_common::RendererId;
-use wallflow_ipc::{encode_to_bytes, EventEnvelope, IpcMessage, RendererCommand, RendererEvent};
+use wallflow_common::{RendererId, WallpaperId};
+use wallflow_ipc::{
+    encode_to_bytes, ApplyWallpaperRequest, EventEnvelope, IpcMessage, RendererCommand,
+    RendererEvent, WallpaperApplyError, WallpaperPayload,
+};
 use wallflow_media::{platform_video_backend, NullVideoBackend, VideoBackend};
 
 #[derive(Debug, Parser)]
@@ -58,6 +61,20 @@ struct Args {
     /// Core ↔ Renderer communication.
     #[arg(long, default_value_t = false)]
     ipc_stdio: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Applied wallpaper state
+// ---------------------------------------------------------------------------
+
+/// Tracks the currently applied wallpaper in the renderer process.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields will be read when GPU rendering is implemented (stage 006)
+struct AppliedWallpaperState {
+    wallpaper_id: WallpaperId,
+    payload: WallpaperPayload,
+    target_monitor: String,
+    applied_at: Instant,
 }
 
 fn main() -> Result<()> {
@@ -155,6 +172,7 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
     let interval = Duration::from_millis(interval_ms);
     let mut is_paused = false;
     let mut heartbeat_count: u64 = 0;
+    let mut applied_state: Option<AppliedWallpaperState> = None;
 
     // Channel for receiving commands from the stdin reader thread
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RendererCommand>();
@@ -226,12 +244,8 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
                         info!(?renderer_id, "renderer stopped via IPC command");
                         break;
                     }
-                    RendererCommand::ApplyWallpaper(assignment) => {
-                        send_ipc_event(RendererEvent::WallpaperApplied {
-                            renderer_id,
-                            monitor_id: assignment.monitor_id.clone(),
-                        })?;
-                        info!(?renderer_id, "wallpaper applied via IPC command");
+                    RendererCommand::ApplyWallpaper(request) => {
+                        handle_apply_wallpaper(renderer_id, request, &mut applied_state)?;
                     }
                     RendererCommand::SetMonitor { monitor_id } => {
                         info!(?renderer_id, ?monitor_id, "monitor changed via IPC command");
@@ -260,6 +274,60 @@ fn run_ipc_stdio(renderer_id: RendererId, interval_ms: u64, timeout_secs: u64) -
                 info!(?renderer_id, "stdin closed, no more commands expected");
                 std::thread::sleep(interval);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle an ApplyWallpaper command: validate, update state, respond.
+fn handle_apply_wallpaper(
+    renderer_id: RendererId,
+    request: ApplyWallpaperRequest,
+    applied_state: &mut Option<AppliedWallpaperState>,
+) -> Result<()> {
+    let wallpaper_id = request.wallpaper_id;
+    let monitor_id = request.target_monitor.clone();
+
+    match &request.payload {
+        WallpaperPayload::StaticImage(static_payload) => {
+            // Validate image path is not empty
+            if static_payload.image_path.trim().is_empty() {
+                send_ipc_event(RendererEvent::WallpaperApplyFailed {
+                    renderer_id,
+                    wallpaper_id,
+                    error: WallpaperApplyError::InvalidImagePath {
+                        path: String::new(),
+                    },
+                })?;
+                warn!(?renderer_id, "apply wallpaper rejected: empty image path");
+                return Ok(());
+            }
+
+            // At this stage, the renderer does not actually render the image.
+            // It validates the payload and records the applied state.
+            // Real GPU rendering will be implemented in stage 006.
+            info!(
+                ?renderer_id,
+                ?wallpaper_id,
+                image_path = %static_payload.image_path,
+                ?static_payload.fit,
+                background = %static_payload.background,
+                "static wallpaper applied (state recorded, not rendering yet)"
+            );
+
+            *applied_state = Some(AppliedWallpaperState {
+                wallpaper_id,
+                payload: request.payload,
+                target_monitor: monitor_id.0.clone(),
+                applied_at: Instant::now(),
+            });
+
+            send_ipc_event(RendererEvent::WallpaperApplied {
+                renderer_id,
+                wallpaper_id,
+                monitor_id,
+            })?;
         }
     }
 

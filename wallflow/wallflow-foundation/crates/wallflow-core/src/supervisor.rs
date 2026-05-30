@@ -32,6 +32,12 @@ pub enum SupervisorError {
 
     #[error("renderer {0} already assigned to monitor {1:?}")]
     AlreadyAssigned(RendererId, MonitorId),
+
+    #[error("wallpaper apply failed for renderer {0}: {1}")]
+    ApplyFailed(RendererId, String),
+
+    #[error("renderer {0} is not running, cannot apply wallpaper")]
+    NotRunning(RendererId),
 }
 
 /// Current status of a single renderer within the supervisor.
@@ -98,6 +104,8 @@ struct RendererEntry {
     restart_count: u32,
     restart_window_start: Instant,
     launched_at: Instant,
+    /// The wallpaper currently applied to this renderer (if any).
+    applied_wallpaper_id: Option<wallflow_common::WallpaperId>,
 }
 
 /// Report for a single renderer, used for structured output.
@@ -175,6 +183,7 @@ impl RendererSupervisor {
             restart_count: 0,
             restart_window_start: Instant::now(),
             launched_at: Instant::now(),
+            applied_wallpaper_id: None,
         };
         self.entries.insert(renderer_id, entry);
         debug!(?renderer_id, ?monitor_id, "renderer registered");
@@ -495,6 +504,89 @@ impl RendererSupervisor {
             .ok_or(SupervisorError::RendererNotFound(renderer_id))
             .map(|e| e.restart_count)
     }
+
+    /// Request a wallpaper apply for a renderer.
+    ///
+    /// Validates that the renderer is in a running or paused state before
+    /// accepting the apply request. Returns the renderer handle if the
+    /// request is valid. The caller is responsible for sending the actual
+    /// IPC command to the renderer process.
+    pub fn apply_wallpaper(
+        &mut self,
+        renderer_id: RendererId,
+        wallpaper_id: wallflow_common::WallpaperId,
+    ) -> Result<RendererHandle, SupervisorError> {
+        let entry = self
+            .entries
+            .get_mut(&renderer_id)
+            .ok_or(SupervisorError::RendererNotFound(renderer_id))?;
+
+        if entry.status != RendererStatus::Running
+            && entry.status != RendererStatus::Paused
+            && entry.status != RendererStatus::Stale
+        {
+            return Err(SupervisorError::NotRunning(renderer_id));
+        }
+
+        entry.applied_wallpaper_id = Some(wallpaper_id);
+        info!(?renderer_id, ?wallpaper_id, "wallpaper apply requested");
+        Ok(RendererHandle {
+            renderer_id,
+            monitor_id: entry.assignment.monitor_id.clone(),
+            status: entry.status.clone(),
+        })
+    }
+
+    /// Record that a wallpaper was successfully applied to a renderer.
+    pub fn mark_wallpaper_applied(
+        &mut self,
+        renderer_id: RendererId,
+    ) -> Result<RendererHandle, SupervisorError> {
+        let entry = self
+            .entries
+            .get(&renderer_id)
+            .ok_or(SupervisorError::RendererNotFound(renderer_id))?;
+        debug!(
+            ?renderer_id,
+            wallpaper_id = ?entry.applied_wallpaper_id,
+            "wallpaper apply confirmed"
+        );
+        Ok(RendererHandle {
+            renderer_id,
+            monitor_id: entry.assignment.monitor_id.clone(),
+            status: entry.status.clone(),
+        })
+    }
+
+    /// Record that a wallpaper apply failed for a renderer.
+    pub fn mark_wallpaper_apply_failed(
+        &mut self,
+        renderer_id: RendererId,
+        reason: String,
+    ) -> Result<RendererHandle, SupervisorError> {
+        let entry = self
+            .entries
+            .get_mut(&renderer_id)
+            .ok_or(SupervisorError::RendererNotFound(renderer_id))?;
+        entry.applied_wallpaper_id = None;
+        warn!(?renderer_id, %reason, "wallpaper apply failed");
+        Ok(RendererHandle {
+            renderer_id,
+            monitor_id: entry.assignment.monitor_id.clone(),
+            status: entry.status.clone(),
+        })
+    }
+
+    /// Get the currently applied wallpaper ID for a renderer.
+    pub fn applied_wallpaper(
+        &self,
+        renderer_id: RendererId,
+    ) -> Result<Option<wallflow_common::WallpaperId>, SupervisorError> {
+        self.entries
+            .get(&renderer_id)
+            .ok_or(SupervisorError::RendererNotFound(renderer_id))
+            .map(|e| e.applied_wallpaper_id)
+    }
 }
 
 impl Default for RendererSupervisor {
@@ -770,5 +862,72 @@ mod tests {
             RendererHealth::from(RendererStatus::Paused),
             RendererHealth::Stale
         );
+    }
+
+    #[test]
+    fn apply_wallpaper_state_transition() {
+        let mut supervisor = RendererSupervisor::new();
+        let assignment = test_assignment();
+        let rid = assignment.renderer_id;
+        let wid = wallflow_common::WallpaperId::new();
+
+        supervisor.register_renderer(assignment);
+        supervisor.mark_running(rid).expect("running");
+
+        let handle = supervisor.apply_wallpaper(rid, wid).expect("apply");
+        assert_eq!(handle.status, RendererStatus::Running);
+
+        // The wallpaper_id should be recorded
+        let applied = supervisor.applied_wallpaper(rid).expect("get applied");
+        assert_eq!(applied, Some(wid));
+    }
+
+    #[test]
+    fn apply_wallpaper_rejects_non_running() {
+        let mut supervisor = RendererSupervisor::new();
+        let assignment = test_assignment();
+        let rid = assignment.renderer_id;
+        let wid = wallflow_common::WallpaperId::new();
+
+        supervisor.register_renderer(assignment);
+        // Still in Starting state — cannot apply
+        let result = supervisor.apply_wallpaper(rid, wid);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mark_wallpaper_applied_success() {
+        let mut supervisor = RendererSupervisor::new();
+        let assignment = test_assignment();
+        let rid = assignment.renderer_id;
+        let wid = wallflow_common::WallpaperId::new();
+
+        supervisor.register_renderer(assignment);
+        supervisor.mark_running(rid).expect("running");
+        supervisor.apply_wallpaper(rid, wid).expect("apply");
+
+        let handle = supervisor.mark_wallpaper_applied(rid).expect("confirmed");
+        assert_eq!(handle.status, RendererStatus::Running);
+    }
+
+    #[test]
+    fn mark_wallpaper_apply_failed_clears_applied() {
+        let mut supervisor = RendererSupervisor::new();
+        let assignment = test_assignment();
+        let rid = assignment.renderer_id;
+        let wid = wallflow_common::WallpaperId::new();
+
+        supervisor.register_renderer(assignment);
+        supervisor.mark_running(rid).expect("running");
+        supervisor.apply_wallpaper(rid, wid).expect("apply");
+
+        let handle = supervisor
+            .mark_wallpaper_apply_failed(rid, "image not found".into())
+            .expect("failed mark");
+        assert_eq!(handle.status, RendererStatus::Running);
+
+        // Applied wallpaper should be cleared
+        let applied = supervisor.applied_wallpaper(rid).expect("get applied");
+        assert_eq!(applied, None);
     }
 }

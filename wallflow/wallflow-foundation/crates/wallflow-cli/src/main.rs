@@ -57,6 +57,19 @@ enum Command {
         #[arg(long, default_value_t = 500)]
         heartbeat_interval_ms: u64,
     },
+
+    /// Create a test wallpaper package, validate it, launch a renderer in
+    /// --ipc-stdio mode, apply the static wallpaper, and report results.
+    /// This is the cloud-testable wallpaper apply integration test.
+    ApplyStaticSmoke {
+        /// How many seconds to let the renderer run before declaring success.
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
+
+        /// Renderer heartbeat interval in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        heartbeat_interval_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,6 +117,12 @@ fn main() -> Result<()> {
             heartbeat_interval_ms,
         } => {
             run_ipc_supervisor_smoke(timeout_secs, heartbeat_interval_ms)?;
+        }
+        Command::ApplyStaticSmoke {
+            timeout_secs,
+            heartbeat_interval_ms,
+        } => {
+            run_apply_static_smoke(timeout_secs, heartbeat_interval_ms)?;
         }
     }
 
@@ -721,8 +740,11 @@ fn run_ipc_supervisor_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Re
                                 RendererEvent::Error { renderer_id, message } => {
                                     eprintln!("  [{:.1}s] Error from renderer {}: {}", elapsed.as_secs_f64(), renderer_id, message);
                                 }
-                                RendererEvent::WallpaperApplied { renderer_id, monitor_id } => {
-                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, monitor_id.0);
+                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id, monitor_id } => {
+                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, wallpaper_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, wallpaper_id, monitor_id.0);
+                                }
+                                RendererEvent::WallpaperApplyFailed { renderer_id, wallpaper_id, error } => {
+                                    eprintln!("  [{:.1}s] WallpaperApplyFailed (renderer_id: {}, wallpaper_id: {}, error: {:?})", elapsed.as_secs_f64(), renderer_id, wallpaper_id, error);
                                 }
                             }
                         }
@@ -861,4 +883,293 @@ async fn send_ipc_command<W: tokio::io::AsyncWrite + Unpin>(
     writer.write_all(&bytes).await?;
     writer.flush().await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Apply static smoke test
+// ---------------------------------------------------------------------------
+
+/// Apply static smoke test: creates a test wallpaper package, validates it,
+/// launches a renderer in --ipc-stdio mode, applies the wallpaper, and
+/// reports results.
+///
+/// The test flow:
+/// 1. Create a temporary test wallpaper package (manifest.json + dummy image)
+/// 2. Load and validate the package via wallflow-package
+/// 3. Spawn renderer with --ipc-stdio
+/// 4. Wait for Started + Ready events
+/// 5. Send ApplyWallpaper with real static image payload
+/// 6. Wait for WallpaperApplied event
+/// 7. Send Shutdown command
+/// 8. Wait for Exited event
+/// 9. Print structured JSON report
+fn run_apply_static_smoke(timeout_secs: u64, heartbeat_interval_ms: u64) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    use tokio::time;
+    use wallflow_common::{MonitorId, WallpaperId};
+    use wallflow_ipc::{
+        ApplyWallpaperRequest, FitMode as IpcFitMode, RendererCommand, RendererEvent,
+        StaticImagePayload, WallpaperPayload,
+    };
+    use wallflow_package::{
+        validate_manifest, validate_package, FitMode as PackageFitMode, StaticImageWallpaper,
+        WallpaperKind, WallpaperManifest, WallpaperPackage, WallpaperPackageVersion,
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let start = Instant::now();
+
+        // Step 1: Create a temporary test wallpaper package
+        let temp_dir = std::env::temp_dir().join("wallflow-apply-static-smoke");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(temp_dir.join("content"))?;
+
+        let manifest = WallpaperManifest {
+            schema_version: 0,
+            id: "test-static-wallpaper".into(),
+            title: "Test Static Wallpaper".into(),
+            description: "A test static wallpaper for WallFlow apply-smoke".into(),
+            author: "WallFlow CLI".into(),
+            kind: WallpaperKind::StaticImage,
+            entry: StaticImageWallpaper {
+                image: "content/wallpaper.png".into(),
+                fit: PackageFitMode::Cover,
+                background: "#000000".into(),
+                opacity: None,
+            },
+            preview: None,
+            tags: vec!["test".into(), "static".into(), "mvp".into()],
+            version: Some(WallpaperPackageVersion::new("0.1.0")),
+        };
+
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(temp_dir.join("manifest.json"), &manifest_json)?;
+
+        // Create a dummy image file (1x1 PNG-like bytes for fixture purposes)
+        // NOTE: This is not a real PNG. Real image decoding will come in stage 006.
+        let dummy_image_data = b"WALLFLOW-DUMMY-IMAGE-FIXURE";
+        std::fs::write(temp_dir.join("content/wallpaper.png"), dummy_image_data)?;
+
+        println!("=== Apply Static Smoke Test ===");
+        println!("Test package dir: {}", temp_dir.display());
+
+        // Step 2: Load and validate the package
+        let package = WallpaperPackage::load(&temp_dir)?;
+        let manifest_report = validate_manifest(&package.manifest);
+        if !manifest_report.valid {
+            eprintln!("Manifest validation failed: {:?}", manifest_report.errors);
+            anyhow::bail!("manifest validation failed");
+        }
+        println!("Package validation: OK (id={})", package.manifest.id);
+
+        let package_report = validate_package(&package);
+        if !package_report.valid {
+            eprintln!("Package validation failed: {:?}", package_report.errors);
+            anyhow::bail!("package validation failed");
+        }
+        println!("Full package validation: OK");
+
+        // Step 3: Spawn renderer with --ipc-stdio
+        let renderer_exe = find_renderer_exe()?;
+        println!("Renderer exe: {}", renderer_exe.display());
+        println!(
+            "Timeout: {}s, Heartbeat interval: {}ms",
+            timeout_secs, heartbeat_interval_ms
+        );
+
+        let mut child = Command::new(&renderer_exe)
+            .arg("--ipc-stdio")
+            .arg("--heartbeat-interval-ms")
+            .arg(heartbeat_interval_ms.to_string())
+            .arg("--timeout-secs")
+            .arg(timeout_secs.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn renderer: {e}"))?;
+
+        let pid = child.id();
+        println!("Renderer spawned (PID: {:?})", pid);
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture renderer stdout"))?;
+
+        let mut stdin_writer = tokio::io::BufWriter::new(stdin);
+        let mut stdout_reader = tokio::io::BufReader::new(stdout);
+
+        let mut started_received = false;
+        let mut ready_received = false;
+        let mut wallpaper_applied_received = false;
+        let mut exited_received = false;
+        let mut apply_failed_received = false;
+        let mut shutdown_sent = false;
+
+        let wallpaper_id = WallpaperId::new();
+        let image_path = temp_dir
+            .join("content/wallpaper.png")
+            .to_string_lossy()
+            .to_string();
+
+        let deadline = time::sleep(Duration::from_secs(timeout_secs + 10));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    eprintln!("Apply static smoke timed out");
+                    let _ = child.kill().await;
+                    break;
+                }
+                result = read_ipc_frame(&mut stdout_reader) => {
+                    match result {
+                        Ok(Some(event)) => {
+                            let elapsed = start.elapsed();
+                            match &event {
+                                RendererEvent::Started { renderer_id } => {
+                                    started_received = true;
+                                    println!("  [{:.1}s] Started (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                }
+                                RendererEvent::Ready { renderer_id } => {
+                                    ready_received = true;
+                                    println!("  [{:.1}s] Ready (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                    // Send ApplyWallpaper as soon as renderer is ready
+                                    if !wallpaper_applied_received && !apply_failed_received {
+                                        println!("  [{:.1}s] Sending ApplyWallpaper command...", elapsed.as_secs_f64());
+                                        let request = ApplyWallpaperRequest {
+                                            wallpaper_id,
+                                            payload: WallpaperPayload::StaticImage(StaticImagePayload {
+                                                image_path: image_path.clone(),
+                                                fit: IpcFitMode::Cover,
+                                                background: "#000000".into(),
+                                                opacity: None,
+                                            }),
+                                            target_monitor: MonitorId("primary".into()),
+                                        };
+                                        send_ipc_command(&mut stdin_writer, RendererCommand::ApplyWallpaper(request)).await?;
+                                    }
+                                }
+                                RendererEvent::Heartbeat { renderer_id, uptime_ms } => {
+                                    println!("  [{:.1}s] Heartbeat (uptime: {}ms, renderer_id: {})", elapsed.as_secs_f64(), uptime_ms, renderer_id);
+                                }
+                                RendererEvent::WallpaperApplied { renderer_id, wallpaper_id: wid, monitor_id } => {
+                                    wallpaper_applied_received = true;
+                                    println!("  [{:.1}s] WallpaperApplied (renderer_id: {}, wallpaper_id: {}, monitor_id: {})", elapsed.as_secs_f64(), renderer_id, wid, monitor_id.0);
+                                    // Now send Shutdown
+                                    if !shutdown_sent {
+                                        println!("  [{:.1}s] Sending Shutdown command...", elapsed.as_secs_f64());
+                                        send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
+                                        shutdown_sent = true;
+                                    }
+                                }
+                                RendererEvent::WallpaperApplyFailed { renderer_id, wallpaper_id: wid, error } => {
+                                    apply_failed_received = true;
+                                    eprintln!("  [{:.1}s] WallpaperApplyFailed (renderer_id: {}, wallpaper_id: {}, error: {:?})", elapsed.as_secs_f64(), renderer_id, wid, error);
+                                    // Still send shutdown
+                                    if !shutdown_sent {
+                                        send_ipc_command(&mut stdin_writer, RendererCommand::Shutdown).await?;
+                                        shutdown_sent = true;
+                                    }
+                                }
+                                RendererEvent::Paused { renderer_id } => {
+                                    println!("  [{:.1}s] Paused (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                }
+                                RendererEvent::Resumed { renderer_id } => {
+                                    println!("  [{:.1}s] Resumed (renderer_id: {})", elapsed.as_secs_f64(), renderer_id);
+                                }
+                                RendererEvent::Exited { renderer_id, exit_code } => {
+                                    exited_received = true;
+                                    println!("  [{:.1}s] Exited (exit_code: {:?}, renderer_id: {})", elapsed.as_secs_f64(), exit_code, renderer_id);
+                                    break;
+                                }
+                                RendererEvent::Error { renderer_id, message } => {
+                                    eprintln!("  [{:.1}s] Error from renderer {}: {}", elapsed.as_secs_f64(), renderer_id, message);
+                                }
+                            }
+                        }
+                        Ok(None) => { break; }
+                        Err(e) => {
+                            eprintln!("Error reading IPC frame: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(stdin_writer);
+
+        // Wait for the process to exit
+        let exit_status = match time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(e)) => {
+                eprintln!("Error waiting for renderer: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("Renderer did not exit in time, killing");
+                let _ = child.kill().await;
+                None
+            }
+        };
+
+        let total_elapsed = start.elapsed();
+        let process_exit_code = exit_status.as_ref().and_then(|s| s.code());
+
+        let success = process_exit_code == Some(0)
+            && started_received
+            && ready_received
+            && wallpaper_applied_received
+            && !apply_failed_received
+            && exited_received;
+
+        let report = serde_json::json!({
+            "test": "apply-static-smoke",
+            "success": success,
+            "total_elapsed_ms": total_elapsed.as_millis() as u64,
+            "renderer_pid": pid,
+            "process_exit_code": process_exit_code,
+            "wallpaper_id": wallpaper_id.to_string(),
+            "package_id": package.manifest.id,
+            "image_path": image_path,
+            "events": {
+                "started_received": started_received,
+                "ready_received": ready_received,
+                "wallpaper_applied_received": wallpaper_applied_received,
+                "apply_failed_received": apply_failed_received,
+                "exited_received": exited_received,
+            },
+            "config": {
+                "timeout_secs": timeout_secs,
+                "heartbeat_interval_ms": heartbeat_interval_ms,
+            }
+        });
+
+        println!("\n=== Apply Static Smoke Report ===");
+        println!("{}", serde_json::to_string_pretty(&report)?);
+
+        if success {
+            println!("\nApply static smoke test PASSED.");
+        } else {
+            eprintln!("\nApply static smoke test FAILED.");
+            if !started_received { eprintln!("  Missing: Started event"); }
+            if !ready_received { eprintln!("  Missing: Ready event"); }
+            if !wallpaper_applied_received { eprintln!("  Missing: WallpaperApplied event"); }
+            if apply_failed_received { eprintln!("  Unexpected: WallpaperApplyFailed event"); }
+            if !exited_received { eprintln!("  Missing: Exited event"); }
+        }
+
+        // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        Ok(())
+    })
 }

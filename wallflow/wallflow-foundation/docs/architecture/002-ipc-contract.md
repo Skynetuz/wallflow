@@ -114,7 +114,7 @@ pub struct EventEnvelope<T> {
 | `Pause` | Pause (keep resources) | `Paused` |
 | `Resume` | Resume from pause | `Resumed` |
 | `Stop` | Stop and release resources | `Exited` |
-| `ApplyWallpaper(assignment)` | Change wallpaper | `WallpaperApplied` |
+| `ApplyWallpaper(ApplyWallpaperRequest)` | Change wallpaper | `WallpaperApplied` / `WallpaperApplyFailed` |
 | `SetMonitor { monitor_id }` | Reassign monitor | `Heartbeat` (ack) |
 | `Shutdown` | Graceful shutdown | `Exited` |
 
@@ -127,17 +127,72 @@ pub struct EventEnvelope<T> {
 | `Heartbeat { renderer_id, uptime_ms }` | Liveness signal |
 | `Paused { renderer_id }` | Confirmed pause |
 | `Resumed { renderer_id }` | Confirmed resume |
-| `WallpaperApplied { renderer_id, monitor_id }` | Wallpaper rendering |
+| `WallpaperApplied { renderer_id, monitor_id, wallpaper_id }` | Wallpaper rendering |
+| `WallpaperApplyFailed { renderer_id, monitor_id, error: WallpaperApplyError }` | Wallpaper apply failed |
 | `Error { renderer_id, message }` | Error occurred |
 | `Exited { renderer_id, exit_code }` | Process exiting |
 
+### ApplyWallpaperRequest
+
+```rust
+pub struct ApplyWallpaperRequest {
+    pub assignment_id: AssignmentId,
+    pub monitor_id: MonitorId,
+    pub wallpaper_id: WallpaperId,
+    pub payload: WallpaperPayload,
+}
+```
+
+### WallpaperPayload
+
+```rust
+#[serde(tag = "type", content = "data")]
+pub enum WallpaperPayload {
+    #[serde(rename = "static_image")]
+    StaticImage(StaticImagePayload),
+}
+```
+
+### StaticImagePayload
+
+```rust
+pub struct StaticImagePayload {
+    pub path: PathBuf,
+    pub fit_mode: FitMode,
+}
+```
+
+### FitMode
+
+```rust
+pub enum FitMode {
+    Fill,
+    Fit,
+    Stretch,
+    Center,
+    Tile,
+}
+```
+
+### WallpaperApplyError
+
+```rust
+pub enum WallpaperApplyError {
+    FileNotFound,
+    DecodeFailed(String),
+    UnsupportedFormat(String),
+    RenderFailed(String),
+}
+```
+
 ## Protocol Versioning
 
-The current protocol version is **3** (`PROTOCOL_VERSION`).
+The current protocol version is **4** (`PROTOCOL_VERSION`).
 
 - **Version 1**: Initial protocol with basic CoreCommand/CoreEvent.
 - **Version 2**: Added RendererCommand/RendererEvent with full lifecycle.
 - **Version 3**: Added `IpcMessage` tagged union for unambiguous frame decoding.
+- **Version 4**: Added `ApplyWallpaperRequest` for structured wallpaper apply commands and `WallpaperApplyFailed` event for error reporting.
 
 Every envelope includes `protocol_version`. Receivers MUST validate the version
 and reject mismatched messages with `FrameError::ProtocolVersionMismatch`.
